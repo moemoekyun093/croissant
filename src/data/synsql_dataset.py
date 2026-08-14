@@ -152,6 +152,7 @@ class SynSQLTableDataset:
         self._conn_cache: dict[str, sqlite3.Connection] = {}
         self._table_names_cache: dict[str, list[str]] = {}
         self._column_names_cache: dict[tuple[str, str], list[str]] = {}
+        self._foreign_key_columns_cache: dict[tuple[str, str], set[str]] = {}
 
     def __len__(self) -> int:
         """Total (db_id, table_name) pairs across every known database --
@@ -202,6 +203,20 @@ class SynSQLTableDataset:
             self._column_names_cache[key] = [row[1] for row in cur.fetchall()]
         return self._column_names_cache[key]
 
+    def _foreign_key_columns(self, db_id: str, table_name: str) -> set[str]:
+        """Column names declared as FOREIGN KEY in this table, read via
+        PRAGMA foreign_key_list -- used to populate Column.is_foreign_key
+        so the ELECTRA pretraining loss can exclude them (see
+        src/data/electra_corruption.py::build_non_fk_mask for why)."""
+        key = (db_id, table_name)
+        if key not in self._foreign_key_columns_cache:
+            cur = self._connection(db_id).cursor()
+            cur.execute(f'PRAGMA foreign_key_list("{table_name}")')
+            # PRAGMA foreign_key_list row shape:
+            # (id, seq, table, from, to, on_update, on_delete, match)
+            self._foreign_key_columns_cache[key] = {row[3] for row in cur.fetchall()}
+        return self._foreign_key_columns_cache[key]
+
     def get_table(self, db_id: str, table_name: str) -> Table:
         """
         Fetches up to `max_rows` real rows for (db_id, table_name) from
@@ -235,8 +250,13 @@ class SynSQLTableDataset:
             for i, val in enumerate(row):
                 columns_values[i].append(clean_text(val))
 
+        fk_columns = self._foreign_key_columns(db_id, table_name)
         columns = [
-            Column(header=column_names[i], cells=columns_values[i])
+            Column(
+                header=column_names[i],
+                cells=columns_values[i],
+                is_foreign_key=column_names[i] in fk_columns,
+            )
             for i in range(len(column_names))
         ]
 

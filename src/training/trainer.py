@@ -20,7 +20,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 
 from src.data.table import Table
-from src.data.electra_corruption import corrupt_tables, pad_labels
+from src.data.electra_corruption import build_non_fk_mask, corrupt_tables, pad_labels
 from src.training.losses import (
     cross_score_queries_tables,
     electra_discriminator_loss,
@@ -122,7 +122,15 @@ class PretrainTrainer:
         X, col_mask, row_mask, cell_mask = self.model.forward_batch_cellwise(corrupted_tables)
         logits = self.discriminator(X)  # [B, N, M]
 
-        loss = electra_discriminator_loss(logits, labels, cell_mask)
+        # exclude declared FOREIGN KEY columns from the loss -- FK values
+        # legitimately repeat across rows, so a same-column swap there is
+        # usually indistinguishable from a normal repeat (unlike a
+        # PRIMARY KEY duplicate, which is a genuine anomaly and stays in
+        # the loss). See src/data/electra_corruption.py::build_non_fk_mask.
+        non_fk_mask = build_non_fk_mask(corrupted_tables, device=self.device)
+        effective_mask = cell_mask * non_fk_mask
+
+        loss = electra_discriminator_loss(logits, labels, effective_mask)
 
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self._trainable_params(), self.grad_clip_norm)
@@ -222,7 +230,10 @@ class PretrainTrainer:
                 X, col_mask, row_mask, cell_mask = self.model.forward_batch_cellwise(corrupted_tables)
                 logits = self.discriminator(X)
 
-                loss = electra_discriminator_loss(logits, labels, cell_mask)
+                non_fk_mask = build_non_fk_mask(corrupted_tables, device=self.device)
+                effective_mask = cell_mask * non_fk_mask
+
+                loss = electra_discriminator_loss(logits, labels, effective_mask)
                 losses.append(loss.item())
 
         return sum(losses) / max(1, len(losses))

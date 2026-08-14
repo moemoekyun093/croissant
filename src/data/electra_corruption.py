@@ -107,7 +107,9 @@ def corrupt_tables(
                     new_cells[i] = replacement
                     col_labels[i] = 1
 
-            new_columns.append(Column(header=column.header, cells=new_cells))
+            new_columns.append(
+                Column(header=column.header, cells=new_cells, is_foreign_key=column.is_foreign_key)
+            )
             table_labels.append(col_labels)
 
         corrupted_tables.append(
@@ -155,3 +157,49 @@ def pad_labels(
                     labels[t_idx, c_idx, r_idx] = 1.0
 
     return labels
+
+
+def build_non_fk_mask(tables: list[Table], device="cpu"):
+    """
+    Returns [B, max_n, max_m] float mask: 1.0 for cells in NON-foreign-key
+    columns, 0.0 for cells in a declared FOREIGN KEY column (and for
+    padding). Meant to be multiplied into the model's own cell_mask
+    before electra_discriminator_loss, so FK columns are excluded from
+    the ELECTRA discriminator's loss entirely -- confirmed against real
+    SynSQL-2.5M tables (scripts/inspect_synsql_tables.py) that ~30% of
+    columns are key-like, and FK columns specifically have a structural
+    problem for this task: FK VALUES REPEAT ACROSS ROWS NORMALLY (e.g.
+    environment_id=1 shared by many rows is completely legitimate), so a
+    same-column swap in an FK column is usually statistically
+    indistinguishable from a real, unremarkable repeat -- grading the
+    discriminator there mostly adds noisy/wasted gradient.
+
+    PRIMARY KEY columns are deliberately NOT masked out here (real PKs
+    are always unique, so a swap-induced duplicate in a PK column is a
+    genuine, low-noise anomaly the discriminator CAN learn to catch --
+    unlike FK duplication, which is the normal case).
+
+    Only reflects Column.is_foreign_key -- does NOT independently
+    exclude null cells (that's cell_mask's job); combine the two
+    (cell_mask * non_fk_mask) for the final effective loss mask. Same
+    max_n/max_m padding convention as pad_labels -- call this on
+    whatever list of tables was actually fed to the model
+    (forward_batch_cellwise), corrupted or not, since is_foreign_key is
+    preserved by corrupt_tables().
+    """
+    import torch
+
+    B = len(tables)
+    n_list = [t.num_columns for t in tables]
+    m_list = [t.num_rows for t in tables]
+    max_n = max(n_list) if n_list else 1
+    max_m = max(m_list) if m_list else 1
+
+    mask = torch.zeros(B, max_n, max_m, device=device)
+    for t_idx, table in enumerate(tables):
+        for c_idx, column in enumerate(table.columns):
+            if column.is_foreign_key:
+                continue
+            mask[t_idx, c_idx, : len(column.cells)] = 1.0
+
+    return mask

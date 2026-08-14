@@ -17,7 +17,7 @@ import random
 import torch
 import torch.nn.functional as F
 
-from src.data.electra_corruption import corrupt_tables, pad_labels
+from src.data.electra_corruption import build_non_fk_mask, corrupt_tables, pad_labels
 from src.data.table import Column, Table
 from src.encoding.cell_encoder import CellEncoder
 from src.models.table_encoder import DiscriminatorHead, TableEncoder
@@ -209,6 +209,10 @@ def check_tiny_batch_overfit(
     device = next(model.parameters()).device
     corrupted_tables, label_grids = corrupt_tables(tables, corrupt_frac)
     labels = pad_labels(label_grids, device=device)  # fixed for the whole check
+    # dummy tables have no FK columns (Column.is_foreign_key defaults to
+    # False), so this is a no-op here -- included anyway to mirror
+    # PretrainTrainer.train_step exactly, same convention real training uses.
+    non_fk_mask = build_non_fk_mask(corrupted_tables, device=device)
 
     losses = []
     for step in range(steps):
@@ -218,7 +222,7 @@ def check_tiny_batch_overfit(
 
         X, col_mask, row_mask, cell_mask = model.forward_batch_cellwise(corrupted_tables)
         logits = discriminator(X)
-        loss = electra_discriminator_loss(logits, labels, cell_mask)
+        loss = electra_discriminator_loss(logits, labels, cell_mask * non_fk_mask)
 
         loss.backward()
         torch.nn.utils.clip_grad_norm_(trainer._trainable_params(), trainer.grad_clip_norm)
@@ -239,8 +243,9 @@ def check_tiny_batch_overfit(
     with torch.no_grad():
         X, col_mask, row_mask, cell_mask = model.forward_batch_cellwise(corrupted_tables)
         preds = (torch.sigmoid(discriminator(X)) > 0.5).float()
-        correct = ((preds == labels).float() * cell_mask).sum()
-        total = cell_mask.sum().clamp(min=1.0)
+        effective_mask = cell_mask * non_fk_mask
+        correct = ((preds == labels).float() * effective_mask).sum()
+        total = effective_mask.sum().clamp(min=1.0)
         accuracy = (correct / total).item()
         trivial_baseline = 1.0 - corrupt_frac
         print(

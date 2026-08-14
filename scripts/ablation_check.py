@@ -10,7 +10,7 @@ rewrite: that ablation zeroed out header or cell-content embeddings
 separately to see which signal the model leaned on, which is no longer
 possible now that CellEncoder fuses header + cell content via raw
 concatenation before TableEncoder ever sees them (see
-src/models/table_encoder.py's forward_batch -- "headers_only"/
+src/models/table_encoder.py's forward_batch_cellwise -- "headers_only"/
 "content_only" now raise NotImplementedError explicitly, rather than
 silently returning a meaningless answer). This is the natural
 analogous check for the CURRENT mechanism: is the discriminator
@@ -41,7 +41,7 @@ import random
 import torch
 
 from src.data.corpus_loader import iter_tables_from_jsonl
-from src.data.electra_corruption import corrupt_tables, pad_labels
+from src.data.electra_corruption import build_non_fk_mask, corrupt_tables, pad_labels
 from src.data.table import Table
 from src.encoding.cell_encoder import CellEncoder
 from src.models.table_encoder import DiscriminatorHead, TableEncoder
@@ -92,12 +92,15 @@ def eval_discriminator(
         X, col_mask, row_mask, cell_mask = model.forward_batch_cellwise(corrupted)
         logits = discriminator(X)
 
-        loss = electra_discriminator_loss(logits, labels, cell_mask)
+        non_fk_mask = build_non_fk_mask(corrupted, device=device)
+        effective_mask = cell_mask * non_fk_mask
+
+        loss = electra_discriminator_loss(logits, labels, effective_mask)
         losses.append(loss.item())
 
         preds = (torch.sigmoid(logits) > 0.5).float()
-        total_correct += ((preds == labels).float() * cell_mask).sum().item()
-        total_cells += cell_mask.sum().item()
+        total_correct += ((preds == labels).float() * effective_mask).sum().item()
+        total_cells += effective_mask.sum().item()
 
     avg_loss = sum(losses) / max(1, len(losses))
     accuracy = total_correct / max(1.0, total_cells)

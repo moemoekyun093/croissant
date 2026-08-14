@@ -15,6 +15,14 @@ class Column:
 
     header: str
     cells: list[str] = field(default_factory=list)
+    # True if this column is a declared SQL FOREIGN KEY (set by
+    # SynSQLTableDataset.get_table() from the live schema; defaults to
+    # False for any other data source, e.g. corpus_loader.py tables,
+    # where this isn't known/applicable). Deliberately NOT set for
+    # PRIMARY KEY columns -- see src/data/electra_corruption.py::
+    # build_non_fk_mask for why the two are treated differently in the
+    # ELECTRA discriminator loss.
+    is_foreign_key: bool = False
 
     def __len__(self) -> int:
         return len(self.cells)
