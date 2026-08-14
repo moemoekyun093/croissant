@@ -163,6 +163,17 @@ class SynSQLTableDataset:
         self._table_names_cache: dict[str, list[str]] = {}
         self._column_names_cache: dict[tuple[str, str], list[str]] = {}
         self._foreign_key_columns_cache: dict[tuple[str, str], set[str]] = {}
+        # Materialized-table cache (real sampled row DATA, not just
+        # schema) -- see get_table()'s docstring for why this matters a
+        # lot in practice: the same table gets fetched over and over
+        # (a query's own positive table, re-looked-up every epoch by
+        # SynSQLQueryDataset.__getitem__; the same database's tables
+        # drawn repeatedly as hard negatives for many different queries
+        # in that database; corpus tables re-materialized across runs).
+        # Without this, a single finetuning epoch at real SynSQL-2.5M
+        # scale triggers millions of redundant live SQL reads for tables
+        # already fetched moments earlier.
+        self._materialized_table_cache: dict[tuple[str, str], Table] = {}
 
     def __len__(self) -> int:
         """Total (db_id, table_name) pairs across every known database --
@@ -276,7 +287,31 @@ class SynSQLTableDataset:
         _sample_bounded_rowids) so this stays cheap even for a huge
         table -- NEVER fetches every rowid in the table just to sample
         from it.
+
+        Materialized results are cached in memory per (db_id,
+        table_name) -- a real SQL fetch only happens on the FIRST call
+        for a given table; every later call (same table used as a
+        query's positive again next epoch, drawn as a hard negative for
+        a different query in the same database, re-read while
+        materializing the corpus, etc.) returns the cached Table
+        directly. At real dataset scale this is the difference between
+        millions of live SQL reads per finetuning epoch and a handful
+        total. Side benefit, not just speed: this also makes a table's
+        sampled row set STABLE across the whole run instead of a fresh
+        random 50-row sample every single access -- the same table
+        means the same data everywhere it's referenced, which is what
+        you want for a fair, consistent comparison across epochs/splits
+        anyway. Returns the SAME Table object on a cache hit (not a
+        copy) -- safe because nothing in this codebase mutates a Table
+        in place after receiving it (e.g. ELECTRA corruption builds NEW
+        Column objects rather than mutating existing ones -- see
+        src/data/electra_corruption.py::corrupt_tables). Delete/restart
+        the process if you need a fresh random sample for some table.
         """
+        cache_key = (db_id, table_name)
+        if cache_key in self._materialized_table_cache:
+            return self._materialized_table_cache[cache_key]
+
         if not self.has_table(db_id, table_name):
             raise KeyError(f"unknown table: db_id={db_id!r} table_name={table_name!r}")
 
@@ -313,11 +348,13 @@ class SynSQLTableDataset:
             for i in range(len(column_names))
         ]
 
-        return Table(
+        table = Table(
             table_id=f"{db_id}#sep#{table_name}",
             table_name=f"{db_id}#sep#{table_name}",
             columns=columns,
         )
+        self._materialized_table_cache[cache_key] = table
+        return table
 
     def iter_tables(self) -> Iterator[Table]:
         """Materializes every table this dataset knows about, one at a
@@ -368,8 +405,9 @@ class SynSQLTableDataset:
             )
             with open(materialized_cache_path, "r", encoding="utf-8") as f:
                 raw_tables = json.load(f)
-            tables = [
-                Table(
+            tables = []
+            for t in raw_tables:
+                table = Table(
                     table_id=t["table_id"],
                     table_name=t["table_name"],
                     columns=[
@@ -381,8 +419,16 @@ class SynSQLTableDataset:
                         for c in t["columns"]
                     ],
                 )
-                for t in raw_tables
-            ]
+                tables.append(table)
+                # Also warm get_table()'s in-memory cache with these same
+                # objects -- otherwise loading the corpus from this JSON
+                # cache is instant, but every later get_table(db_id,
+                # table_name) call for one of these same tables (e.g. as
+                # a query's positive during finetune batch-building) would
+                # still fall through to a live SQL fetch, since it has no
+                # way of knowing this table was already materialized here.
+                db_id, _, table_name = t["table_id"].partition("#sep#")
+                self._materialized_table_cache[(db_id, table_name)] = table
             print(f"[load_corpus] loaded {len(tables)} table(s) from cache")
             return tables
 
