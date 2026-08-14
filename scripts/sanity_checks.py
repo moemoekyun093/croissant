@@ -233,7 +233,18 @@ def check_tiny_batch_overfit(
         if step % 20 == 0:
             print(f"  step {step}: loss {loss_value:.4f}")
 
-    print(f"[4/4 overfit check] first loss={losses[0]:.4f}  last loss={losses[-1]:.4f}")
+    # compare against the average of the last few steps rather than the
+    # single final step -- with lr=1e-3 and no warmup, the loss curve on
+    # a tiny model can bump up transiently before settling (observed in
+    # practice: a real run went 0.55 -> 0.58 -> 0.42 -> 0.33), so judging
+    # pass/fail off one possibly-unlucky final step is noise-sensitive.
+    # Averaging the tail is the standard fix for exactly this.
+    tail_n = min(10, len(losses))
+    final_loss = sum(losses[-tail_n:]) / tail_n
+    print(
+        f"[4/4 overfit check] first loss={losses[0]:.4f}  "
+        f"last loss={losses[-1]:.4f}  avg of last {tail_n}={final_loss:.4f}"
+    )
 
     # final accuracy on the SAME fixed corrupted batch just trained on --
     # a model that actually learned something should clear the trivial
@@ -253,7 +264,7 @@ def check_tiny_batch_overfit(
             f"(trivial always-real baseline: {trivial_baseline:.3f})"
         )
 
-    assert losses[-1] < losses[0] * 0.5, (
+    assert final_loss < losses[0] * 0.5, (
         "loss did not drop meaningfully on a tiny, truly FIXED batch -- "
         "this points to a bug in the loss/model wiring itself, independent "
         "of data or hyperparameters."
