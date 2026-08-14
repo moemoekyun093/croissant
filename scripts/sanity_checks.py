@@ -17,9 +17,11 @@ import random
 import torch
 import torch.nn.functional as F
 
+from src.data.electra_corruption import corrupt_tables, pad_labels
 from src.data.table import Column, Table
 from src.encoding.cell_encoder import CellEncoder
 from src.models.table_encoder import DiscriminatorHead, TableEncoder
+from src.training.losses import electra_discriminator_loss
 from src.training.trainer import PretrainTrainer
 
 
@@ -180,8 +182,22 @@ def check_tiny_batch_overfit(
 ) -> None:
     """corrupt_frac deliberately higher than pretrain.yaml's default
     (0.15) -- a tiny fixed batch needs enough corrupted cells to give the
-    discriminator a real signal to overfit to."""
+    discriminator a real signal to overfit to.
 
+    Corrupts ONCE, up front, and trains against that SAME fixed
+    (corrupted_tables, labels) pair for every step -- deliberately NOT
+    calling trainer.train_step() in the loop, since that internally
+    calls corrupt_tables() again on every call, which would re-randomize
+    which cells are corrupted on every step. That turns this into a
+    moving-target online-training check instead of a memorization check,
+    and a model can never drive loss to near-zero against a target that
+    keeps changing -- it isn't a bug, but it also isn't testing what this
+    check is supposed to test (does backprop/loss wiring work at all,
+    isolated from whether this specific ELECTRA task is easy or hard on
+    real data). A genuine fixed-batch overfit should reach a low loss
+    quickly regardless of how information-theoretically hard the actual
+    corruption-detection task might be in general.
+    """
     model = model_builder()
     discriminator = discriminator_builder()
     trainer = PretrainTrainer(model, discriminator, lr=lr, warmup_ratio=0.0, corrupt_frac=corrupt_frac)
@@ -190,27 +206,38 @@ def check_tiny_batch_overfit(
         trainer.optimizer, lambda step: 1.0
     )
 
+    device = next(model.parameters()).device
+    corrupted_tables, label_grids = corrupt_tables(tables, corrupt_frac)
+    labels = pad_labels(label_grids, device=device)  # fixed for the whole check
+
     losses = []
     for step in range(steps):
-        loss_value = trainer.train_step(tables)
+        model.train()
+        discriminator.train()
+        trainer.optimizer.zero_grad()
+
+        X, col_mask, row_mask, cell_mask = model.forward_batch_cellwise(corrupted_tables)
+        logits = discriminator(X)
+        loss = electra_discriminator_loss(logits, labels, cell_mask)
+
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(trainer._trainable_params(), trainer.grad_clip_norm)
+        trainer.optimizer.step()
+
+        loss_value = loss.item()
         losses.append(loss_value)
         if step % 20 == 0:
             print(f"  step {step}: loss {loss_value:.4f}")
 
     print(f"[4/4 overfit check] first loss={losses[0]:.4f}  last loss={losses[-1]:.4f}")
 
-    # diagnostic: on this same fixed (re-corrupted) batch, report the
-    # discriminator's final accuracy against the trivial "always predict
-    # real" baseline (which would score 1 - corrupt_frac) -- a model
-    # that's actually learned something should clear that baseline by a
-    # wide margin on data it's been directly overfitting to.
-    from src.data.electra_corruption import corrupt_tables, pad_labels
+    # final accuracy on the SAME fixed corrupted batch just trained on --
+    # a model that actually learned something should clear the trivial
+    # "always predict real" baseline (1 - corrupt_frac) by a wide margin.
     model.eval()
     discriminator.eval()
     with torch.no_grad():
-        corrupted, label_grids = corrupt_tables(tables, corrupt_frac)
-        labels = pad_labels(label_grids, device=next(model.parameters()).device)
-        X, col_mask, row_mask, cell_mask = model.forward_batch_cellwise(corrupted)
+        X, col_mask, row_mask, cell_mask = model.forward_batch_cellwise(corrupted_tables)
         preds = (torch.sigmoid(discriminator(X)) > 0.5).float()
         correct = ((preds == labels).float() * cell_mask).sum()
         total = cell_mask.sum().clamp(min=1.0)
@@ -222,9 +249,9 @@ def check_tiny_batch_overfit(
         )
 
     assert losses[-1] < losses[0] * 0.5, (
-        "loss did not drop meaningfully on a tiny, fixed batch -- this points "
-        "to a bug in the loss/model wiring itself, independent of data or "
-        "hyperparameters."
+        "loss did not drop meaningfully on a tiny, truly FIXED batch -- "
+        "this points to a bug in the loss/model wiring itself, independent "
+        "of data or hyperparameters."
     )
     print("[4/4 overfit check] OK")
 
