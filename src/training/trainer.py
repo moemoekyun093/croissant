@@ -21,7 +21,7 @@ from torch.optim.lr_scheduler import LambdaLR
 
 from src.data.table import Table
 from src.data.electra_corruption import build_non_fk_mask, corrupt_tables, pad_labels
-from src.eval.retrieval_metrics import compute_map
+from src.eval.retrieval_metrics import compute_map, compute_ranking_metrics
 from src.training.losses import (
     cross_score_queries_tables,
     electra_discriminator_loss,
@@ -397,21 +397,21 @@ class FinetuneTrainer:
 
         return loss.item()
 
-    def evaluate_map(
+    def _corpus_scores(
         self,
         examples: list[tuple[str, str, list[str]]],
         corpus_tables: list[Table],
         query_batch_size: int | None = None,
         table_batch_size: int = 32,
-    ) -> float:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Full-corpus Mean Average Precision -- the model-selection metric
-        (NOT the training loss). Ranks EVERY table in corpus_tables
-        against each query in `examples`, not just in-batch negatives
-        the way train_step/evaluate's InfoNCE loss does -- a batch-local
-        loss can look good or bad for reasons that have nothing to do
-        with full-corpus ranking quality, which is what actually matters
-        for retrieval.
+        Scores EVERY table in corpus_tables against each query in
+        `examples` -- not just in-batch negatives the way
+        train_step/evaluate's InfoNCE loss does -- and returns the raw
+        [n_queries, n_corpus] score matrix plus the matching positive
+        mask. Shared groundwork for evaluate_map (MAP only) and
+        evaluate_ranking_metrics (MAP + MRR from the same pass) -- not
+        meant to be called directly by training scripts.
 
         examples:      list of (question, db_id, table_names) -- kept as
                        plain tuples rather than importing
@@ -514,7 +514,44 @@ class FinetuneTrainer:
                     )  # [q_hi - q_lo, len(idx_chunk)]
                     scores[q_lo:q_hi].index_copy_(1, idx_tensor, cross.to(scores.device))
 
+        return scores, positive_mask
+
+    def evaluate_map(
+        self,
+        examples: list[tuple[str, str, list[str]]],
+        corpus_tables: list[Table],
+        query_batch_size: int | None = None,
+        table_batch_size: int = 32,
+    ) -> float:
+        """Mean Average Precision only -- see _corpus_scores' docstring
+        for every argument. If you also want MRR from the same ranking,
+        call evaluate_ranking_metrics instead: this and that both score
+        the corpus from scratch, so calling both back to back re-runs
+        the (expensive) encoder forward passes twice for no reason."""
+        scores, positive_mask = self._corpus_scores(
+            examples, corpus_tables, query_batch_size, table_batch_size
+        )
         return compute_map(scores, positive_mask)
+
+    def evaluate_ranking_metrics(
+        self,
+        examples: list[tuple[str, str, list[str]]],
+        corpus_tables: list[Table],
+        query_batch_size: int | None = None,
+        table_batch_size: int = 32,
+    ) -> dict:
+        """MAP and MRR together, from ONE corpus-scoring pass (see
+        _corpus_scores) and one ranking pass per query (see
+        src/eval/retrieval_metrics.py::compute_ranking_metrics) -- use
+        this instead of evaluate_map when you want both metrics, to
+        avoid re-scoring the whole corpus twice.
+
+        returns: {"map": float, "mrr": float}
+        """
+        scores, positive_mask = self._corpus_scores(
+            examples, corpus_tables, query_batch_size, table_batch_size
+        )
+        return compute_ranking_metrics(scores, positive_mask)
 
     def fit(
         self,
@@ -597,25 +634,31 @@ class FinetuneTrainer:
                     )
 
             epoch_avg = sum(epoch_losses) / max(1, len(epoch_losses))
-            epoch_elapsed = time.time() - epoch_start
+            epoch_train_elapsed = time.time() - epoch_start
 
-            val_map = self.evaluate_map(val_examples, corpus_tables)
+            val_start = time.time()
+            val_metrics = self.evaluate_ranking_metrics(val_examples, corpus_tables)
+            val_map, val_mrr = val_metrics["map"], val_metrics["mrr"]
+            val_elapsed = time.time() - val_start
+
+            self._log(
+                f"[finetune] epoch {epoch} summary: "
+                f"epoch loss {epoch_avg:.4f} | "
+                f"val MAP {val_map:.4f} | val MRR {val_mrr:.4f} | "
+                f"train time {epoch_train_elapsed:.1f}s | val time {val_elapsed:.1f}s"
+            )
 
             if val_map > best_map:
                 best_map = val_map
                 epochs_without_improvement = 0
-                self.save_checkpoint(epoch, extra={"val_map": val_map})
-                self._log(
-                    f"== [finetune] epoch {epoch} done, avg train loss {epoch_avg:.4f}, "
-                    f"val MAP {val_map:.4f} (NEW BEST), took {epoch_elapsed/60:.1f} min =="
-                )
+                self.save_checkpoint(epoch, extra={"val_map": val_map, "val_mrr": val_mrr})
+                self._log(f"== [finetune] epoch {epoch} done (NEW BEST val MAP) ==")
             else:
                 epochs_without_improvement += 1
                 self._log(
-                    f"== [finetune] epoch {epoch} done, avg train loss {epoch_avg:.4f}, "
-                    f"val MAP {val_map:.4f} (best so far: {best_map:.4f}, "
-                    f"{epochs_without_improvement}/{patience} epoch(s) without improvement), "
-                    f"took {epoch_elapsed/60:.1f} min =="
+                    f"== [finetune] epoch {epoch} done "
+                    f"(best val MAP so far: {best_map:.4f}, "
+                    f"{epochs_without_improvement}/{patience} epoch(s) without improvement) =="
                 )
                 if epochs_without_improvement >= patience:
                     self._log(

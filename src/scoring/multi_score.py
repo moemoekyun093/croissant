@@ -12,22 +12,42 @@ matching the rest of the codebase's masking convention).
     1. global:        max_{j,i} q^T X[i,j,:]
                        best-matching cell anywhere in the table -- no
                        row/column structure at all.
-    2. row_match:      sum_j max_i q^T X[i,j,:]
-                       best row per column, summed over columns.
-    3. column_match:   sum_i max_j q^T X[i,j,:]
-                       best column per row, summed over rows.
+    2. row_match:      mean_j max_i q^T X[i,j,:]
+                       best row per column, AVERAGED over the table's
+                       own real column count (not summed) -- so a table
+                       with more columns doesn't win purely by having
+                       more terms to accumulate; every table is scored
+                       on the same per-column-average scale regardless
+                       of its own width. (Was a plain sum; changed
+                       deliberately, per-instruction, for table-size
+                       fairness -- see row_match's inline comment. Note
+                       this is NOT rank-neutral: it can and will change
+                       which of two differently-sized tables ranks
+                       higher for the same query, by design.)
+    3. column_match:   mean_i max_j q^T X[i,j,:]
+                       best column per row, averaged over the table's
+                       own real row count -- same fairness rationale as
+                       (2), transposed.
     4. col_deepset:    DeepSet-pool_j( max_i q^T X[i,j,:] )
-                       same inner term as (2), learned pooling over
-                       columns instead of a plain sum.
+                       same inner term as (2)'s pre-averaging step,
+                       learned pooling over columns instead of a mean --
+                       NOT changed to match (2)/(3)'s averaging (the
+                       learned rho/phi pooling is a separate mechanism);
+                       still has the same table-size-bias risk (2)/(3)
+                       had before this change, since DeepSetPool1D's
+                       internal sum isn't count-normalized either.
     5. row_deepset:    DeepSet-pool_i( max_j q^T X[i,j,:] )
-                       same inner term as (3), learned pooling over rows.
-    6. mixture:        lambda * sum_j max_i q^T X[i,j,:]
-                       + (1-lambda) * sum_i q^T X'[i,:]
-                       (2)'s formula on X, blended with a plain dot
-                       product against X' (ColumnCollapse's row-indexed
-                       dual -- columns already pooled away there, so no
-                       max is needed/possible for that term), lambda
-                       learned via a sigmoid-constrained parameter.
+                       same inner term as (3)'s pre-averaging step,
+                       learned pooling over rows -- same caveat as (4).
+    6. mixture:        lambda * mean_j max_i q^T X[i,j,:]
+                       + (1-lambda) * mean_i q^T X'[i,:]
+                       (2)'s formula on X (already row-count-averaged,
+                       via calling row_match), blended with X'
+                       (ColumnCollapse's row-indexed dual -- columns
+                       already pooled away there, so no max is
+                       needed/possible for that term) -- ALSO averaged
+                       over real row count now, same fairness rationale,
+                       lambda learned via a sigmoid-constrained parameter.
 
 Every q^T X[i,j,:] term above is actually a COSINE similarity, not a raw
 dot product: both Q and X (and X_prime, for mode 6) are L2-normalized
@@ -170,17 +190,26 @@ class MultiScorer(nn.Module):
             return per_query.sum(dim=1)
 
         if mode == "row_match":
-            # max_i q^T X[i,j,:] per column j, then sum_j
+            # max_i q^T X[i,j,:] per column j, then MEAN over j (not sum)
+            # -- averaging by each table's own real column count so a
+            # table with more columns doesn't win purely by having more
+            # terms to accumulate; every table gets scored on the same
+            # [-1, 1]-ish scale regardless of its own width. See
+            # module docstring.
             best_per_col = _masked_max(sims, row_mask.view(B, 1, 1, -1), dim=-1)  # [B, L, N]
             best_per_col = best_per_col * col_mask.view(B, 1, -1)
-            per_query = best_per_col.sum(dim=-1)  # [B, L]
+            n_real = col_mask.sum(dim=-1).clamp(min=1.0)  # [B]
+            per_query = best_per_col.sum(dim=-1) / n_real.view(B, 1)  # [B, L]
             return per_query.sum(dim=1)
 
         if mode == "column_match":
-            # max_j q^T X[i,j,:] per row i, then sum_i
+            # max_j q^T X[i,j,:] per row i, then MEAN over i (not sum) --
+            # same per-table fairness rationale as row_match above, this
+            # time normalizing by the table's real row count.
             best_per_row = _masked_max(sims.transpose(-1, -2), col_mask.view(B, 1, 1, -1), dim=-1)  # [B, L, M]
             best_per_row = best_per_row * row_mask.view(B, 1, -1)
-            per_query = best_per_row.sum(dim=-1)
+            m_real = row_mask.sum(dim=-1).clamp(min=1.0)  # [B]
+            per_query = best_per_row.sum(dim=-1) / m_real.view(B, 1)
             return per_query.sum(dim=1)
 
         if mode == "col_deepset":
@@ -202,10 +231,11 @@ class MultiScorer(nn.Module):
                     "row-indexed dual (columns already pooled away -- no column "
                     "axis left, so term_b is a plain dot product, no max)."
                 )
-            term_a = self.score("row_match", Q, X, row_mask, col_mask)  # [B]
+            term_a = self.score("row_match", Q, X, row_mask, col_mask)  # [B] -- already row-count-averaged internally
             sims_prime = torch.einsum("blk,bmk->blm", _l2_normalize(Q), _l2_normalize(X_prime))  # [B, L, M]
             sims_prime = sims_prime * row_mask.view(B, 1, -1)
-            term_b = sims_prime.sum(dim=-1).sum(dim=1)  # [B]
+            m_real = row_mask.sum(dim=-1).clamp(min=1.0)  # [B] -- same per-table fairness as row_match/column_match
+            term_b = (sims_prime.sum(dim=-1) / m_real.view(B, 1)).sum(dim=1)  # [B]
             lam = self.mixture_lambda
             return lam * term_a + (1 - lam) * term_b
 
@@ -269,17 +299,22 @@ class MultiScorer(nn.Module):
             return per_query.sum(dim=-1)  # [Bq, Bt]
 
         if mode == "row_match":
+            # MEAN over columns (per-table real column count), not sum --
+            # see score()'s row_match for the fairness rationale.
             best_per_col = _masked_max(sims, row_mask.view(1, Bt, 1, 1, -1), dim=-1)  # [Bq,Bt,L,N]
             best_per_col = best_per_col * col_mask.view(1, Bt, 1, -1)
-            per_query = best_per_col.sum(dim=-1)  # [Bq, Bt, L]
+            n_real = col_mask.sum(dim=-1).clamp(min=1.0)  # [Bt]
+            per_query = best_per_col.sum(dim=-1) / n_real.view(1, Bt, 1)  # [Bq, Bt, L]
             return per_query.sum(dim=-1)  # [Bq, Bt]
 
         if mode == "column_match":
+            # MEAN over rows (per-table real row count), not sum.
             best_per_row = _masked_max(
                 sims.transpose(-1, -2), col_mask.view(1, Bt, 1, 1, -1), dim=-1
             )  # [Bq, Bt, L, M]
             best_per_row = best_per_row * row_mask.view(1, Bt, 1, -1)
-            per_query = best_per_row.sum(dim=-1)
+            m_real = row_mask.sum(dim=-1).clamp(min=1.0)  # [Bt]
+            per_query = best_per_row.sum(dim=-1) / m_real.view(1, Bt, 1)
             return per_query.sum(dim=-1)
 
         if mode == "col_deepset":
@@ -301,10 +336,11 @@ class MultiScorer(nn.Module):
                 raise ValueError(
                     "mode='mixture' requires X_prime: [Bt, M, k], see score()'s docstring."
                 )
-            term_a = self.score_cross("row_match", Q, X, row_mask, col_mask)  # [Bq, Bt]
+            term_a = self.score_cross("row_match", Q, X, row_mask, col_mask)  # [Bq, Bt] -- already row-count-averaged
             sims_prime = torch.einsum("qlk,tmk->qtlm", _l2_normalize(Q), _l2_normalize(X_prime))  # [Bq, Bt, L, M]
             sims_prime = sims_prime * row_mask.view(1, Bt, 1, -1)
-            term_b = sims_prime.sum(dim=-1).sum(dim=-1)  # [Bq, Bt]
+            m_real = row_mask.sum(dim=-1).clamp(min=1.0)  # [Bt]
+            term_b = (sims_prime.sum(dim=-1) / m_real.view(1, Bt, 1)).sum(dim=-1)  # [Bq, Bt]
             lam = self.mixture_lambda
             return lam * term_a + (1 - lam) * term_b
 
