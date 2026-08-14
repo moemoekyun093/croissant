@@ -36,6 +36,7 @@ FREE_GPU="${FREE_GPU:-3}"
 BUSY_GPU="${BUSY_GPU:-2}"
 POLL_SECONDS="${POLL_SECONDS:-60}"
 FREE_THRESHOLD_MIB="${FREE_THRESHOLD_MIB:-2000}"  # under this = "free enough" to start
+CONSECUTIVE_FREE_CHECKS="${CONSECUTIVE_FREE_CHECKS:-3}"  # avoid starting on a single transient dip
 
 # Everything except "ours" -- that model is assumed already running
 # manually. Rerun scripts/run_all_models.sh (or pass --encoder ours to
@@ -77,18 +78,34 @@ run_encoder() {
 }
 
 wait_for_gpu_free() {
+  # Requires CONSECUTIVE_FREE_CHECKS consecutive under-threshold readings
+  # in a row before declaring the GPU free -- a single low reading could
+  # just be a transient dip between steps (e.g. between batches, or
+  # during a checkpoint save) rather than the job actually finishing.
+  # Any busy reading resets the streak back to zero.
   local gpu="$1"
-  echo "[gpu${gpu}] waiting for GPU ${gpu} to free up (polling every ${POLL_SECONDS}s, threshold ${FREE_THRESHOLD_MIB} MiB used) ..."
+  local streak=0
+  echo "[gpu${gpu}] waiting for GPU ${gpu} to free up (polling every ${POLL_SECONDS}s, threshold ${FREE_THRESHOLD_MIB} MiB used, requires ${CONSECUTIVE_FREE_CHECKS} consecutive free reading(s)) ..."
   while true; do
     local used
     used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$gpu" 2>/dev/null | tr -d '[:space:]')
     if [ -z "$used" ]; then
       echo "[gpu${gpu}] nvidia-smi query failed -- retrying in ${POLL_SECONDS}s"
+      streak=0
     elif [ "$used" -lt "$FREE_THRESHOLD_MIB" ]; then
-      echo "[gpu${gpu}] GPU ${gpu} is free (memory used: ${used} MiB) -- starting queue"
-      return
+      streak=$((streak + 1))
+      echo "[gpu${gpu}] free reading ${streak}/${CONSECUTIVE_FREE_CHECKS} (memory used: ${used} MiB)"
+      if [ "$streak" -ge "$CONSECUTIVE_FREE_CHECKS" ]; then
+        echo "[gpu${gpu}] GPU ${gpu} confirmed free after ${streak} consecutive reading(s) -- starting queue"
+        return
+      fi
     else
-      echo "[gpu${gpu}] still busy (memory used: ${used} MiB) -- checking again in ${POLL_SECONDS}s"
+      if [ "$streak" -gt 0 ]; then
+        echo "[gpu${gpu}] busy again (memory used: ${used} MiB) -- resetting free streak"
+      else
+        echo "[gpu${gpu}] still busy (memory used: ${used} MiB) -- checking again in ${POLL_SECONDS}s"
+      fi
+      streak=0
     fi
     sleep "$POLL_SECONDS"
   done
