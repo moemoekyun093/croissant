@@ -149,6 +149,16 @@ class SynSQLTableDataset:
                 if os.path.isdir(os.path.join(databases_root, d))
             )
 
+        # O(1) membership for has_table() -- self._db_ids stays a list
+        # (order/db_ids()/table_keys() rely on that), but has_table() is
+        # called once per (question, table_name) pair while building
+        # SynSQLQueryDataset -- millions of times for the real
+        # questions_with_tables.json -- and "db_id in self._db_ids" as a
+        # linear scan over thousands of db_ids turns that into an
+        # accidental quadratic scan (millions x thousands = billions of
+        # comparisons on one core). This set is the actual fix.
+        self._db_id_set = set(self._db_ids)
+
         self._conn_cache: dict[str, sqlite3.Connection] = {}
         self._table_names_cache: dict[str, list[str]] = {}
         self._column_names_cache: dict[tuple[str, str], list[str]] = {}
@@ -171,7 +181,7 @@ class SynSQLTableDataset:
         return list(self._table_names(db_id))
 
     def has_table(self, db_id: str, table_name: str) -> bool:
-        return db_id in self._db_ids and table_name in self._table_names(db_id)
+        return db_id in self._db_id_set and table_name in self._table_names(db_id)
 
     def _connection(self, db_id: str) -> sqlite3.Connection:
         if db_id not in self._conn_cache:
