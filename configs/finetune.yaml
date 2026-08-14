@@ -1,44 +1,50 @@
 # Query->table finetuning hyperparameters: real (question, positive
 # table) contrastive training via MultiScorer, starting from an
-# ELECTRA-pretrained encoder checkpoint
-# (src/training/query_encoder.py, FinetuneTrainer in src/training/trainer.py,
-# src/scoring/multi_score.py).
+# ELECTRA-pretrained encoder checkpoint (src/training/query_encoder.py,
+# FinetuneTrainer in src/training/trainer.py, src/scoring/multi_score.py).
 #
-# `defaults` = current values used in code today (scripts/finetune_query_table.py's
-#              argparse defaults + FinetuneTrainer's constructor defaults).
+# `defaults` = current values used in code today. Loaded automatically as
+#              argparse defaults by scripts/finetune_query_table.py (via
+#              src/training/config.py::apply_yaml_defaults, merged with
+#              model.yaml) -- editing a value here changes what a
+#              flag-less run actually uses. Pass the matching --flag on
+#              the command line to override any single value for one run
+#              without touching this file.
 # `sweep`    = candidate values worth trying. Like pretrain.yaml, this
 #              whole stage is new and unvalidated against real data --
 #              `defaults` is a starting point, not a checked choice.
 
 defaults:
   # -- query encoder (src/training/query_encoder.py::QueryEncoder) --
-  query_model_name: bert-base-uncased     # 🤷 same backbone as CellEncoder, never compared against alternatives
-  query_trainable: true                   # 🎯 unlike CellEncoder's frozen BERT, the query tower trains from the start -- finetuning is exactly the stage with real query supervision (see QueryEncoder docstring)
-  query_max_length: 32                    # 🤷 carried over from CellEncoder's cell/header max_length, not re-checked for query length distribution
-  exclude_special_tokens: false           # 🎯 keeps [CLS]/[SEP] as ordinary query vectors, matching ColBERT's own convention
+  query_model_name: bert-base-uncased     # [default] same backbone as CellEncoder, never compared against alternatives
+  query_trainable: true                   # [deliberate] unlike CellEncoder's frozen BERT, the query tower trains from the start -- finetuning is exactly the stage with real query supervision
+  query_max_length: 32                    # [default] carried over from CellEncoder's cell/header max_length, not re-checked for query length distribution
+  exclude_special_tokens: false           # [deliberate] keeps [CLS]/[SEP] as ordinary query vectors, matching ColBERT's own convention
 
   # -- scoring (src/scoring/multi_score.py::MultiScorer) --
-  scoring_mode: row_match                 # 🎯 chosen over column_match/mixture/etc. -- see conversation; structurally closest to the existing table-table MaxSim convention
+  scoring_mode: row_match                 # [deliberate] chosen over column_match/mixture/etc. as structurally closest to the existing table-table MaxSim convention
 
   # -- optimizer / schedule --
-  lr: 1.0e-4                              # 🤷 not re-tuned for this stage; finetuning often wants a LOWER lr than pretraining since the encoder already has learned structure to preserve -- worth checking explicitly, not just reusing pretrain.yaml's value
-  weight_decay: 0.01                      # 🤷 standard AdamW default
-  warmup_ratio: 0.1                       # 🎯 standard convention
-  grad_clip_norm: 1.0                     # 🎯 standard safeguard
+  lr: 1.0e-4                              # [default] not re-tuned for this stage -- finetuning often wants a LOWER lr than pretraining since the encoder already has learned structure to preserve, worth checking explicitly rather than reusing pretrain.yaml's value
+  weight_decay: 0.01                      # [default] standard AdamW default
+  warmup_ratio: 0.1                       # [deliberate] standard convention
+  grad_clip_norm: 1.0                     # [deliberate] standard safeguard
 
   # -- contrastive loss (src/training/losses.py::query_table_info_nce_loss) --
-  temperature: 0.07                       # 🤷 carried over from the table-table InfoNCE default, not re-derived for query-table scoring's different score scale/range
-  negatives: in_batch                     # ⚠️ known issue, not just untuned -- see conversation: two queries sharing the same positive table in one batch currently corrupts each other's negatives; not yet deduplicated
+  temperature: 0.07                       # [default] carried over from the earlier table-table InfoNCE default, not re-derived for query-table scoring's different score scale/range
+  negatives: in_batch                     # [known issue, not a settable parameter -- no --flag] two queries sharing the same positive table in one batch currently corrupts each other's negatives; not yet deduplicated
 
   # -- batching / epochs --
-  batch_size: 32                          # 🤷 smaller than pretrain's 64 by guess only (cross_score_queries_tables loops Bq times per step, so cost grows faster with batch size here than in the other two stages) -- not measured
-  num_epochs: 10                          # 🤷 no principled stopping criterion yet
+  batch_size: 32                          # [default] smaller than pretrain's 64 by guess only (the cross-query-vs-table scoring loop's cost grows faster with batch size here than in the other stages), not measured
+  num_epochs: 10                          # [default] no principled stopping criterion yet
+  max_rows: 50                            # [deliberate] matches MAX_ROWS convention referenced in training_config.md
+  max_columns: 20                         # [default] truncation cap for outlier-wide tables, used by the size-bucketing batcher
 
   # -- data split --
-  val_frac: 0.1                           # 🤷 standard default, not tuned
+  val_frac: 0.1                           # [default] standard default, not tuned
 
   # -- infra / logging --
-  device: cuda:2                          # 🎯 re-check via nvidia-smi before reuse
+  device: cuda:2                          # [deliberate, needs rechecking] re-check via nvidia-smi before reuse
   checkpoint_dir: eval/report_runs/finetune
   log_every: 10
 

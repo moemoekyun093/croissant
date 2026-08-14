@@ -3,12 +3,22 @@
 # Sourced from: src/models/table_encoder.py, src/models/rcpe.py,
 # src/encoding/cell_encoder.py, src/training/training_config.md
 #
-# `defaults` = current values used in code today.
-# `sweep`    = candidate values worth trying, for settings flagged 🤷
+# `defaults` = current values used in code today. Loaded automatically as
+#              argparse defaults by scripts/pretrain_electra.py and
+#              scripts/finetune_query_table.py (via
+#              src/training/config.py::apply_yaml_defaults) -- editing a
+#              value here changes what a flag-less run actually uses.
+#              Pass the matching --flag on the command line to override
+#              any single value for one run without touching this file.
+# `sweep`    = candidate values worth trying, for settings marked [default]
 #              (reasonable-but-unvalidated) in training_config.md.
-#              Settings flagged 🎯 (deliberately reasoned) are left out
-#              of `sweep` on purpose -- change them only with a specific
-#              reason, not as part of a blind grid search.
+#              Settings marked [deliberate] are left out of `sweep` on
+#              purpose -- change them only with a specific reason, not as
+#              part of a blind grid search.
+#
+# Data/batching caps (max_rows, max_columns) live in pretrain.yaml /
+# finetune.yaml instead of here -- they're data-pipeline concerns, not
+# architecture.
 #
 # NOTE (current simplification): numeric cells are no longer routed to a
 # separate NumericEmbedder -- every cell (numeric-looking or not) is
@@ -29,20 +39,16 @@
 
 defaults:
   # -- cell + header encoder (single shared BERT + projection) --
-  text_model_name: bert-base-uncased      # 🤷 never compared against alternatives
-  text_trainable: false                   # 🎯 frozen BERT + trainable projection (CLIP-style)
-  text_max_length: 32                     # 🎯 sized for short cell values; known-inadequate for prose-heavy cells
-  text_max_batch_size: 2048               # 🎯 internal BERT chunk size, safety bound
+  text_model_name: bert-base-uncased      # [default] never compared against alternatives
+  text_trainable: false                   # [deliberate] frozen BERT + trainable projection (CLIP-style)
+  text_max_length: 32                     # [deliberate] sized for short cell values; known-inadequate for prose-heavy cells
+  text_max_batch_size: 2048               # [deliberate] internal BERT chunk size, safety bound
 
   # -- table encoder / RCPE table layers --
-  embed_dim: 64                           # 🤷 inconsistent across scripts (64 in pilot_train.py, 32 in sanity_checks.py) -- pick one; must be even (BERT projects to embed_dim // 2 per half)
-  num_layers: 1                           # cheap to increase; cell encoding (BERT) dominates >99% of wall time
-  nonlinearity: sigmoid                   # 🎯 follows original spec sigma(gate * X X^T); tanh/relu wired but untested
-  channel_mix_hidden_dim: null            # defaults to embed_dim * 2 when null; 🤷 lighter than standard transformer FFN (x4)
-
-  # -- data / corpus shape caps --
-  max_rows_per_table: 50                  # 🎯 MAX_ROWS, caps O(m^2) attention cost in ColumnAggregator
-  max_columns_per_table: 20               # truncation cap used in scripts/pilot_train.py make_batches
+  embed_dim: 64                           # [default] must be even (BERT projects to embed_dim // 2 per half)
+  num_layers: 1                           # [default] cheap to increase, cell encoding (BERT) dominates >99% of wall time
+  nonlinearity: sigmoid                   # [deliberate] follows original spec sigma(gate * X X^T); tanh/relu wired but untested
+  channel_mix_hidden_dim: null            # [default] defaults to embed_dim * 2 when null; lighter than standard transformer FFN (x4)
 
 sweep:
   embed_dim: [32, 64, 96, 128]

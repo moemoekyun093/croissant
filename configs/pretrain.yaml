@@ -1,9 +1,14 @@
 # ELECTRA-style pretraining hyperparameters: cell corruption + per-cell
-# discriminator (src/data/electra_corruption.py, DiscriminatorHead +
-# PretrainTrainer in src/models/table_encoder.py / src/training/trainer.py).
+# discriminator (src/data/electra_corruption.py, DiscriminatorHead in
+# src/models/table_encoder.py, PretrainTrainer in src/training/trainer.py).
 #
-# `defaults` = current values used in code today (scripts/pretrain_electra.py's
-#              argparse defaults + PretrainTrainer's constructor defaults).
+# `defaults` = current values used in code today. Loaded automatically as
+#              argparse defaults by scripts/pretrain_electra.py (via
+#              src/training/config.py::apply_yaml_defaults, merged with
+#              model.yaml) -- editing a value here changes what a
+#              flag-less run actually uses. Pass the matching --flag on
+#              the command line to override any single value for one run
+#              without touching this file.
 # `sweep`    = candidate values worth trying. Everything here is genuinely
 #              untuned -- this whole training stage is new, nothing has
 #              been run against real data yet -- so treat `defaults` as a
@@ -11,28 +16,29 @@
 
 defaults:
   # -- corruption (src/data/electra_corruption.py::corrupt_tables) --
-  corrupt_frac: 0.15                      # 🤷 fraction of real cells corrupted per table, chosen by analogy to BERT's 15% MLM rate -- not derived for this task
-  corruption_pool_scope: batch_column_match  # 🎯 pool = every real value seen anywhere in the batch under the SAME header text (own table included) -- see conversation: exact header-string match only, no fuzzy/cross-name matching yet
+  corrupt_frac: 0.15                      # [default] fraction of real cells corrupted per table, chosen by analogy to BERT's 15% MLM rate, not derived for this task
+  corruption_pool_scope: batch_column_match  # [deliberate, not a settable parameter -- no --flag] describes fixed behavior: replacement pool = every real value seen anywhere in the batch under the SAME header text (own table included), exact string match only, no fuzzy/cross-name matching
 
   # -- discriminator head (src/models/table_encoder.py::DiscriminatorHead) --
-  discriminator_hidden_dim: null          # defaults to embed_dim when null; 2-layer MLP w/ GELU, one logit per cell
+  discriminator_hidden_dim: null          # [default] defaults to embed_dim when null
 
-  # -- optimizer / schedule (shared AdamW + linear warmup/decay, same as training.yaml) --
-  lr: 1.0e-4                              # 🤷 carried over from the contrastive-pretraining default, not re-tuned for this task
-  weight_decay: 0.01                      # 🤷 standard AdamW default
-  warmup_ratio: 0.1                       # 🎯 standard convention
-  grad_clip_norm: 1.0                     # 🎯 standard safeguard
+  # -- optimizer / schedule (shared AdamW + linear warmup/decay) --
+  lr: 1.0e-4                              # [default] carried over from the earlier contrastive-pretraining default, not re-tuned for this task
+  weight_decay: 0.01                      # [default] standard AdamW default
+  warmup_ratio: 0.1                       # [deliberate] standard convention
+  grad_clip_norm: 1.0                     # [deliberate] standard safeguard
 
   # -- batching / epochs --
-  batch_size: 64                          # 🤷 carried over from pilot_train.py's GPU-headroom-based choice -- not re-checked for this task's memory profile (row-resolved X is [B,N,M,k], not pooled -- higher memory than the old contrastive path at the same batch size)
-  num_epochs: 15                          # 🤷 no principled stopping criterion yet
-  max_rows: 50                            # 🎯 matches MAX_ROWS convention used elsewhere (model.yaml)
+  batch_size: 64                          # [default, known risk] carried over from the earlier pipeline's GPU-headroom-based choice, not re-checked for this task's memory profile (row-resolved X is [B,N,M,k], not pooled -- higher memory than the old contrastive path at the same batch size)
+  num_epochs: 15                          # [default] no principled stopping criterion yet
+  max_rows: 50                            # [deliberate] matches MAX_ROWS convention referenced in training_config.md
+  max_columns: 20                         # [default] truncation cap for outlier-wide tables, used by the size-bucketing batcher
 
   # -- data split --
-  val_frac: 0.1                           # 🤷 standard default, not tuned
+  val_frac: 0.1                           # [default] standard default, not tuned
 
   # -- infra / logging --
-  device: cuda:2                          # 🎯 re-check via nvidia-smi before reuse, same caveat as training.yaml
+  device: cuda:2                          # [deliberate, needs rechecking] re-check via nvidia-smi before reuse
   checkpoint_dir: eval/report_runs/pretrain
   log_every: 10
 

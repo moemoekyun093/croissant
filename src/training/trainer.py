@@ -12,6 +12,7 @@ pass (TableEncoder) are project-specific.
 """
 
 import os
+import random
 from typing import Iterable
 
 import torch
@@ -70,6 +71,7 @@ class PretrainTrainer:
         corrupt_frac: float = 0.15,
         checkpoint_dir: str = "eval/report_runs/pretrain",
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
+        seed: int = 42,
     ):
         self.model = model.to(device)
         self.discriminator = discriminator.to(device)
@@ -80,6 +82,12 @@ class PretrainTrainer:
         self.warmup_ratio = warmup_ratio
         self.grad_clip_norm = grad_clip_norm
         self.corrupt_frac = corrupt_frac
+
+        # owns its own seeded RNG (not the bare `random` module) so
+        # between-epoch batch reshuffling is reproducible given the same
+        # seed -- construction-time batch/table sampling in the calling
+        # script should use this same seed for a fully reproducible run.
+        self._rng = random.Random(seed)
 
         self.checkpoint_dir = checkpoint_dir
         os.makedirs(checkpoint_dir, exist_ok=True)
@@ -134,7 +142,6 @@ class PretrainTrainer:
         val_batches: list[list[Table]] | None = None,
         resume_from: str | None = None,
     ) -> None:
-        import random
         import time
 
         # Materialized once (not just iterated) specifically so it can be
@@ -167,8 +174,10 @@ class PretrainTrainer:
             # each batch's own table composition stays whatever
             # make_batches' size-bucketing produced) so every epoch sees
             # a different training order instead of the exact same
-            # sequence every time.
-            random.shuffle(batches)
+            # sequence every time. Uses this trainer's own seeded RNG
+            # (not the bare random module) so the whole run is
+            # reproducible given the same seed.
+            self._rng.shuffle(batches)
 
             epoch_losses = []
             epoch_start = time.time()
@@ -276,6 +285,7 @@ class FinetuneTrainer:
         scoring_mode: str = "row_match",
         checkpoint_dir: str = "eval/report_runs/finetune",
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
+        seed: int = 42,
     ):
         self.model = model.to(device)
         self.query_encoder = query_encoder.to(device)
@@ -288,6 +298,12 @@ class FinetuneTrainer:
         self.grad_clip_norm = grad_clip_norm
         self.temperature = temperature
         self.scoring_mode = scoring_mode
+
+        # owns its own seeded RNG (not the bare `random` module) so
+        # between-epoch batch reshuffling is reproducible given the same
+        # seed -- construction-time batch/example sampling in the calling
+        # script should use this same seed for a fully reproducible run.
+        self._rng = random.Random(seed)
 
         self.checkpoint_dir = checkpoint_dir
         os.makedirs(checkpoint_dir, exist_ok=True)
@@ -360,7 +376,6 @@ class FinetuneTrainer:
         val_batches: list[list[tuple[str, Table]]] | None = None,
         resume_from: str | None = None,
     ) -> None:
-        import random
         import time
 
         # Materialized once so it can be RESHUFFLED between epochs below --
@@ -388,8 +403,10 @@ class FinetuneTrainer:
             # reshuffle BATCH ORDER between epochs (query/table pairing
             # within each batch stays fixed -- only the sequence of
             # batches changes) so every epoch sees a different order
-            # instead of the exact same sequence every time.
-            random.shuffle(batches)
+            # instead of the exact same sequence every time. Uses this
+            # trainer's own seeded RNG (not the bare random module) so
+            # the whole run is reproducible given the same seed.
+            self._rng.shuffle(batches)
 
             epoch_losses = []
             epoch_start = time.time()
