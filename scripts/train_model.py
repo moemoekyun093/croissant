@@ -181,6 +181,16 @@ if __name__ == "__main__":
     parser.add_argument("--log_every", type=int, default=50)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
+        "--skip_pretrain", action=argparse.BooleanOptionalAction, default=False,
+        help="skip stage 1 (ELECTRA pretraining) entirely and finetune straight from a "
+             "freshly-initialized encoder -- no pretrain data sampling, no pretrain "
+             "checkpoint. Useful for fast pilot iteration on the finetuning path alone. "
+             "NOTE: for the actual model-vs-baseline comparison you're building toward, "
+             "the agreed methodology is ELECTRA pretraining + finetuning for every model "
+             "-- treat runs made with this flag as finetune-only smoke tests, not "
+             "results to report.",
+    )
+    parser.add_argument(
         "--text_cache_path", default=None,
         help="only meaningful for --encoder ours -- see "
              "scripts/pretrain_electra.py's --text_cache_path. Defaults to "
@@ -267,31 +277,6 @@ if __name__ == "__main__":
     corpus_tables = table_dataset.load_corpus(args.corpus_json)
     print(f"corpus: {len(corpus_tables)} table(s) -- used unsplit for every val/test ranking")
 
-    # ---------------------------------------------------------------
-    # stage 1: ELECTRA pretraining
-    # ---------------------------------------------------------------
-    db_ids = table_dataset.db_ids()
-    if args.n_dbs is not None and args.n_dbs < len(db_ids):
-        rng.shuffle(db_ids)
-        db_ids = db_ids[: args.n_dbs]
-        print(f"pretrain pilot: sampling {len(db_ids)} database(s)")
-
-    table_keys = [(db_id, t) for db_id in db_ids for t in table_dataset.tables_in_db(db_id)]
-    rng.shuffle(table_keys)
-    if args.n_tables is not None and args.n_tables < len(table_keys):
-        table_keys = table_keys[: args.n_tables]
-        print(f"pretrain pilot: sampling {len(table_keys)} table(s)")
-
-    pretrain_tables = [table_dataset.get_table(db_id, t) for db_id, t in table_keys]
-    print(f"pretrain corpus: {len(pretrain_tables)} table(s)")
-
-    n_val = max(1, int(len(pretrain_tables) * 0.1))
-    pretrain_val_tables, pretrain_train_tables = pretrain_tables[:n_val], pretrain_tables[n_val:]
-
-    pretrain_batches = make_batches(pretrain_train_tables, args.pretrain_batch_size, rng, max_columns=args.max_columns)
-    pretrain_val_batches = make_batches(pretrain_val_tables, args.pretrain_batch_size, rng, max_columns=args.max_columns)
-    print(f"pretrain: {len(pretrain_batches)} train batches/epoch, {len(pretrain_val_batches)} val batches")
-
     model = build_table_model(args)
 
     # Text-embedding cache: only "ours" has one (CellEncoder/TextEmbedder
@@ -304,43 +289,74 @@ if __name__ == "__main__":
         model.load_text_cache(args.text_cache_path)
         print(f"text cache warm-started with {model.cell_encoder.text_embedder.cache_size()} entries")
 
-    discriminator = DiscriminatorHead(embed_dim=args.embed_dim, hidden_dim=args.discriminator_hidden_dim)
-
-    pretrainer = PretrainTrainer(
-        model,
-        discriminator,
-        lr=args.pretrain_lr,
-        weight_decay=args.weight_decay,
-        warmup_ratio=args.warmup_ratio,
-        grad_clip_norm=args.grad_clip_norm,
-        corrupt_frac=args.corrupt_frac,
-        checkpoint_dir=pretrain_dir,
-        device=args.device,
-        seed=args.seed,
-    )
-
-    print(f"\n=== [{args.encoder}] stage 1/2: ELECTRA pretraining on {args.device} ===")
-    pretrainer.fit(
-        pretrain_batches,
-        num_epochs=args.pretrain_epochs,
-        steps_per_epoch=len(pretrain_batches),
-        log_every=args.log_every,
-        val_batches=pretrain_val_batches,
-    )
-
-    if args.encoder == "ours":
-        os.makedirs(os.path.dirname(args.text_cache_path) or ".", exist_ok=True)
-        model.save_text_cache(args.text_cache_path)
+    if args.skip_pretrain:
         print(
-            f"saved text cache ({model.cell_encoder.text_embedder.cache_size()} entries) "
-            f"to {args.text_cache_path} after pretraining"
+            f"\n=== [{args.encoder}] stage 1/2: SKIPPED (--skip_pretrain) -- "
+            f"finetuning from a freshly-initialized encoder ==="
+        )
+    else:
+        # -----------------------------------------------------------
+        # stage 1: ELECTRA pretraining
+        # -----------------------------------------------------------
+        db_ids = table_dataset.db_ids()
+        if args.n_dbs is not None and args.n_dbs < len(db_ids):
+            rng.shuffle(db_ids)
+            db_ids = db_ids[: args.n_dbs]
+            print(f"pretrain pilot: sampling {len(db_ids)} database(s)")
+
+        table_keys = [(db_id, t) for db_id in db_ids for t in table_dataset.tables_in_db(db_id)]
+        rng.shuffle(table_keys)
+        if args.n_tables is not None and args.n_tables < len(table_keys):
+            table_keys = table_keys[: args.n_tables]
+            print(f"pretrain pilot: sampling {len(table_keys)} table(s)")
+
+        pretrain_tables = [table_dataset.get_table(db_id, t) for db_id, t in table_keys]
+        print(f"pretrain corpus: {len(pretrain_tables)} table(s)")
+
+        n_val = max(1, int(len(pretrain_tables) * 0.1))
+        pretrain_val_tables, pretrain_train_tables = pretrain_tables[:n_val], pretrain_tables[n_val:]
+
+        pretrain_batches = make_batches(pretrain_train_tables, args.pretrain_batch_size, rng, max_columns=args.max_columns)
+        pretrain_val_batches = make_batches(pretrain_val_tables, args.pretrain_batch_size, rng, max_columns=args.max_columns)
+        print(f"pretrain: {len(pretrain_batches)} train batches/epoch, {len(pretrain_val_batches)} val batches")
+
+        discriminator = DiscriminatorHead(embed_dim=args.embed_dim, hidden_dim=args.discriminator_hidden_dim)
+
+        pretrainer = PretrainTrainer(
+            model,
+            discriminator,
+            lr=args.pretrain_lr,
+            weight_decay=args.weight_decay,
+            warmup_ratio=args.warmup_ratio,
+            grad_clip_norm=args.grad_clip_norm,
+            corrupt_frac=args.corrupt_frac,
+            checkpoint_dir=pretrain_dir,
+            device=args.device,
+            seed=args.seed,
         )
 
-    ckpt = latest_checkpoint(pretrain_dir)
-    if ckpt is None:
-        raise RuntimeError(f"pretraining produced no checkpoint in {pretrain_dir}")
-    print(f"loading pretrained encoder from {ckpt}")
-    load_pretrained_encoder(model, ckpt, device=args.device)
+        print(f"\n=== [{args.encoder}] stage 1/2: ELECTRA pretraining on {args.device} ===")
+        pretrainer.fit(
+            pretrain_batches,
+            num_epochs=args.pretrain_epochs,
+            steps_per_epoch=len(pretrain_batches),
+            log_every=args.log_every,
+            val_batches=pretrain_val_batches,
+        )
+
+        if args.encoder == "ours":
+            os.makedirs(os.path.dirname(args.text_cache_path) or ".", exist_ok=True)
+            model.save_text_cache(args.text_cache_path)
+            print(
+                f"saved text cache ({model.cell_encoder.text_embedder.cache_size()} entries) "
+                f"to {args.text_cache_path} after pretraining"
+            )
+
+        ckpt = latest_checkpoint(pretrain_dir)
+        if ckpt is None:
+            raise RuntimeError(f"pretraining produced no checkpoint in {pretrain_dir}")
+        print(f"loading pretrained encoder from {ckpt}")
+        load_pretrained_encoder(model, ckpt, device=args.device)
 
     # ---------------------------------------------------------------
     # stage 2: query-table finetuning (early stopping on val MAP)
@@ -434,6 +450,7 @@ if __name__ == "__main__":
         "num_layers": args.num_layers,
         "n_hard_negatives": args.n_hard_negatives,
         "patience": args.patience,
+        "skip_pretrain": args.skip_pretrain,
         "pretrain_epochs_configured": args.pretrain_epochs,
         "finetune_epochs_configured": args.finetune_epochs,
         "split_json": args.split_json,
