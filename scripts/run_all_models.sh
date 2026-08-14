@@ -14,6 +14,17 @@
 # your copy lives somewhere else or is laid out differently):
 #   ./scripts/run_all_models.sh
 #
+# PRETRAIN_EPOCHS defaults to 1 (not pretrain.yaml's 15) -- capped low
+# here deliberately for a full 7-model sweep's total wall-clock; override
+# via env var if you want every encoder pretrained longer. Finetune
+# epochs are NOT capped here -- they still come from finetune.yaml's own
+# default (currently 10) -- pass FINETUNE_EPOCHS-equivalent flags
+# yourself by editing this script if you want that capped too.
+#
+# VAL_SAMPLE_SIZE defaults to 3000 -- without it, a real split's val set
+# (can be hundreds of thousands of queries) gets ranked against the full
+# corpus every single finetune epoch, which is prohibitively slow.
+#
 # Every flag below is overridable via env var, same convention as
 # scripts/run_pilot.sh. Split/corpus files must already exist -- run
 # scripts/build_query_splits.py once first if configs/splits/*.json
@@ -29,6 +40,11 @@ CORPUS_JSON="${CORPUS_JSON:-configs/splits/corpus.json}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-eval/report_runs}"
 LOG_DIR="${LOG_DIR:-eval/report_runs/logs}"
 SEED="${SEED:-42}"
+PRETRAIN_EPOCHS="${PRETRAIN_EPOCHS:-1}"
+VAL_SAMPLE_SIZE="${VAL_SAMPLE_SIZE:-3000}"  # see scripts/train_model.py's --val_sample_size --
+                                             # a real split's val set can be hundreds of
+                                             # thousands of queries; ranking all of them against
+                                             # the full corpus every epoch is impractically slow.
 GPUS=(2 3)  # 0 and 1 are busy -- do not add them here.
 
 # Every encoder this codebase can train: "ours" + every registered
@@ -61,6 +77,8 @@ run_encoder() {
     --checkpoint_dir "$CHECKPOINT_DIR" \
     --device "cuda:${gpu}" \
     --seed "$SEED" \
+    --pretrain_epochs "$PRETRAIN_EPOCHS" \
+    --val_sample_size "$VAL_SAMPLE_SIZE" \
     "${TABLES_FLAG[@]}" \
     > "$log_file" 2>&1
   local status=$?

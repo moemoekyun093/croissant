@@ -66,7 +66,7 @@ from src.training.query_encoder import QueryEncoder
 from src.training.trainer import FinetuneTrainer, PretrainTrainer
 
 from scripts.pretrain_electra import make_batches
-from scripts.finetune_query_table import cap_columns, resolve_train_batches, to_eval_examples
+from scripts.finetune_query_table import cap_columns, count_batches, resolve_train_batches, to_eval_examples
 
 ENCODER_CHOICES = ["ours"] + sorted(ENCODER_REGISTRY)
 
@@ -402,7 +402,13 @@ if __name__ == "__main__":
             )
         )
 
-    finetune_steps_per_epoch = len(build_train_batches())
+    # Arithmetic count, NOT len(list(build_train_batches())) -- see
+    # count_batches' docstring. At real dataset scale (millions of train
+    # examples), materializing every batch just to count them means
+    # doing millions of extra live SQL hard-negative fetches before
+    # training even starts -- this is what was actually causing a
+    # "stuck" run, not slowness in the training loop itself.
+    finetune_steps_per_epoch = count_batches(len(train_indices), args.finetune_batch_size)
 
     eval_val_indices = val_indices
     if args.val_sample_size is not None and args.val_sample_size < len(val_indices):

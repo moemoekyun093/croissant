@@ -147,6 +147,27 @@ def resolve_train_batches(
             yield pairs, hard_negatives
 
 
+def count_batches(n_examples: int, batch_size: int) -> int:
+    """
+    How many batches resolve_train_batches will yield for n_examples,
+    computed arithmetically -- matches its exact chunking/drop-tail rule
+    (full batches of batch_size, final partial batch dropped only if it
+    has fewer than 2 examples) WITHOUT actually calling
+    resolve_train_batches.
+
+    This matters a lot at real scale: resolve_train_batches doesn't just
+    count, it fully MATERIALIZES every batch, including sampling and
+    live-SQL-fetching n_hard_negatives extra tables per query. Calling
+    it once just to do `len(list(...))` for a steps-per-epoch print
+    statement -- which is what this codebase used to do -- means doing
+    that full materialization (millions of extra SQLite reads at
+    SynSQL-2.5M's real scale) BEFORE training even starts, for a single
+    integer. Always use this instead when you just need the count.
+    """
+    full_batches, remainder = divmod(n_examples, batch_size)
+    return full_batches + (1 if remainder >= 2 else 0)
+
+
 def to_eval_examples(query_dataset: SynSQLQueryDataset, indices: list[int]) -> list[tuple[str, str, list[str]]]:
     """(question, db_id, table_names) tuples for evaluate_map -- see
     FinetuneTrainer.evaluate_map's docstring for why this stays a plain
@@ -282,7 +303,12 @@ if __name__ == "__main__":
             )
         )
 
-    steps_per_epoch = len(build_train_batches())
+    # Arithmetic count, NOT len(list(build_train_batches())) -- see
+    # count_batches' docstring. At real dataset scale (millions of train
+    # examples), materializing every batch just to count them means
+    # doing millions of extra live SQL hard-negative fetches before
+    # training even starts.
+    steps_per_epoch = count_batches(len(train_indices), args.batch_size)
 
     eval_val_indices = val_indices
     if args.val_sample_size is not None and args.val_sample_size < len(val_indices):
