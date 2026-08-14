@@ -70,9 +70,10 @@ def corrupt_tables(
                            label_grids[t][c][r] = 1 if that cell was
                            replaced, else 0. Never marks an
                            already-empty cell as corrupted (nothing
-                           meaningful to detect there -- RowCollapse
-                           already excludes null cells from pooling, and
-                           there's no "real" value to compare against).
+                           meaningful to detect there -- cell_mask
+                           already excludes null cells from
+                           electra_discriminator_loss, and there's no
+                           "real" value to compare against).
     """
     rand = rng or random
     pools = _column_value_pools(tables)

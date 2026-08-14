@@ -1,12 +1,14 @@
 """
-Column/table architecture: turns per-column cell embeddings into a
-single [n, k] table representation (n columns, k embedding dim), ready
-for MaxSim table-vs-table comparison.
+Column/table architecture: turns per-column cell embeddings into
+row-resolved cell embeddings [B, N, M, k] (B tables, N=max columns,
+M=max rows), consumed directly by the ELECTRA discriminator head
+(pretraining) and MultiScorer (query-table finetuning) -- see
+forward_batch_cellwise() below, the only forward path in the current
+pipeline.
 
-Every module operates on a batch-with-table dimension [B, N, M, k]
-(B tables, N=max columns across the batch, M=max rows across the batch),
-using masks (col_mask: [B,N], row_mask: [B,M]) rather than Python loops
-over columns or tables. A single table is just B=1.
+Every module operates on that batch-with-table dimension, using masks
+(col_mask: [B,N], row_mask: [B,M]) rather than Python loops over columns
+or tables. A single table is just B=1.
 
 Pipeline order:
     (header injection -- done ONCE, before the layer stack, matching how
@@ -27,8 +29,6 @@ Pipeline order:
                                 rows and all k channels.
         ChannelMix             -- across the k channels.
     Repeatable, stacked num_layers times, each with its own weights.
-    RowCollapse              -- runs ONCE, after all layers, collapsing
-                               rows to one vector per column
 
 Profiling: measured empirically (not assumed) that cell encoding
 (BERT + numeric embedder) dominates wall-clock cost by roughly 99%+ of a
@@ -285,73 +285,6 @@ class TableLayer(nn.Module):
 
 
 # ==========================================================
-# ROW COLLAPSE (per column, attention-pooling over the rows)
-# ==========================================================
-# Runs ONCE, after all TableLayers -- not stacked.
-
-class RowCollapse(nn.Module):
-    def __init__(self, input_dim: int):
-        super().__init__()
-
-        self.input_dim = input_dim
-
-        self.seed = nn.Parameter(torch.randn(1, input_dim))
-
-        self.k_proj = nn.Linear(input_dim, input_dim)
-        self.v_proj = nn.Linear(input_dim, input_dim)
-        self.out_proj = nn.Linear(input_dim, input_dim)
-
-    def forward_table(
-        self,
-        columns: torch.Tensor,
-        row_mask: torch.Tensor,
-        cell_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        columns: [B, N, M, k]
-        row_mask: [B, M] -- 1 for real (non-padding) rows
-        cell_mask: [B, N, M] -- 1 for non-null cells specifically. Real
-            but null cells (empty string after cleaning) are excluded
-            from pooling here: a heavily-null column's summary shouldn't
-            be dominated by the same generic "empty" embedding repeated
-            many times (confirmed empirically -- see
-            analyze_column_collapse.py / inspect_random_column_values.py
-            findings on e.g. codebase_community.posts."Closed Date",
-            81.5% null, acting as a representation-collapse attractor).
-
-            Degenerate case: if a column has ZERO non-null cells (every
-            real row happens to be null), falls back to row_mask alone
-            for that column -- otherwise every score would be -inf and
-            softmax would produce NaN. This never removes a table's
-            LAST real row from consideration, only prefers non-null rows
-            when at least one exists.
-
-        returns: [B, N, k] -- one pooled vector per (table, column)
-        """
-
-        B, N, M, k = columns.shape
-
-        has_any_nonnull = cell_mask.sum(dim=2, keepdim=True) > 0  # [B, N, 1]
-        row_mask_expanded = row_mask.view(B, 1, M).expand(-1, N, -1)  # [B, N, M]
-        effective_mask = torch.where(has_any_nonnull, cell_mask, row_mask_expanded)
-
-        K = self.k_proj(columns)  # [B, N, M, k]
-        V = self.v_proj(columns)  # [B, N, M, k]
-
-        seed = self.seed.view(1, 1, 1, k).expand(B, N, 1, k)
-
-        scores = torch.einsum("bnqk,bnmk->bnqm", seed, K) / (self.input_dim ** 0.5)
-
-        mask = effective_mask.view(B, N, 1, M)
-        scores = scores.masked_fill(mask == 0, float("-inf"))
-
-        attn = torch.softmax(scores, dim=-1)  # [B, N, 1, M]
-        pooled = torch.einsum("bnqm,bnmk->bnqk", attn, V).squeeze(2)  # [B, N, k]
-
-        return self.out_proj(pooled)
-
-
-# ==========================================================
 # TABLE ENCODER (orchestrator)
 # ==========================================================
 
@@ -376,19 +309,15 @@ class TableEncoder(nn.Module):
                 for _ in range(num_layers)
             ]
         )
-        self.row_collapse = RowCollapse(embed_dim)
 
     def _encode_cellwise(
         self, tables: list[Table], ablation: str | None = None, profile: bool = False
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Shared by forward_batch() and forward_batch_cellwise(): runs
-        CellEncoder + the full TableLayer stack, stopping BEFORE
-        RowCollapse -- i.e. still row-resolved, [B, N, M, k]. This is
-        the same tensor shape src/scoring/multi_score.py's MultiScorer
-        expects, and what an ELECTRA-style per-cell discriminator head
-        needs (RowCollapse would destroy the per-row resolution a
-        cell-level real/corrupted prediction requires).
+        Runs CellEncoder + the full TableLayer stack -- row-resolved,
+        [B, N, M, k]. This is the same tensor shape
+        src/scoring/multi_score.py's MultiScorer expects, and what the
+        ELECTRA-style per-cell discriminator head needs.
 
         returns: (X, col_mask, row_mask, cell_mask) -- X: [B,N,M,k]
         """
@@ -451,42 +380,19 @@ class TableEncoder(nn.Module):
         self, tables: list[Table], ablation: str | None = None, profile: bool = False
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Row-resolved variant of forward_batch() -- returns per-CELL
-        embeddings (no RowCollapse), for anything that needs cell-level
+        Returns per-CELL embeddings, for anything that needs cell-level
         resolution: the ELECTRA discriminator head (pretraining) and
-        MultiScorer-based query-table scoring (finetuning).
+        MultiScorer-based query-table scoring (finetuning). This is the
+        only forward path in the current pipeline -- there is no
+        table-level (one-vector-per-column) output anymore; that used to
+        be produced by a RowCollapse module feeding table-vs-table MaxSim
+        (src/scoring/maxsim.py), both removed since nothing in
+        PretrainTrainer/FinetuneTrainer ever exercised them (see git
+        history if that table-table retrieval path is ever needed again).
 
         returns: (X, col_mask, row_mask, cell_mask) -- X: [B, N, M, k]
         """
         return self._encode_cellwise(tables, ablation=ablation, profile=profile)
-
-    def forward_batch(
-        self, tables: list[Table], ablation: str | None = None, profile: bool = False
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        tables: list of B raw Tables
-        ablation: None (normal), "headers_only", or "content_only"
-        profile: if True, prints a wall-clock split between cell encoding
-                 and the table-level layers. Optional, off by default --
-                 use scripts/profile_forward_pass.py for a dedicated,
-                 repeated-run measurement instead of enabling this
-                 inline during training.
-        returns: (X, col_mask) -- X: [B, N, k], one vector per column
-                 (RowCollapse already applied)
-        """
-
-        X, col_mask, row_mask, cell_mask = self._encode_cellwise(
-            tables, ablation=ablation, profile=profile
-        )
-
-        X = self.row_collapse.forward_table(X, row_mask, cell_mask)  # [B,N,k]
-
-        return X, col_mask
-
-    def forward(self, table: Table) -> torch.Tensor:
-        """Single-table convenience wrapper -- one slice, not a loop."""
-        X, _col_mask = self.forward_batch([table])
-        return X[0, : len(table.columns)]
 
 
 # ==========================================================
@@ -511,7 +417,7 @@ class DiscriminatorHead(nn.Module):
     def forward(self, X: torch.Tensor) -> torch.Tensor:
         """
         X: [B, N, M, k] -- row-resolved cell embeddings (TableEncoder.
-           forward_batch_cellwise's output, i.e. BEFORE RowCollapse)
+           forward_batch_cellwise's output)
         returns: [B, N, M] -- one real/corrupted logit per cell (apply
                  sigmoid, or use with BCEWithLogitsLoss directly)
         """

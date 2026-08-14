@@ -61,17 +61,13 @@ def cross_score_queries_tables(
     scores PAIRED (query_i, table_i) -- one score per batch position)
     into a full [Bq, Bt] cross matrix, every query against every table
     in the batch -- needed for in-batch-negative contrastive finetuning
-    (query_table_info_nce_loss below), the same way
-    batched_maxsim_matrix_padded gives a full table-vs-table matrix for
-    info_nce_loss.
+    (query_table_info_nce_loss below).
 
     Loops over the query batch (Bq calls to scorer.score(), each scoring
     that one query against ALL Bt tables at once via broadcasting) --
-    not the full O(Bq*Bt) Python loop MultiScorer's own module docstring
-    calls out as what batched_maxsim_matrix_padded avoids; this is a
-    lighter, Bq-only loop, acceptable at typical batch sizes. Revisit
-    with a fully vectorized einsum across both batch dims if this shows
-    up as a bottleneck.
+    not a full O(Bq*Bt) Python loop, just a lighter Bq-only one,
+    acceptable at typical batch sizes. Revisit with a fully vectorized
+    einsum across both batch dims if this shows up as a bottleneck.
 
     Q:        [Bq, L, k] -- caller must already have zeroed out any
               padding-token rows (e.g. Q * query_mask.unsqueeze(-1)),

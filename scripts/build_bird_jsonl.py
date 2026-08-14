@@ -66,7 +66,7 @@ def random_value_for_type(declared_type):
     says "no signal, ignore this"; gibberish text asserts a false
     signal the model has no way to recognize as meaningless). TEXT
     columns are deliberately left as None here, still handled by
-    CellEncoder's null-masking in RowCollapse.
+    CellEncoder's own null-masking (cell_mask).
     """
 
     t = (declared_type or "").upper()
@@ -93,9 +93,9 @@ def _is_missing(value):
     an empty string '' is a legitimate, present, non-NULL value in SQL,
     but semantically identical to NULL for our purposes (both produce
     no real content). This matches how the rest of the pipeline already
-    treats them (CellEncoder classifies "" as an empty cell, RowCollapse
-    masks it the same way it would a null) -- so imputation needs the
-    same definition, or these cells silently slip through untouched.
+    treats them (CellEncoder classifies "" as an empty cell, masked out
+    the same way a null would be via cell_mask) -- so imputation needs
+    the same definition, or these cells silently slip through untouched.
     """
     if value is None:
         return True

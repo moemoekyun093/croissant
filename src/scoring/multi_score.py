@@ -1,6 +1,7 @@
 """
-Six candidate query-table scoring functions over row-resolved (pre-
-RowCollapse) cell embeddings X[i, j, :], as sketched on paper.
+Six candidate query-table scoring functions over row-resolved cell
+embeddings X[i, j, :] (TableEncoder.forward_batch_cellwise's output),
+as sketched on paper.
 
 Convention: Q is a set of L query vectors (however produced upstream --
 this module is agnostic to that). X is one document table's cell
@@ -29,7 +30,7 @@ matching the rest of the codebase's masking convention).
                        learned via a sigmoid-constrained parameter.
 
 Final aggregation across the L query vectors in Q: summed, matching the
-ColBERT/ Starmie convention already used in scoring/maxsim.py.
+ColBERT/Starmie convention.
 
 This module was written and smoke-tested standalone against dummy
 tensors of the documented shapes (see conversation history for the test

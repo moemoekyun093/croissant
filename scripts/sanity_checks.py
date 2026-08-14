@@ -15,11 +15,11 @@ Run with: python scripts/sanity_checks.py
 import random
 
 import torch
+import torch.nn.functional as F
 
 from src.data.table import Column, Table
 from src.encoding.cell_encoder import CellEncoder
 from src.models.table_encoder import DiscriminatorHead, TableEncoder
-from src.scoring.maxsim import maxsim
 from src.training.trainer import PretrainTrainer
 
 
@@ -66,18 +66,33 @@ def shuffle_table(table: Table) -> Table:
 # ==========================================================
 
 def check_shapes(model: TableEncoder, table: Table) -> None:
-    out = model(table)
-    expected = (table.num_columns, model.row_collapse.input_dim)
+    X, col_mask, row_mask, cell_mask = model.forward_batch_cellwise([table])
 
-    assert out.shape == expected, (
-        f"expected shape {expected}, got {tuple(out.shape)}"
-    )
-    print(f"[1/4 shape check] OK -- output shape {tuple(out.shape)}")
+    expected = (1, table.num_columns, table.num_rows, model.embed_dim)
+    assert X.shape == expected, f"expected shape {expected}, got {tuple(X.shape)}"
+    assert col_mask.shape == (1, table.num_columns), f"unexpected col_mask shape {tuple(col_mask.shape)}"
+    assert row_mask.shape == (1, table.num_rows), f"unexpected row_mask shape {tuple(row_mask.shape)}"
+    assert cell_mask.shape == (1, table.num_columns, table.num_rows), f"unexpected cell_mask shape {tuple(cell_mask.shape)}"
+
+    print(f"[1/4 shape check] OK -- output shape {tuple(X.shape)}")
 
 
 # ==========================================================
 # CHECK 2: PERMUTATION INVARIANCE
 # ==========================================================
+
+def _masked_mean_pool(X: torch.Tensor, cell_mask: torch.Tensor) -> torch.Tensor:
+    """X: [B,N,M,k], cell_mask: [B,N,M] -> [B,k], masked mean over real
+    cells. A sum/mean over an unordered set of real cells doesn't care
+    what order those cells came in, so this is order-invariant by
+    construction -- a lightweight standalone replacement for the
+    RowCollapse-based table representation this check used to compare
+    (which is no longer part of the pipeline)."""
+    mask = cell_mask.unsqueeze(-1)  # [B,N,M,1]
+    summed = (X * mask).sum(dim=(1, 2))  # [B,k]
+    count = mask.sum(dim=(1, 2)).clamp(min=1.0)  # [B,1]
+    return summed / count
+
 
 def check_permutation_invariance(
     model: TableEncoder, table: Table, tol: float = 1e-3
@@ -85,11 +100,14 @@ def check_permutation_invariance(
     model.eval()
 
     with torch.no_grad():
-        out_orig = model(table)
-        out_shuffled = model(shuffle_table(table))
+        X_orig, _cm, _rm, cell_mask_orig = model.forward_batch_cellwise([table])
+        X_shuf, _cm2, _rm2, cell_mask_shuf = model.forward_batch_cellwise([shuffle_table(table)])
 
-        sim_self = maxsim(out_orig, out_orig).item()
-        sim_shuffled = maxsim(out_orig, out_shuffled).item()
+        v_orig = _masked_mean_pool(X_orig, cell_mask_orig)
+        v_shuf = _masked_mean_pool(X_shuf, cell_mask_shuf)
+
+        sim_self = F.cosine_similarity(v_orig, v_orig).item()
+        sim_shuffled = F.cosine_similarity(v_orig, v_shuf).item()
 
     diff = abs(sim_self - sim_shuffled)
     print(

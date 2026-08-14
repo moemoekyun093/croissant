@@ -97,8 +97,8 @@ def check_crash_resilience(model: TableEncoder, tables: list[Table]) -> list[Tab
             )
             t0 = time.time()
             try:
-                out = model(table)
-                assert out.shape == (table.num_columns, model.row_collapse.input_dim)
+                X, col_mask, row_mask, cell_mask = model.forward_batch_cellwise([table])
+                assert X.shape == (1, table.num_columns, table.num_rows, model.embed_dim)
                 ok_tables.append(table)
                 print(f"ok ({time.time()-t0:.2f}s)", flush=True)
             except Exception as e:
@@ -122,7 +122,7 @@ def check_timing(model: TableEncoder, tables: list[Table], full_corpus_size: int
     with torch.no_grad():
         for i, table in enumerate(tables):
             t0 = time.time()
-            model(table)
+            model.forward_batch_cellwise([table])
             elapsed = time.time() - t0
             if elapsed > 2.0 or i % 20 == 0:
                 print(
