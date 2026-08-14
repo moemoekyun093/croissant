@@ -26,7 +26,7 @@ from src.training.trainer import PretrainTrainer
 
 def make_batches(tables, batch_size, max_columns=20):
     """Same bucket-by-size + truncate-wide-tables strategy as
-    scripts/pilot_train.py::make_batches -- keeps padding cost down."""
+    scripts/real_data_check.py::bucket_tables -- keeps padding cost down."""
     from src.data.table import Table
 
     capped = []

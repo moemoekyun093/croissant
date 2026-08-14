@@ -1,9 +1,13 @@
 """
 Sanity checks to run once, before a real training launch -- the full
-Table -> TableEncoder -> maxsim -> info_nce_loss -> Trainer chain has
-been built and reasoned through piece by piece, but never actually
-executed together end to end. This catches the class of bug that's
-expensive to discover mid-training.
+Table -> TableEncoder -> DiscriminatorHead -> electra_discriminator_loss
+-> PretrainTrainer chain has been built and reasoned through piece by
+piece, but never actually executed together end to end. This catches the
+class of bug that's expensive to discover mid-training.
+
+Checks 1-2 are architecture-only (no trainer involved, still apply
+regardless of pretraining/finetuning strategy). Checks 3-4 exercise the
+ELECTRA pretraining path specifically (PretrainTrainer + DiscriminatorHead).
 
 Run with: python scripts/sanity_checks.py
 """
@@ -12,12 +16,11 @@ import random
 
 import torch
 
-from src.data.augmentation import drop_columns, drop_rows
 from src.data.table import Column, Table
 from src.encoding.cell_encoder import CellEncoder
-from src.models.table_encoder import TableEncoder
+from src.models.table_encoder import DiscriminatorHead, TableEncoder
 from src.scoring.maxsim import maxsim
-from src.training.trainer import Trainer
+from src.training.trainer import PretrainTrainer
 
 
 # ==========================================================
@@ -104,13 +107,11 @@ def check_permutation_invariance(
 
 
 # ==========================================================
-# CHECK 3: GRADIENT FLOW
+# CHECK 3: GRADIENT FLOW (ELECTRA pretraining path)
 # ==========================================================
 
-def check_gradient_flow(trainer: Trainer, tables: list[Table]) -> None:
-    trainer.optimizer = torch.optim.AdamW(
-        [p for p in trainer.model.parameters() if p.requires_grad], lr=1e-4
-    )
+def check_gradient_flow(trainer: PretrainTrainer, tables: list[Table]) -> None:
+    trainer.optimizer = torch.optim.AdamW(trainer._trainable_params(), lr=1e-4)
     trainer.scheduler = torch.optim.lr_scheduler.LambdaLR(
         trainer.optimizer, lambda step: 1.0
     )
@@ -120,7 +121,11 @@ def check_gradient_flow(trainer: Trainer, tables: list[Table]) -> None:
 
     n_with_grad, n_zero_grad, n_missing_grad = 0, 0, 0
 
-    for name, p in trainer.model.named_parameters():
+    named_params = list(trainer.model.named_parameters()) + [
+        (f"discriminator.{n}", p) for n, p in trainer.discriminator.named_parameters()
+    ]
+
+    for name, p in named_params:
         if not p.requires_grad:
             continue
         if p.grad is None:
@@ -144,17 +149,25 @@ def check_gradient_flow(trainer: Trainer, tables: list[Table]) -> None:
 
 
 # ==========================================================
-# CHECK 4: TINY-BATCH OVERFIT
+# CHECK 4: TINY-BATCH OVERFIT (ELECTRA pretraining path)
 # ==========================================================
 
 def check_tiny_batch_overfit(
-    model_builder, tables: list[Table], steps: int = 100, lr: float = 1e-3
+    model_builder,
+    discriminator_builder,
+    tables: list[Table],
+    steps: int = 100,
+    lr: float = 1e-3,
+    corrupt_frac: float = 0.3,
 ) -> None:
+    """corrupt_frac deliberately higher than pretrain.yaml's default
+    (0.15) -- a tiny fixed batch needs enough corrupted cells to give the
+    discriminator a real signal to overfit to."""
+
     model = model_builder()
-    trainer = Trainer(model, lr=lr, warmup_ratio=0.0)
-    trainer.optimizer = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad], lr=lr
-    )
+    discriminator = discriminator_builder()
+    trainer = PretrainTrainer(model, discriminator, lr=lr, warmup_ratio=0.0, corrupt_frac=corrupt_frac)
+    trainer.optimizer = torch.optim.AdamW(trainer._trainable_params(), lr=lr)
     trainer.scheduler = torch.optim.lr_scheduler.LambdaLR(
         trainer.optimizer, lambda step: 1.0
     )
@@ -168,16 +181,27 @@ def check_tiny_batch_overfit(
 
     print(f"[4/4 overfit check] first loss={losses[0]:.4f}  last loss={losses[-1]:.4f}")
 
-    # diagnostic: print the final pairwise similarity matrix so a collapse
-    # (near-uniform similarities across all pairs) is visible directly,
-    # rather than only inferred from the loss plateauing near ln(negatives)
+    # diagnostic: on this same fixed (re-corrupted) batch, report the
+    # discriminator's final accuracy against the trivial "always predict
+    # real" baseline (which would score 1 - corrupt_frac) -- a model
+    # that's actually learned something should clear that baseline by a
+    # wide margin on data it's been directly overfitting to.
+    from src.data.electra_corruption import corrupt_tables, pad_labels
     model.eval()
+    discriminator.eval()
     with torch.no_grad():
-        reprs = [model(t) for t in tables]
-        print("  final pairwise maxsim matrix (rows=query tables):")
-        for i, r_i in enumerate(reprs):
-            row = [f"{maxsim(r_i, r_j).item():.3f}" for r_j in reprs]
-            print(f"    table {i}: {row}")
+        corrupted, label_grids = corrupt_tables(tables, corrupt_frac)
+        labels = pad_labels(label_grids, device=next(model.parameters()).device)
+        X, col_mask, row_mask, cell_mask = model.forward_batch_cellwise(corrupted)
+        preds = (torch.sigmoid(discriminator(X)) > 0.5).float()
+        correct = ((preds == labels).float() * cell_mask).sum()
+        total = cell_mask.sum().clamp(min=1.0)
+        accuracy = (correct / total).item()
+        trivial_baseline = 1.0 - corrupt_frac
+        print(
+            f"  final discriminator accuracy: {accuracy:.3f} "
+            f"(trivial always-real baseline: {trivial_baseline:.3f})"
+        )
 
     assert losses[-1] < losses[0] * 0.5, (
         "loss did not drop meaningfully on a tiny, fixed batch -- this points "
@@ -199,16 +223,21 @@ if __name__ == "__main__":
         cell_encoder = CellEncoder(text_model_name="bert-base-uncased", output_dim=32)
         return TableEncoder(cell_encoder, embed_dim=32)
 
+    def build_discriminator() -> DiscriminatorHead:
+        return DiscriminatorHead(embed_dim=32)
+
     model = build_model()
     table = make_dummy_table(1, n_cols=4, n_rows=8)
 
     check_shapes(model, table)
     check_permutation_invariance(model, table)
 
-    trainer = Trainer(model, lr=1e-4, checkpoint_dir="/tmp/sanity_checkpoints")
+    trainer = PretrainTrainer(
+        model, build_discriminator(), lr=1e-4, checkpoint_dir="/tmp/sanity_checkpoints"
+    )
     tables_batch = [make_dummy_table(i, n_cols=4, n_rows=8) for i in range(3)]
     check_gradient_flow(trainer, tables_batch)
 
-    check_tiny_batch_overfit(build_model, tables_batch, steps=100)
+    check_tiny_batch_overfit(build_model, build_discriminator, tables_batch, steps=100)
 
     print("\nAll sanity checks passed.")

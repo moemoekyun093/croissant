@@ -1,11 +1,7 @@
 """
 Losses for table representation learning.
 
-Contains three distinct losses for three distinct training stages:
-    info_nce_loss              -- table-table contrastive (original
-                                   augmentation-based pretraining, still
-                                   used by the existing Trainer/
-                                   pilot_train.py path)
+Contains two distinct losses for two distinct training stages:
     electra_discriminator_loss -- ELECTRA-style cell-corruption
                                    pretraining (PretrainTrainer)
     query_table_info_nce_loss  -- real query->table contrastive
@@ -15,45 +11,6 @@ Contains three distinct losses for three distinct training stages:
 
 import torch
 import torch.nn.functional as F
-
-from src.scoring.maxsim import batched_maxsim_matrix_padded
-
-
-def info_nce_loss(
-    X: torch.Tensor,
-    mask: torch.Tensor,
-    B: int,
-    temperature: float = 0.07,
-) -> torch.Tensor:
-    """
-    X:    [2B, max_n, k] -- padded table representations, first B rows
-          are originals, second B rows are their augmented counterparts
-          (same order)
-    mask: [2B, max_n]    -- 1 for real columns, 0 for padding
-    B:    number of original tables (X.shape[0] == 2*B)
-    temperature: softmax temperature (Starmie fixes this at 0.07)
-
-    returns: scalar loss -- symmetric InfoNCE, fully vectorized (no
-    Python loop over the B positive pairs)
-    """
-
-    device = X.device
-    N = 2 * B
-
-    sims = batched_maxsim_matrix_padded(X, mask) / temperature  # [N, N]
-
-    self_mask = torch.eye(N, device=device, dtype=torch.bool)
-    sims = sims.masked_fill(self_mask, float("-inf"))
-
-    idx = torch.arange(B, device=device)
-    logsumexp_all = torch.logsumexp(sims, dim=1)  # [N]
-
-    # original[i] -> augmented[i]  (positive at column idx+B)
-    log_prob_fwd = sims[idx, idx + B] - logsumexp_all[idx]
-    # augmented[i] -> original[i]  (positive at column idx)
-    log_prob_bwd = sims[idx + B, idx] - logsumexp_all[idx + B]
-
-    return -(log_prob_fwd.sum() + log_prob_bwd.sum()) / (2 * B)
 
 
 def electra_discriminator_loss(

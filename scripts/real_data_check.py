@@ -8,8 +8,8 @@ Checks:
      could be slow/memory-heavy given the O(m^2)/O(n^2) attention steps)
   3. Crash resilience -- does every table survive a forward pass
   4. Timing -- encoding throughput, extrapolated to a full-corpus epoch
-  5. A few real training steps -- watches for NaN loss / crashes with
-     real (not synthetic) data
+  5. A few real ELECTRA pretraining steps -- watches for NaN loss /
+     crashes with real (not synthetic) data
 
 Usage:
     python -m scripts.real_data_check --corpus_jsonl /path/to/corpus.jsonl --n_tables 200
@@ -23,8 +23,8 @@ import torch
 from src.data.corpus_loader import iter_tables_from_jsonl
 from src.data.table import Table
 from src.encoding.cell_encoder import CellEncoder
-from src.models.table_encoder import TableEncoder
-from src.training.trainer import Trainer
+from src.models.table_encoder import DiscriminatorHead, TableEncoder
+from src.training.trainer import PretrainTrainer
 
 
 def load_slice(corpus_jsonl: str, n_tables: int) -> tuple[list[Table], int]:
@@ -147,7 +147,7 @@ def check_timing(model: TableEncoder, tables: list[Table], full_corpus_size: int
 def bucket_tables(
     tables: list[Table], batch_size: int, max_columns: int = 20
 ) -> list[list[Table]]:
-    """Same fix as pilot_train.py: cap extreme-outlier column counts and
+    """Same fix as scripts/pretrain_electra.py: cap extreme-outlier column counts and
     sort by size before batching, so a rare wide/tall table doesn't force
     padding cost onto an entire batch of otherwise small tables."""
 
@@ -162,10 +162,19 @@ def bucket_tables(
     return [capped[i : i + batch_size] for i in range(0, len(capped), batch_size)]
 
 
-def check_real_training_steps(
-    model_builder, tables: list[Table], batch_size: int = 8, n_steps: int | None = None
+def check_real_pretrain_steps(
+    model_builder,
+    discriminator_builder,
+    tables: list[Table],
+    batch_size: int = 8,
+    n_steps: int | None = None,
+    corrupt_frac: float = 0.15,
 ) -> None:
     """
+    Runs a few real ELECTRA pretraining steps (cell corruption ->
+    DiscriminatorHead -> BCE loss) via PretrainTrainer, watching for NaN
+    loss or crashes on real (not synthetic) data.
+
     n_steps: if None, runs over ALL bucketed batches (recommended for an
     honest throughput estimate -- bucketing sorts small-to-large, so
     only looking at the first few steps sees only the smallest tables
@@ -173,10 +182,9 @@ def check_real_training_steps(
     """
 
     model = model_builder()
-    trainer = Trainer(model, lr=1e-4, warmup_ratio=0.0)
-    trainer.optimizer = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad], lr=1e-4
-    )
+    discriminator = discriminator_builder()
+    trainer = PretrainTrainer(model, discriminator, lr=1e-4, warmup_ratio=0.0, corrupt_frac=corrupt_frac)
+    trainer.optimizer = torch.optim.AdamW(trainer._trainable_params(), lr=1e-4)
     trainer.scheduler = torch.optim.lr_scheduler.LambdaLR(
         trainer.optimizer, lambda step: 1.0
     )
@@ -185,7 +193,7 @@ def check_real_training_steps(
     if n_steps is not None:
         batches = batches[:n_steps]
 
-    print(f"[real training steps] running {len(batches)} batches, batch_size={batch_size}")
+    print(f"[real pretrain steps] running {len(batches)} batches, batch_size={batch_size}")
 
     total_elapsed = 0.0
     total_table_forwards = 0
@@ -207,7 +215,10 @@ def check_real_training_steps(
         elapsed = time.time() - t0
 
         total_elapsed += elapsed
-        total_table_forwards += 2 * len(batch)  # originals + augmented
+        # unlike the old augmentation-contrastive path, ELECTRA forwards
+        # ONE corrupted copy of each table per step, not an
+        # original+augmented pair -- so no 2x factor here.
+        total_table_forwards += len(batch)
 
         status = "NaN!" if loss_value != loss_value else f"{loss_value:.4f}"
         print(f"  step {step}: loss {status} ({elapsed:.1f}s)")
@@ -215,14 +226,14 @@ def check_real_training_steps(
     if total_elapsed > 0:
         tables_per_sec = total_table_forwards / total_elapsed
         print(
-            f"\n[real training steps] aggregate: {total_table_forwards} table-forwards "
+            f"\n[real pretrain steps] aggregate: {total_table_forwards} table-forwards "
             f"in {total_elapsed:.1f}s ({tables_per_sec:.1f} tables/s)"
         )
 
-        full_epoch_forwards = 2 * 1_000_000
+        full_epoch_forwards = 1_000_000
         est_min = full_epoch_forwards / tables_per_sec / 60
         print(
-            f"[real training steps] estimated full-corpus epoch (batched, "
+            f"[real pretrain steps] estimated full-corpus epoch (batched, "
             f"train+forward, no backward-pass overhead separated out): "
             f"{est_min:.1f} min ({est_min/60:.1f} hr)"
         )
@@ -242,6 +253,9 @@ if __name__ == "__main__":
         )
         return TableEncoder(cell_encoder, embed_dim=args.embed_dim)
 
+    def build_discriminator() -> DiscriminatorHead:
+        return DiscriminatorHead(embed_dim=args.embed_dim)
+
     tables, skipped = load_slice(args.corpus_jsonl, args.n_tables)
     report_size_distribution(tables)
 
@@ -250,6 +264,6 @@ if __name__ == "__main__":
 
     if ok_tables:
         check_timing(model, ok_tables, args.full_corpus_size)
-        check_real_training_steps(build_model, ok_tables, n_steps=None)
+        check_real_pretrain_steps(build_model, build_discriminator, ok_tables, n_steps=None)
 
     print("\nReal-data slice check complete.")

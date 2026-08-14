@@ -1,59 +1,78 @@
 # Current Training Configuration
 
-Legend: 🎯 = deliberately reasoned choice · 🤷 = reasonable default, not tuned/validated
+Legend: [deliberate] = reasoned choice, checked against something concrete.
+[default] = reasonable starting point, not tuned or validated yet.
 
-## Architecture
+This describes the current pipeline: ELECTRA-style cell-corruption
+pretraining (PretrainTrainer), followed by finetuning on real query to
+table pairs (FinetuneTrainer). It replaces an earlier augmentation +
+table-table InfoNCE contrastive pretraining setup, which has been
+removed from the codebase (see git history / configs/ if you need to
+reconstruct it). The values below match configs/model.yaml,
+configs/pretrain.yaml, and configs/finetune.yaml -- those files are the
+source of truth for defaults and sweep candidates; this document is
+just the reasoning behind them.
 
-| Setting | Value | Rationale |
-|---|---|---|
-| `embed_dim` (k) | **64** in `pilot_train.py`, **32** in `sanity_checks.py` | 🤷 **Inconsistent between scripts — pick one before real training.** Neither was derived from anything principled; 64 was just chosen as "a bit bigger" for the pilot. Worth an actual sweep once other things are stable. |
-| `text_model_name` | `bert-base-uncased` | 🤷 Arbitrary standard choice, never compared against alternatives (smaller/faster models, domain-specific variants). |
-| `text_trainable` | `False` (frozen) | 🎯 Deliberate: training a novel, unvalidated architecture on top of a fully fine-tuned 110M-param BERT risked confounding "is the new architecture learning" with "is BERT drifting/forgetting." Frozen BERT + trainable projection (CLIP-style adapter) isolates what's actually being learned right now. Revisit unfreezing once the rest is validated. |
-| `text_max_length` | 32 tokens | 🎯/⚠️ Deliberately sized for short cell values (names, numbers, short phrases) — but explicitly known to be inadequate for prose-heavy cells, confirmed directly against your science-standards table example (100+ word cells get heavily truncated). Unresolved trade-off, not yet revisited. |
-| `numeric_sinusoidal_dim` | 128 | 🤷 Matches the convention used for diffusion timestep embeddings; never tuned specifically for this use case. |
-| `ColumnAggregator` nonlinearity (`sigma`) | `sigmoid` | 🎯 Directly follows your original architecture spec (`sigma(XX^T)`); `tanh`/`relu` are wired as alternatives but untested. |
-| `ChannelMix` hidden dim | `input_dim × 2` | 🤷 Lighter than the standard transformer FFN convention (usually ×4) — chosen as a smaller default, not validated either way. |
-
-## Data / Corpus
-
-| Setting | Value | Rationale |
-|---|---|---|
-| Row cap per table | 50 (`MAX_ROWS`) | 🎯 Inherited from your original corpus-building scripts, predates this pipeline — caps compute in `ColumnAggregator`'s `O(m²)` attention. |
-| `n_tables` (pilot) | 10,000 | 🎯 Chosen specifically for fast iteration, given the ~144hr/epoch estimate on the full 1M corpus made further tuning there impractical. |
-| `val_frac` | 0.1 (10% held out) | 🤷 Standard default split ratio, added specifically to catch overfitting to the small pilot corpus — the *decision* to hold out data was deliberate, the exact fraction wasn't tuned. |
-| Augmentation type | row/column **subset-dropping**, not shuffling | 🎯 Directly follows from your architecture's proven exact permutation invariance (confirmed via the sanity check) — shuffling would be a zero-gradient augmentation. Also matches Starmie's own ablation finding that `drop_col` outperformed shuffle-based augmentations even for their non-invariant encoder. |
-| `row_keep_frac`, `col_keep_frac` | 0.7, 0.7 | 🤷 "Moderate" subset size chosen by feel — not swept. Too close to 1.0 makes the positive pair trivially easy; too low makes it an unfair ask. No data on where the right value actually is yet. |
-
-## Loss / Contrastive Setup
+## Architecture (shared by both stages)
 
 | Setting | Value | Rationale |
 |---|---|---|
-| `temperature` | 0.07 | 🎯 Taken directly from Starmie's fixed value, not derived independently — reasonable starting point given the similarity of the two setups, not re-validated for this architecture. |
-| Loss direction | Symmetric (query→doc and doc→query averaged) | 🎯 Standard CLIP/Starmie convention — ensures both "sides" of the positive pair get gradient signal. |
-| Negatives | Pure in-batch (every other table + its augmented view) | 🎯 The standard assumption given no labeled data exists — "two randomly drawn tables are dissimilar." No hard-negative mining yet (the BIRD/BM25-based weak supervision discussed earlier remains unimplemented). |
-| Learned temperature (`logit_scale`) | Not used — fixed instead | 🎯 Deliberately deferred earlier in favor of Starmie's fixed value; a learned temperature is a reasonable thing to add later, once there's a way to tell if it actually helps. |
+| `embed_dim` (k) | 64 | [default] Final, post-concatenation cell width. Never swept; worth an actual sweep once a pretraining run is validated end to end. Must be even -- BERT projects to `embed_dim // 2` for the cell half and the header half separately. |
+| `text_model_name` | `bert-base-uncased` | [default] Arbitrary standard choice, never compared against alternatives (smaller/faster models, domain-specific variants). |
+| `text_trainable` (CellEncoder) | `False` (frozen) | [deliberate] Training a novel, unvalidated table architecture on top of a fully fine-tuned 110M-param BERT risks confounding "is the new architecture learning" with "is BERT drifting." Frozen BERT + trainable projection isolates what's actually being learned. Revisit unfreezing once the rest is validated. |
+| Cell/header fusion | raw concatenation, no projection afterward | [deliberate] A cell's embedding is `concat(cell_BERT_vector, header_BERT_vector)`, both already post-BERT, post-projection vectors -- not raw text concatenation, and no linear layer collapses the two back down. This also means header info can no longer be isolated from cell content at the TableEncoder level (see `forward_batch`'s ablation handling). |
+| Numeric cell routing | none -- every cell is text | [deliberate] The earlier numeric/text split (a separate sinusoidal-embedding path for numeric-looking cells) has been dropped. Every cell, numeric-looking or not, goes through BERT as text. `src/encoding/numeric_embedder.py` and `src/encoding/cell_type.py` are unused on the main path now; revisit if numeric-aware encoding turns out to matter. |
+| Header contextualization | none -- independent per-header BERT CLS | [deliberate] Headers are embedded independently via BERT's own CLS token, one at a time (batched in one call, not joined into a shared sequence). The earlier cross-header contextualizer transformer has been removed from the main path. |
+| `text_max_length` | 32 tokens | [deliberate, known limitation] Sized for short cell values (names, numbers, short phrases) -- confirmed inadequate for prose-heavy cells (100+ word cells get heavily truncated). Unresolved trade-off, not yet revisited. |
+| `ColumnAggregator`/RCPE nonlinearity (`sigma`) | `sigmoid` | [deliberate] Follows the original architecture spec (`sigma(XX^T)`); `tanh`/`relu` are wired as alternatives but untested. |
+| `ChannelMix` hidden dim | `input_dim x 2` | [default] Lighter than the standard transformer FFN convention (usually x4) -- chosen as a smaller default, not validated either way. |
+| Row cap per table (`MAX_ROWS`) | 50 | [deliberate] Caps compute in the row-attention steps, which are quadratic in row count. |
 
-## Optimization
-
-| Setting | Value | Rationale |
-|---|---|---|
-| Optimizer | AdamW | 🤷 Standard default for transformer-adjacent training, not compared against alternatives. |
-| Learning rate | 1e-4 | 🤷 Standard transformer fine-tuning default, never swept for this specific setup. |
-| Weight decay | 0.01 | 🤷 Standard AdamW default. |
-| LR schedule | Linear warmup (10% of steps) → linear decay to 0 | 🎯 Standard, well-established transformer training convention — low-risk default choice. |
-| Gradient clipping | max norm 1.0 | 🎯 Standard safeguard against exploding gradients; conventional value, not tuned. |
-| `batch_size` | 64 | 🎯 Chosen specifically because `nvidia-smi` showed ~95GB free on `cuda:2` — this is a conservative starting point given that headroom, not a derived optimum. Likely can go higher. |
-| `num_epochs` | 15 (just proposed, not yet run) | 🤷 No principled stopping criterion yet beyond "watch train vs. val loss diverge" — this is exactly what the val-loss tracking just added is for. |
-
-## Hardware / Infra
+## Pretraining (ELECTRA-style cell corruption)
 
 | Setting | Value | Rationale |
 |---|---|---|
-| `device` | `cuda:2` | 🎯 Directly chosen from your `nvidia-smi` output — GPUs 0/1/3 were heavily used by other jobs, GPU 2 was at 12% util / 2.6GB used. |
-| `TextEmbedder` internal chunk size | 512 | 🎯 Safety bound added specifically to prevent one unbounded BERT forward pass when many tables' cells get combined into a single batched call — not stress-tested at the extremes of what your GPU could actually hold. |
+| Mechanism | cell corruption + per-cell discriminator | [deliberate] Replaces the earlier augmentation-based table-table contrastive task. A random subset of cells get swapped for another real value from the same column; a discriminator head predicts real vs. swapped per cell, using the row-resolved embeddings from before RowCollapse. |
+| Corruption scheme | cheap same-column swap, no generator network | [deliberate] The replacement for a corrupted cell is just another real value from the same column (matched by exact header text, anywhere in the batch, including the same table) -- not a value produced by a trained generator model. Same idea TABBIE's own corrupt-cell-detection pretraining task uses. Avoids training a second network alongside the discriminator. |
+| `corrupt_frac` | 0.15 | [default] Fraction of real cells corrupted per table, chosen by analogy to BERT's 15% masking rate -- not derived for this specific task. |
+| Discriminator granularity | per-cell | [deliberate] One real/corrupted logit per cell, from the row-resolved embeddings before RowCollapse -- matches the granularity corruption itself operates at, and is the same tensor shape the finetuning scorer needs. |
+| Discriminator head | 2-layer MLP, GELU, hidden dim = embed_dim | [default] Small and simple by design; not swept. |
+| `lr` | 1e-4 | [default] Carried over from the earlier contrastive setup's default, not re-tuned for this task. |
+| `batch_size` | 64 | [default, known risk] Carried over from the earlier pipeline's GPU-headroom-based choice. Not re-checked: pretraining now carries the full row-resolved `[B,N,M,k]` tensor through backprop instead of a pooled `[B,N,k]` tensor, so memory pressure at a given batch size is higher than before. |
+| `num_epochs` | 15 | [default] No principled stopping criterion yet -- watch train vs. val loss. |
+| Optimizer / schedule | AdamW, linear warmup (10%) then linear decay to 0, grad clip norm 1.0 | [deliberate] Standard, low-risk transformer training convention, unchanged from the earlier setup. |
+| Batch reshuffling | shuffled once before the train/val split, batch order reshuffled every epoch | [deliberate] Batch composition (which tables land together, from size-bucketing) stays fixed across epochs; only the order batches are seen in changes. |
+
+## Finetuning (real query to table contrastive)
+
+| Setting | Value | Rationale |
+|---|---|---|
+| Data source | real (question, positive table) pairs, e.g. `SynSQLQueryDataset` | [deliberate] Replaces the earlier augmentation-derived synthetic positives with real supervision. |
+| Query encoder | separate BERT instance + projection to full `embed_dim` | [deliberate] Not built on CellEncoder's TextEmbedder, which projects to half of `embed_dim` specifically so cell+header concatenation lands on the full width. A query has no header counterpart, so it needs the full width directly. |
+| Query encoder trainable | `True` | [deliberate] Unlike CellEncoder's frozen BERT, the query tower trains from the start -- finetuning is exactly the stage with real query supervision to learn from. |
+| Scoring | `MultiScorer`, mode = `row_match` | [deliberate] Chosen over `column_match`/`mixture`/others as the starting point; structurally closest to the table-table MaxSim convention the architecture was originally built around. All six MultiScorer modes are implemented and swappable via config. |
+| Negatives | in-batch, one positive table per query | [known issue, not just untuned] If two queries in the same batch share a positive table, that table is currently treated as a false negative for the other query. Not yet fixed -- see `configs/finetune.yaml`. |
+| `temperature` | 0.07 | [default] Carried over from the table-table InfoNCE default, not re-derived for query-table scoring's different score scale. |
+| `lr` | 1e-4 | [default, worth checking] Finetuning often wants a lower learning rate than pretraining, since the encoder already has learned structure to preserve. Not yet checked explicitly. |
+| `batch_size` | 32 | [default] Smaller than pretraining's default by guess only -- the cross-query-vs-table scoring loop's cost grows faster with batch size here than in the other stages. Not measured. |
+| Checkpoint transfer | `load_pretrained_encoder()` | [deliberate] Loads only the TableEncoder weights from a pretraining checkpoint, discarding the discriminator head -- the discriminator has no role once pretraining ends. |
+
+## Data / corpus
+
+| Setting | Value | Rationale |
+|---|---|---|
+| `val_frac` | 0.1 (10% held out) | [default] Standard split ratio, not tuned. |
+| Table source (SynSQL) | live SQLite reads via `SynSQLTableDataset` | [deliberate] Table and column names are read directly from each database's own SQLite schema (`sqlite_master` + `PRAGMA table_info`), not from `tables.json` -- confirmed that dataset's `tables.json` is Spider-style, with a `column_names` field that holds human-readable descriptions rather than real column identifiers. Reading the live schema instead can't drift out of sync with the real data. |
+
+## Hardware / infra
+
+| Setting | Value | Rationale |
+|---|---|---|
+| `device` | `cuda:2` | [deliberate, needs rechecking] Originally chosen from a specific `nvidia-smi` snapshot -- re-check before reuse, GPU availability changes. |
+| `TextEmbedder` internal chunk size | 2048 | [deliberate] Safety bound preventing one unbounded BERT forward pass when many tables' cells get combined into a single batched call. |
 
 ---
 
 ## The honest summary
 
-The **architecture-level choices** (frozen BERT, sigmoid nonlinearity, subset-dropping augmentation, symmetric InfoNCE, in-batch negatives) are reasoned through and defensible given what's been discussed and tested. The **numeric hyperparameters** (`lr`, `embed_dim`, `keep_frac`, `temperature`, `batch_size`, `num_epochs`) are almost entirely untuned defaults — reasonable starting points borrowed from adjacent work (Starmie, standard transformer training), not values derived from any experiment on your actual data. That's expected and fine at this stage — the pilot run with held-out validation is exactly the mechanism for starting to replace "reasonable guess" with "checked against evidence" for these, one at a time, rather than tuning all of them blind.
+The architecture-level choices (frozen BERT for cell/header encoding, raw concatenation instead of a learned projection, cheap same-column corruption instead of a generator network, per-cell discriminator granularity, in-batch negatives for finetuning) are reasoned through and defensible given what's been discussed and tested. The numeric hyperparameters (`lr`, `embed_dim`, `corrupt_frac`, `temperature`, `batch_size`, `num_epochs`) are almost entirely untuned defaults, several carried over unchanged from the earlier contrastive setup without being re-checked against this task's different memory profile and loss scale. Nothing here has been run against real torch or real data yet -- see `scripts/real_data_check.py` and `scripts/sanity_checks.py` for the checks meant to catch a first-run bug before a full pretraining launch, and `configs/pretrain.yaml` / `configs/finetune.yaml` for sweep candidates once a first run is confirmed to work.
