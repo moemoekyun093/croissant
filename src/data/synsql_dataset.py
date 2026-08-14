@@ -327,7 +327,9 @@ class SynSQLTableDataset:
             for table_name in self._table_names(db_id):
                 yield self.get_table(db_id, table_name)
 
-    def load_corpus(self, corpus_json_path: str) -> list[Table]:
+    def load_corpus(
+        self, corpus_json_path: str, materialized_cache_path: str | None = None
+    ) -> list[Table]:
         """
         Materializes the FIXED retrieval corpus persisted by
         scripts/build_query_splits.py -- the same corpus every
@@ -338,7 +340,52 @@ class SynSQLTableDataset:
         Returns tables in the order they're listed in the corpus file
         (sorted by (db_id, table_name) at write time), so corpus
         ordering is stable/reproducible across runs and across models.
+
+        materialized_cache_path: where the fully-materialized corpus
+        (every table's real header/cell values, not just the (db_id,
+        table_name) pairs in corpus_json_path) is cached as JSON.
+        Defaults to corpus_json_path with a ".materialized.json" suffix.
+
+        Since the corpus is FIXED -- never re-split, never changes
+        across runs or models -- there's no reason to re-read the same
+        ~168k tables from SQLite on every single run just to get back
+        the exact same content. If this cache file already exists, it's
+        loaded directly (plain JSON parse, no SQLite, no per-table
+        PRAGMA/SELECT calls at all) instead of re-materializing live; if
+        it doesn't exist yet, this still does the live read (as before,
+        with progress logging) and then WRITES this file so every future
+        run is fast. Delete the cache file if the underlying database
+        files ever change and you need a fresh read.
         """
+        if materialized_cache_path is None:
+            base, _ = os.path.splitext(corpus_json_path)
+            materialized_cache_path = f"{base}.materialized.json"
+
+        if os.path.exists(materialized_cache_path):
+            print(
+                f"[load_corpus] loading pre-materialized corpus from "
+                f"{materialized_cache_path!r} (no SQLite reads) ..."
+            )
+            with open(materialized_cache_path, "r", encoding="utf-8") as f:
+                raw_tables = json.load(f)
+            tables = [
+                Table(
+                    table_id=t["table_id"],
+                    table_name=t["table_name"],
+                    columns=[
+                        Column(
+                            header=c["header"],
+                            cells=c["cells"],
+                            is_foreign_key=c["is_foreign_key"],
+                        )
+                        for c in t["columns"]
+                    ],
+                )
+                for t in raw_tables
+            ]
+            print(f"[load_corpus] loaded {len(tables)} table(s) from cache")
+            return tables
+
         with open(corpus_json_path, "r", encoding="utf-8") as f:
             corpus = json.load(f)
 
@@ -370,6 +417,24 @@ class SynSQLTableDataset:
                 f"weren't found in the live schema (databases_root may differ "
                 f"from when the corpus was built)"
             )
+
+        print(f"[load_corpus] caching materialized corpus to {materialized_cache_path!r} for future runs ...")
+        raw_tables = [
+            {
+                "table_id": t.table_id,
+                "table_name": t.table_name,
+                "columns": [
+                    {"header": c.header, "cells": c.cells, "is_foreign_key": c.is_foreign_key}
+                    for c in t.columns
+                ],
+            }
+            for t in tables
+        ]
+        os.makedirs(os.path.dirname(materialized_cache_path) or ".", exist_ok=True)
+        with open(materialized_cache_path, "w", encoding="utf-8") as f:
+            json.dump(raw_tables, f)
+        print(f"[load_corpus] cached {len(tables)} table(s) to {materialized_cache_path}")
+
         return tables
 
 

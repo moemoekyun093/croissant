@@ -303,15 +303,47 @@ if __name__ == "__main__":
         model.load_text_cache(args.text_cache_path)
         print(f"text cache warm-started with {model.cell_encoder.text_embedder.cache_size()} entries")
 
+    # Resume from an existing checkpoint if this encoder's pretrain_dir
+    # already has one -- e.g. a previous run of this exact command was
+    # interrupted partway through pretraining. Checked BEFORE gathering
+    # any pretrain table data: if the checkpoint already covers every
+    # requested --pretrain_epochs, there's nothing left to train, and
+    # re-gathering the full pretrain table corpus (a live SQL fetch per
+    # table -- up to ~160k of them at real scale) just to build a
+    # training loop that immediately no-ops would be pure waste. This is
+    # what a prior version of this script actually did -- looked "stuck"
+    # after a resume because it silently redid ~168k table fetches for
+    # a stage that had nothing left to do.
+    resume_ckpt = latest_checkpoint(pretrain_dir)
+    pretrain_already_done = False
+    if resume_ckpt is not None:
+        import torch
+
+        completed_epoch = torch.load(resume_ckpt, map_location="cpu").get("epoch")
+        if completed_epoch is not None and completed_epoch + 1 >= args.pretrain_epochs:
+            pretrain_already_done = True
+
     if args.skip_pretrain:
         print(
             f"\n=== [{args.encoder}] stage 1/2: SKIPPED (--skip_pretrain) -- "
             f"finetuning from a freshly-initialized encoder ==="
         )
+    elif pretrain_already_done:
+        print(
+            f"\n=== [{args.encoder}] stage 1/2: already complete -- "
+            f"{resume_ckpt} covers all {args.pretrain_epochs} requested "
+            f"pretrain epoch(s), skipping straight to finetuning without "
+            f"re-gathering the pretrain table corpus ==="
+        )
+        print(f"loading pretrained encoder from {resume_ckpt}")
+        load_pretrained_encoder(model, resume_ckpt, device=args.device)
     else:
         # -----------------------------------------------------------
         # stage 1: ELECTRA pretraining
         # -----------------------------------------------------------
+        if resume_ckpt is not None:
+            print(f"found existing pretrain checkpoint, resuming from {resume_ckpt}")
+
         db_ids = table_dataset.db_ids()
         if args.n_dbs is not None and args.n_dbs < len(db_ids):
             rng.shuffle(db_ids)
@@ -348,16 +380,6 @@ if __name__ == "__main__":
             device=args.device,
             seed=args.seed,
         )
-
-        # Resume from an existing checkpoint if this encoder's pretrain_dir
-        # already has one -- e.g. a previous run of this exact command was
-        # interrupted partway through pretraining. Without this,
-        # restarting train_model.py always retrained from epoch 0 even
-        # though PretrainTrainer.save_checkpoint was writing a checkpoint
-        # every epoch the whole time -- those files just sat there unused.
-        resume_ckpt = latest_checkpoint(pretrain_dir)
-        if resume_ckpt is not None:
-            print(f"found existing pretrain checkpoint, resuming from {resume_ckpt}")
 
         print(f"\n=== [{args.encoder}] stage 1/2: ELECTRA pretraining on {args.device} ===")
         pretrainer.fit(
