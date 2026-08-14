@@ -8,20 +8,28 @@ configs/finetune.yaml (via src/training/config.py::apply_yaml_defaults)
 files. Pass a --flag explicitly to override just that one value for a
 single run.
 
-Usage:
-    python -m scripts.finetune_query_table \
-        --tables_json /path/to/synsql/tables.json \
-        --databases_root /path/to/synsql/databases \
-        --questions_json /path/to/synsql/questions_with_tables.json \
-        --pretrained_checkpoint eval/report_runs/pretrain/checkpoint_epoch14.pt
+Split/corpus: loads the persisted query split and fixed table corpus
+built by scripts/build_query_splits.py (--split_json/--corpus_json) --
+run that script once first. Training uses the TRAIN query examples
+only; validation each epoch computes Mean Average Precision (MAP) of
+the VAL query examples ranked against the FULL corpus (never a subset),
+per-instruction that only queries are split, never the corpus. Model
+selection is early stopping on best validation MAP (--patience epochs
+without improvement) -- nothing else is used to decide which checkpoint
+is "best". Test-set MAP is reported once at the end, using the
+best-validation-MAP checkpoint, not the last epoch trained.
 
-    # small pilot run -- caps how many query->table examples get used
-    python -m scripts.finetune_query_table \
-        --tables_json /path/to/synsql/tables.json \
-        --databases_root /path/to/synsql/databases \
-        --questions_json /path/to/synsql/questions_with_tables.json \
-        --pretrained_checkpoint eval/report_runs/pretrain/checkpoint_epoch14.pt \
-        --n_examples 500
+Usage:
+    python -m scripts.build_query_splits \\
+        --databases_root /path/to/synsql/databases \\
+        --questions_json /path/to/synsql/questions_with_tables.json \\
+        --tables_json /path/to/synsql/tables.json
+
+    python -m scripts.finetune_query_table \\
+        --databases_root /path/to/synsql/databases \\
+        --split_json configs/splits/query_split.json \\
+        --corpus_json configs/splits/corpus.json \\
+        --pretrained_checkpoint eval/report_runs/pretrain/checkpoint_epoch14.pt
 
 Loads the pretrained TableEncoder via load_pretrained_encoder(), which
 discards any discriminator-head weights from that checkpoint -- the
@@ -29,6 +37,9 @@ discriminator was only ever needed for the pretraining task.
 """
 
 import argparse
+import datetime
+import json
+import os
 import random
 
 from src.data.synsql_dataset import SynSQLQueryDataset, SynSQLTableDataset
@@ -50,33 +61,113 @@ def cap_columns(table: Table, max_columns: int) -> Table:
     return Table(table_id=table.table_id, table_name=table.table_name, columns=table.columns[:max_columns])
 
 
-def resolve_batches(
-    query_dataset: SynSQLQueryDataset, batch_size: int, max_columns: int, rng: random.Random
+def sample_hard_negatives(
+    table_dataset: SynSQLTableDataset,
+    db_id: str,
+    exclude_table_names: set,
+    n: int,
+    rng: random.Random,
+    max_columns: int,
+) -> list[Table]:
+    """n tables from the SAME database as a query's positive, excluding
+    the query's own gold table(s) -- harder negatives than a random
+    other query's positive table (which usually comes from a totally
+    different, unrelated database), since same-db tables share schema
+    conventions and domain vocabulary and so are much easier for the
+    model to confuse.
+
+    Note: these are appended to a batch with no query of their own, so
+    they're never anyone's positive -- but it's possible (rare, and no
+    worse than the existing in-batch-negative risk) that a same-db table
+    picked here happens to be the gold answer for some OTHER query's
+    db_id-sharing question elsewhere in the batch; that's an inherent,
+    accepted false-negative risk of in-batch/hard-negative training, not
+    something new introduced here.
+    """
+    candidates = [t for t in table_dataset.tables_in_db(db_id) if t not in exclude_table_names]
+    if not candidates:
+        return []
+    rng.shuffle(candidates)
+    chosen_names = candidates[:n]
+    return [cap_columns(table_dataset.get_table(db_id, name), max_columns) for name in chosen_names]
+
+
+def resolve_train_batches(
+    query_dataset: SynSQLQueryDataset,
+    table_dataset: SynSQLTableDataset,
+    indices: list[int],
+    batch_size: int,
+    max_columns: int,
+    rng: random.Random,
+    n_hard_negatives: int = 0,
 ):
-    """Yields batches of (question, positive_table) pairs -- exactly one
-    positive table per query, randomly chosen when a query has more than
-    one valid positive (see FinetuneTrainer._score_batch's docstring for
-    why exactly one is required: the cross-score matrix assumes a single
-    diagonal positive per query)."""
-    for idx_batch in query_dataset.iter_batches(batch_size):
-        batch = []
+    """Yields (pairs, hard_negatives) batches from the given TRAIN
+    indices only.
+
+    pairs: exactly one (question, positive_table) per query, randomly
+        chosen when a query has more than one valid positive (see
+        FinetuneTrainer._score_batch's docstring for why exactly one is
+        required: the cross-score matrix assumes query i's positive is
+        at column i).
+    hard_negatives: n_hard_negatives extra tables per query in this
+        batch, sampled from that query's OWN database but excluding its
+        gold table(s) -- see sample_hard_negatives. Empty list when
+        n_hard_negatives=0 (plain in-batch negatives only).
+
+    Call this fresh each epoch (see FinetuneTrainer.fit's batch_fn
+    docstring) -- it uses `rng` to shuffle query order, pick a positive
+    among multiple valid ones, AND pick hard negatives, so a repeat call
+    with the same rng state produces a genuinely different batch set,
+    not just a reordering of the same one.
+    """
+    order = list(indices)
+    rng.shuffle(order)
+    for i in range(0, len(order), batch_size):
+        idx_batch = order[i : i + batch_size]
+        pairs = []
+        hard_negatives = []
         for idx in idx_batch:
             question, tables = query_dataset[idx]
             table = cap_columns(rng.choice(tables), max_columns)
-            batch.append((question, table))
-        if len(batch) >= 2:
-            yield batch
+            pairs.append((question, table))
+
+            if n_hard_negatives > 0:
+                ex = query_dataset.examples[idx]
+                hard_negatives.extend(
+                    sample_hard_negatives(
+                        table_dataset,
+                        ex.db_id,
+                        set(ex.table_names),
+                        n_hard_negatives,
+                        rng,
+                        max_columns,
+                    )
+                )
+        if len(pairs) >= 2:
+            yield pairs, hard_negatives
+
+
+def to_eval_examples(query_dataset: SynSQLQueryDataset, indices: list[int]) -> list[tuple[str, str, list[str]]]:
+    """(question, db_id, table_names) tuples for evaluate_map -- see
+    FinetuneTrainer.evaluate_map's docstring for why this stays a plain
+    tuple rather than SynSQLQueryDataset's own QueryTableExample."""
+    examples = []
+    for idx in indices:
+        ex = query_dataset.examples[idx]
+        examples.append((ex.question, ex.db_id, ex.table_names))
+    return examples
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--tables_json", required=True)
+    parser.add_argument("--tables_json", default=None)
     parser.add_argument("--databases_root", required=True)
     parser.add_argument("--questions_json", required=True)
+    parser.add_argument("--split_json", default="configs/splits/query_split.json")
+    parser.add_argument("--corpus_json", default="configs/splits/corpus.json")
     parser.add_argument("--pretrained_checkpoint", required=True)
     parser.add_argument("--max_rows", type=int)
     parser.add_argument("--max_columns", type=int)
-    parser.add_argument("--val_frac", type=float)
     parser.add_argument("--embed_dim", type=int, help="must match the pretrained checkpoint")
     parser.add_argument("--num_layers", type=int)
     parser.add_argument("--text_model_name")
@@ -101,6 +192,19 @@ if __name__ == "__main__":
     parser.add_argument("--scoring_mode", choices=["global", "row_match", "column_match", "col_deepset", "row_deepset", "mixture"])
     parser.add_argument("--batch_size", type=int)
     parser.add_argument("--num_epochs", type=int)
+    parser.add_argument(
+        "--patience", type=int, default=3,
+        help="stop early after this many epochs without a val MAP improvement",
+    )
+    parser.add_argument(
+        "--n_hard_negatives", type=int, default=2,
+        help="per query in a training batch, sample this many extra tables from "
+             "that query's OWN database (excluding its gold table(s)) as hard "
+             "negatives, on top of the ordinary in-batch negatives from other "
+             "queries' positive tables. Same-database tables share schema/domain "
+             "vocabulary, so they're a harder, more informative negative than a "
+             "random other query's positive table. Set to 0 to disable.",
+    )
     parser.add_argument("--lr", type=float)
     parser.add_argument("--weight_decay", type=float)
     parser.add_argument("--warmup_ratio", type=float)
@@ -111,14 +215,22 @@ if __name__ == "__main__":
     parser.add_argument("--log_every", type=int)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
-        "--n_examples", type=int, default=None,
-        help="pilot run: randomly cap the number of query->table examples "
-             "used (applied after loading questions_json, before the "
-             "train/val split)",
+        "--text_cache_path", default=None,
+        help="path to CellEncoder's cell/header BERT-embedding cache (see "
+             "scripts/pretrain_electra.py's --text_cache_path). Point this at "
+             "the SAME file pretraining saved to (e.g. "
+             "eval/report_runs/pretrain/text_cache.pt) so cell/header strings "
+             "already seen during pretraining don't need BERT re-run here. "
+             "Defaults to <checkpoint_dir>/text_cache.pt (this run's OWN "
+             "checkpoint_dir, i.e. loads nothing new unless you point it "
+             "explicitly at pretraining's).",
     )
 
     apply_yaml_defaults(parser, "configs/model.yaml", "configs/finetune.yaml")
     args = parser.parse_args()
+
+    if args.text_cache_path is None:
+        args.text_cache_path = os.path.join(args.checkpoint_dir, "text_cache.pt")
 
     rng = random.Random(args.seed)
 
@@ -132,38 +244,39 @@ if __name__ == "__main__":
     query_dataset = SynSQLQueryDataset(args.questions_json, table_dataset)
     print(f"loaded {len(query_dataset)} query -> table example(s)")
 
-    all_indices = list(range(len(query_dataset)))
-    rng.shuffle(all_indices)
-    if args.n_examples is not None and args.n_examples < len(all_indices):
-        all_indices = all_indices[: args.n_examples]
-        print(f"pilot run: sampling {len(all_indices)} example(s)")
+    print(f"loading split from {args.split_json} ...")
+    resolved = query_dataset.resolve_split(args.split_json)
+    train_indices, val_indices, test_indices = resolved["train"], resolved["val"], resolved["test"]
+    print(f"split: {len(train_indices)} train / {len(val_indices)} val / {len(test_indices)} test")
 
-    n_val = max(1, int(len(all_indices) * args.val_frac))
-    val_indices, train_indices = set(all_indices[:n_val]), set(all_indices[n_val:])
+    print(f"loading fixed corpus from {args.corpus_json} ...")
+    corpus_tables = table_dataset.load_corpus(args.corpus_json)
+    print(f"corpus: {len(corpus_tables)} table(s) -- used unsplit for every val/test ranking")
 
-    class _Subset:
-        def __init__(self, base, indices):
-            self.base, self.indices = base, list(indices)
+    def build_train_batches():
+        """Called fresh once per epoch by FinetuneTrainer.fit (see its
+        batch_fn docstring) -- reshuffles query order, re-picks a
+        positive among multiple valid ones, and re-samples hard
+        negatives every call, using this script's shared `rng`."""
+        return list(
+            resolve_train_batches(
+                query_dataset,
+                table_dataset,
+                train_indices,
+                args.batch_size,
+                args.max_columns,
+                rng,
+                n_hard_negatives=args.n_hard_negatives,
+            )
+        )
 
-        def __len__(self):
-            return len(self.indices)
-
-        def __getitem__(self, i):
-            return self.base[self.indices[i]]
-
-        def iter_batches(self, batch_size, shuffle=True):
-            order = list(range(len(self.indices)))
-            if shuffle:
-                rng.shuffle(order)
-            for i in range(0, len(order), batch_size):
-                yield order[i : i + batch_size]
-
-    train_subset = _Subset(query_dataset, train_indices)
-    val_subset = _Subset(query_dataset, val_indices)
-
-    train_batches = list(resolve_batches(train_subset, args.batch_size, args.max_columns, rng))
-    val_batches = list(resolve_batches(val_subset, args.batch_size, args.max_columns, rng))
-    print(f"{len(train_batches)} train batches/epoch, {len(val_batches)} val batches")
+    steps_per_epoch = len(build_train_batches())
+    val_examples = to_eval_examples(query_dataset, val_indices)
+    test_examples = to_eval_examples(query_dataset, test_indices)
+    print(
+        f"{steps_per_epoch} train batches/epoch (n_hard_negatives={args.n_hard_negatives}), "
+        f"{len(val_examples)} val example(s), {len(test_examples)} test example(s)"
+    )
 
     cell_encoder = CellEncoder(
         text_model_name=args.text_model_name,
@@ -180,6 +293,14 @@ if __name__ == "__main__":
         channel_mix_hidden_dim=args.channel_mix_hidden_dim,
     )
     load_pretrained_encoder(model, args.pretrained_checkpoint, device=args.device)
+
+    # weights and the text cache are independent state -- the checkpoint's
+    # state_dict has no cache entries, so this is a separate load, not
+    # something load_pretrained_encoder already covers.
+    if os.path.exists(args.text_cache_path):
+        print(f"loading cell/header text cache from {args.text_cache_path} ...")
+        model.load_text_cache(args.text_cache_path)
+        print(f"text cache warm-started with {cell_encoder.text_embedder.cache_size()} entries")
 
     query_encoder = QueryEncoder(
         model_name=args.query_model_name,
@@ -203,13 +324,63 @@ if __name__ == "__main__":
         seed=args.seed,
     )
 
-    print(f"starting finetuning on {args.device} (scoring_mode={args.scoring_mode}) ...")
-    trainer.fit(
-        train_batches,
+    print(f"starting finetuning on {args.device} (scoring_mode={args.scoring_mode}, patience={args.patience}) ...")
+    best_val_map = trainer.fit(
+        build_train_batches,
         num_epochs=args.num_epochs,
-        steps_per_epoch=len(train_batches),
+        steps_per_epoch=steps_per_epoch,
+        val_examples=val_examples,
+        corpus_tables=corpus_tables,
+        patience=args.patience,
         log_every=args.log_every,
-        val_batches=val_batches,
+    )
+
+    print(f"\nbest validation MAP: {best_val_map:.4f}")
+
+    # final test-set MAP, using the best-val-MAP checkpoint (not
+    # whatever the last epoch trained happened to be -- early stopping
+    # means those can differ).
+    best_ckpt_path = os.path.join(args.checkpoint_dir, "best_model.pt")
+    test_map = None
+    if os.path.exists(best_ckpt_path):
+        trainer.load_checkpoint(best_ckpt_path)
+        test_map = trainer.evaluate_map(test_examples, corpus_tables)
+        print(f"test MAP (best-val-MAP checkpoint): {test_map:.4f}")
+    else:
+        print("no best checkpoint found (val MAP never improved) -- skipping test evaluation")
+
+    # Persisted, structured record -- best_model.pt/train.log hold the
+    # same numbers but aren't convenient to aggregate across runs/models
+    # for a report table; this is. See scripts/run_all_models.sh, which
+    # collects one of these per encoder into a single combined table.
+    results = {
+        "best_val_map": best_val_map,
+        "test_map": test_map,
+        "n_train": len(train_indices),
+        "n_val": len(val_indices),
+        "n_test": len(test_indices),
+        "corpus_size": len(corpus_tables),
+        "seed": args.seed,
+        "scoring_mode": args.scoring_mode,
+        "embed_dim": args.embed_dim,
+        "num_layers": args.num_layers,
+        "n_hard_negatives": args.n_hard_negatives,
+        "patience": args.patience,
+        "num_epochs_configured": args.num_epochs,
+        "split_json": args.split_json,
+        "corpus_json": args.corpus_json,
+        "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
+    }
+    results_path = os.path.join(args.checkpoint_dir, "results.json")
+    with open(results_path, "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=2)
+    print(f"wrote results to {results_path}")
+
+    os.makedirs(os.path.dirname(args.text_cache_path) or ".", exist_ok=True)
+    model.save_text_cache(args.text_cache_path)
+    print(
+        f"saved text cache ({cell_encoder.text_embedder.cache_size()} entries) "
+        f"to {args.text_cache_path}"
     )
 
     print("\nFinetuning complete.")

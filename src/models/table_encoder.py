@@ -310,6 +310,19 @@ class TableEncoder(nn.Module):
             ]
         )
 
+    def save_text_cache(self, path: str) -> None:
+        """Pass-through to CellEncoder.save_text_cache -- see that
+        method's docstring. Only meaningful when self.cell_encoder is a
+        real CellEncoder (the "ours" path); calling this on a model
+        wrapping some other cell_encoder that doesn't implement it will
+        raise AttributeError."""
+        self.cell_encoder.save_text_cache(path)
+
+    def load_text_cache(self, path: str, merge: bool = True) -> None:
+        """Pass-through to CellEncoder.load_text_cache -- see that
+        method's docstring."""
+        self.cell_encoder.load_text_cache(path, merge=merge)
+
     def _encode_cellwise(
         self, tables: list[Table], ablation: str | None = None, profile: bool = False
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:

@@ -274,6 +274,37 @@ class SynSQLTableDataset:
             for table_name in self._table_names(db_id):
                 yield self.get_table(db_id, table_name)
 
+    def load_corpus(self, corpus_json_path: str) -> list[Table]:
+        """
+        Materializes the FIXED retrieval corpus persisted by
+        scripts/build_query_splits.py -- the same corpus every
+        train/val/test split (and every model, including baselines)
+        should rank against, per-instruction that only queries are
+        split, never the corpus.
+
+        Returns tables in the order they're listed in the corpus file
+        (sorted by (db_id, table_name) at write time), so corpus
+        ordering is stable/reproducible across runs and across models.
+        """
+        with open(corpus_json_path, "r", encoding="utf-8") as f:
+            corpus = json.load(f)
+
+        tables = []
+        missing = 0
+        for record in corpus["tables"]:
+            db_id, table_name = record["db_id"], record["table_name"]
+            if self.has_table(db_id, table_name):
+                tables.append(self.get_table(db_id, table_name))
+            else:
+                missing += 1
+        if missing:
+            print(
+                f"[load_corpus] {missing} table(s) from {corpus_json_path!r} "
+                f"weren't found in the live schema (databases_root may differ "
+                f"from when the corpus was built)"
+            )
+        return tables
+
 
 # ==========================================================
 # QUERY DATASET (real query -> positive table(s), for finetuning)
@@ -284,6 +315,15 @@ class QueryTableExample:
     question: str
     db_id: str
     table_names: list[str]  # one or more positive tables for this query
+
+    def key(self) -> tuple:
+        """Identity used by the persisted train/val/test query split
+        (scripts/build_query_splits.py) to match a split record back to
+        this dataset's own (possibly re-filtered) examples list --
+        content-based rather than a raw index, so the split stays valid
+        even if SynSQLQueryDataset's filtering logic changes later and
+        shifts indices around."""
+        return (self.question, self.db_id, tuple(sorted(self.table_names)))
 
 
 class SynSQLQueryDataset:
@@ -296,6 +336,18 @@ class SynSQLQueryDataset:
     cell-corruption task, which needs no queries at all).
     """
 
+    # excluded by default -- confirmed against a real record: "style":
+    # "Multi-turn Dialogue" questions collapse an entire **User**/
+    # **Assistant** back-and-forth into a single "question" string
+    # (e.g. "I need some info about clothing inventory... Category with
+    # ID 1... yes, 2023... only in-stock items... just the count..."),
+    # not a standalone natural-language query -- a single QueryEncoder
+    # pass over that whole transcript isn't the same task as encoding
+    # one real question, so these are dropped rather than trained/
+    # validated/tested on. Pass exclude_styles=None (or an empty set) to
+    # keep them if you ever want to include multi-turn examples anyway.
+    DEFAULT_EXCLUDED_STYLES = frozenset({"Multi-turn Dialogue"})
+
     def __init__(
         self,
         questions_json: str,
@@ -303,6 +355,8 @@ class SynSQLQueryDataset:
         question_key: str = "question",
         db_id_key: str = "db_id",
         table_names_key: str = "required_tables",
+        style_key: str = "style",
+        exclude_styles: set | frozenset | None = DEFAULT_EXCLUDED_STYLES,
     ):
         self.table_dataset = table_dataset
 
@@ -310,8 +364,13 @@ class SynSQLQueryDataset:
             raw = json.load(f)
 
         self.examples: list[QueryTableExample] = []
-        skipped = 0
+        skipped_schema = 0
+        skipped_style = 0
         for record in raw:
+            if exclude_styles and record.get(style_key) in exclude_styles:
+                skipped_style += 1
+                continue
+
             db_id = record[db_id_key]
             table_names = record[table_names_key]
             if isinstance(table_names, str):
@@ -323,16 +382,21 @@ class SynSQLQueryDataset:
             # thousands of these).
             valid = [t for t in table_names if table_dataset.has_table(db_id, t)]
             if not valid:
-                skipped += 1
+                skipped_schema += 1
                 continue
 
             self.examples.append(
                 QueryTableExample(question=record[question_key], db_id=db_id, table_names=valid)
             )
 
-        if skipped:
+        if skipped_style:
             print(
-                f"[SynSQLQueryDataset] skipped {skipped} question(s) whose "
+                f"[SynSQLQueryDataset] excluded {skipped_style} question(s) with "
+                f"style in {sorted(exclude_styles)}"
+            )
+        if skipped_schema:
+            print(
+                f"[SynSQLQueryDataset] skipped {skipped_schema} question(s) whose "
                 f"positive table(s) weren't found in the live database schema"
             )
 
@@ -354,3 +418,52 @@ class SynSQLQueryDataset:
             random.shuffle(order)
         for i in range(0, len(order), batch_size):
             yield order[i : i + batch_size]
+
+    def resolve_split(self, split_json_path: str) -> dict[str, list[int]]:
+        """
+        Loads a persisted train/val/test QUERY split (built once via
+        scripts/build_query_splits.py) and resolves it against THIS
+        dataset's own self.examples, returning
+        {"train": [idx, ...], "val": [...], "test": [...]} -- indices
+        into self.examples / self[idx].
+
+        Only the QUERIES are split -- the table corpus itself is never
+        partitioned; every split evaluates retrieval against the SAME
+        full set of tables (per-instruction: "Fixed corpus tables and
+        only split queries across train, test and dev"). This method
+        doesn't touch SynSQLTableDataset at all, only which query
+        examples belong to which split.
+
+        Matches by QueryTableExample.key() (content-based), not raw
+        index, so the split file stays valid even if this dataset's own
+        filtering (e.g. which positive tables are dropped as
+        schema-invalid) changes between when the split was built and
+        when it's loaded. Any split record that no longer matches any
+        example here (e.g. questions_json changed) is skipped and
+        counted, not silently dropped.
+        """
+        with open(split_json_path, "r", encoding="utf-8") as f:
+            split = json.load(f)
+
+        key_to_idx = {ex.key(): i for i, ex in enumerate(self.examples)}
+
+        resolved: dict[str, list[int]] = {}
+        for split_name in ("train", "val", "test"):
+            indices = []
+            missing = 0
+            for record in split.get(split_name, []):
+                key = (record["question"], record["db_id"], tuple(sorted(record["table_names"])))
+                if key in key_to_idx:
+                    indices.append(key_to_idx[key])
+                else:
+                    missing += 1
+            if missing:
+                print(
+                    f"[resolve_split] {split_name}: {missing} record(s) from "
+                    f"{split_json_path!r} didn't match any current example "
+                    f"(questions_json or schema may have changed since the "
+                    f"split was built)"
+                )
+            resolved[split_name] = indices
+
+        return resolved

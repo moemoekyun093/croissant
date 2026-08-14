@@ -46,7 +46,7 @@ defaults:
 
   # -- table encoder / RCPE table layers --
   embed_dim: 64                           # [default] must be even (BERT projects to embed_dim // 2 per half)
-  num_layers: 1                           # [default] cheap to increase, cell encoding (BERT) dominates >99% of wall time
+  num_layers: 3                           # [default] cheap to increase, cell encoding (BERT) dominates >99% of wall time
   nonlinearity: sigmoid                   # [deliberate] follows original spec sigma(gate * X X^T); tanh/relu wired but untested
   channel_mix_hidden_dim: null            # [default] defaults to embed_dim * 2 when null; lighter than standard transformer FFN (x4)
 

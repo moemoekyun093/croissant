@@ -218,6 +218,24 @@ class CellEncoder(nn.Module):
             max_batch_size=text_max_batch_size,
         )
 
+    def save_text_cache(self, path: str) -> None:
+        """Persists the shared cell/header BERT-embedding cache to disk
+        -- see TextEmbedder.save_cache_to_disk. Only meaningful when BERT
+        is frozen (the default); a no-op is fine to call regardless, it
+        just saves whatever's been accumulated in memory so far (empty
+        if text_trainable=True, since caching is disabled in that case)."""
+        self.text_embedder.save_cache_to_disk(path)
+
+    def load_text_cache(self, path: str, merge: bool = True) -> None:
+        """Loads a previously-saved cell/header BERT-embedding cache --
+        e.g. one saved by save_text_cache() at the end of a PRETRAINING
+        run, loaded here at the start of FINETUNING (a separate process,
+        so the in-memory cache built during pretraining would otherwise
+        be lost) -- every cell/header string seen during pretraining is
+        then already cached instead of re-running BERT on it from
+        scratch during finetuning/eval. See TextEmbedder.load_cache_from_disk."""
+        self.text_embedder.load_cache_from_disk(path, merge=merge)
+
     def encode_column(self, column: Column) -> torch.Tensor:
         """
         Single-column entry point -- kept for debugging/inspection (e.g.

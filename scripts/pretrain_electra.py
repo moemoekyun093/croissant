@@ -34,6 +34,7 @@ databases/ layout.
 """
 
 import argparse
+import os
 import random
 
 from src.data.synsql_dataset import SynSQLTableDataset
@@ -114,9 +115,22 @@ if __name__ == "__main__":
         help="seeds db/table sampling and batch shuffling, so --n_dbs/"
              "--n_tables pilot runs are reproducible across runs",
     )
+    parser.add_argument(
+        "--text_cache_path", default=None,
+        help="path to CellEncoder's cell/header BERT-embedding cache (see "
+             "CellEncoder.save_text_cache/load_text_cache). If a file already "
+             "exists here, it's loaded before training so no cell/header string "
+             "seen in a previous run has to go through BERT again. Always saved "
+             "here at the end (accumulating this run's newly-seen strings), so a "
+             "later scripts.finetune_query_table run can load the same file and "
+             "start warm instead of cold. Defaults to <checkpoint_dir>/text_cache.pt.",
+    )
 
     apply_yaml_defaults(parser, "configs/model.yaml", "configs/pretrain.yaml")
     args = parser.parse_args()
+
+    if args.text_cache_path is None:
+        args.text_cache_path = os.path.join(args.checkpoint_dir, "text_cache.pt")
 
     rng = random.Random(args.seed)
 
@@ -171,6 +185,11 @@ if __name__ == "__main__":
         nonlinearity=args.nonlinearity,
         channel_mix_hidden_dim=args.channel_mix_hidden_dim,
     )
+    if os.path.exists(args.text_cache_path):
+        print(f"loading cell/header text cache from {args.text_cache_path} ...")
+        model.load_text_cache(args.text_cache_path)
+        print(f"text cache warm-started with {cell_encoder.text_embedder.cache_size()} entries")
+
     discriminator = DiscriminatorHead(embed_dim=args.embed_dim, hidden_dim=args.discriminator_hidden_dim)
 
     trainer = PretrainTrainer(
@@ -194,6 +213,13 @@ if __name__ == "__main__":
         log_every=args.log_every,
         val_batches=val_batches,
         resume_from=args.resume_from,
+    )
+
+    os.makedirs(os.path.dirname(args.text_cache_path) or ".", exist_ok=True)
+    model.save_text_cache(args.text_cache_path)
+    print(
+        f"saved text cache ({cell_encoder.text_embedder.cache_size()} entries) "
+        f"to {args.text_cache_path}"
     )
 
     print("\nPretraining complete.")

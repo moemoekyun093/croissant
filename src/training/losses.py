@@ -57,58 +57,53 @@ def cross_score_queries_tables(
     col_mask: torch.Tensor,
 ) -> torch.Tensor:
     """
-    Expands src/scoring/multi_score.py's MultiScorer.score() (which
-    scores PAIRED (query_i, table_i) -- one score per batch position)
-    into a full [Bq, Bt] cross matrix, every query against every table
-    in the batch -- needed for in-batch-negative contrastive finetuning
-    (query_table_info_nce_loss below).
-
-    Loops over the query batch (Bq calls to scorer.score(), each scoring
-    that one query against ALL Bt tables at once via broadcasting) --
-    not a full O(Bq*Bt) Python loop, just a lighter Bq-only one,
-    acceptable at typical batch sizes. Revisit with a fully vectorized
-    einsum across both batch dims if this shows up as a bottleneck.
+    Every query in Q scored against every table in X, via
+    src/scoring/multi_score.py's MultiScorer.score_cross() -- ONE
+    batched tensor op, no Python-level loop over queries or tables.
+    Needed for in-batch-negative contrastive finetuning
+    (query_table_info_nce_loss below) and for full-corpus MAP ranking
+    (FinetuneTrainer.evaluate_map), where Bt can be tens or hundreds of
+    thousands of candidate tables -- a per-query Python loop doesn't
+    scale to that (this function used to loop Bq times calling
+    scorer.score() per query; replaced with score_cross(), which does
+    the same math as a single vectorized computation).
 
     Q:        [Bq, L, k] -- caller must already have zeroed out any
               padding-token rows (e.g. Q * query_mask.unsqueeze(-1)),
-              since MultiScorer.score() has no query_mask argument of
-              its own and treats every row of Q as a real query vector.
+              since MultiScorer.score_cross() has no query_mask argument
+              of its own and treats every row of Q as a real query
+              vector.
     X:        [Bt, N, M, k]  -- row-resolved cell embeddings
     row_mask: [Bt, M]
     col_mask: [Bt, N]
 
     returns: [Bq, Bt] score matrix
     """
-    Bq = Q.shape[0]
-    Bt = X.shape[0]
-
-    rows = []
-    for i in range(Bq):
-        q_i = Q[i : i + 1].expand(Bt, -1, -1)  # [Bt, L, k]
-        # MultiScorer.score() doesn't take a query_mask argument today --
-        # it assumes every row of Q is a valid query vector. If a query
-        # has padding tokens (shorter than the batch's max length), zero
-        # those positions out of Q BEFORE calling this function (see
-        # FinetuneTrainer.train_step) so they contribute a zero dot
-        # product rather than a spurious signal. query_mask is accepted
-        # here for that same masking, applied by the caller in advance.
-        scores_i = scorer.score(mode, q_i, X, row_mask, col_mask)  # [Bt]
-        rows.append(scores_i)
-
-    return torch.stack(rows, dim=0)  # [Bq, Bt]
+    return scorer.score_cross(mode, Q, X, row_mask, col_mask)
 
 
 def query_table_info_nce_loss(
     cross_scores: torch.Tensor,
+    positive_indices: torch.Tensor | None = None,
     temperature: float = 0.07,
 ) -> torch.Tensor:
     """
     Real query -> positive-table contrastive loss (finetuning), given a
     [Bq, Bt] cross-score matrix (cross_score_queries_tables' output).
-    Assumes the batch is constructed with Bq == Bt and query i's
-    positive at table i (SynSQLQueryDataset-based batches, one positive
-    table sampled per query) -- other tables in the batch are in-batch
-    negatives.
+    Every OTHER column for a given query's row is a negative -- ordinary
+    in-batch negatives when Bt == Bq (other queries' positive tables),
+    PLUS any extra hard-negative tables appended past column Bq - 1 when
+    Bt > Bq (see scripts/finetune_query_table.py's resolve_train_batches,
+    which appends same-database, non-gold tables as harder negatives
+    than a random other query's positive table).
+
+    positive_indices: [Bq] int64, the column index of query i's true
+        positive table. Defaults to arange(Bq) -- positive for query i
+        at column i -- matching resolve_train_batches' convention: the
+        batch's Bq positive tables are always placed first (columns
+        0..Bq-1, one per query, in order), any hard negatives appended
+        afterward. Pass this explicitly only if a caller ever needs a
+        different positive layout.
 
     One-directional (query -> table) softmax cross-entropy, NOT
     symmetric like info_nce_loss's table-table version: retrieval here
@@ -119,13 +114,14 @@ def query_table_info_nce_loss(
 
     returns: scalar loss
     """
-    assert cross_scores.shape[0] == cross_scores.shape[1], (
-        "query_table_info_nce_loss assumes one positive table per query, "
-        "i.e. a square [B, B] cross-score matrix with the positive on "
-        "the diagonal"
-    )
+    Bq, Bt = cross_scores.shape
 
-    B = cross_scores.shape[0]
-    targets = torch.arange(B, device=cross_scores.device)
+    if positive_indices is None:
+        assert Bq <= Bt, (
+            f"query_table_info_nce_loss got Bq={Bq} queries but only "
+            f"Bt={Bt} tables -- every query needs at least its own "
+            f"positive table present as a column."
+        )
+        positive_indices = torch.arange(Bq, device=cross_scores.device)
 
-    return F.cross_entropy(cross_scores / temperature, targets)
+    return F.cross_entropy(cross_scores / temperature, positive_indices)

@@ -13,7 +13,7 @@ pass (TableEncoder) are project-specific.
 
 import os
 import random
-from typing import Iterable
+from typing import Callable, Iterable
 
 import torch
 from torch.optim import AdamW
@@ -21,6 +21,7 @@ from torch.optim.lr_scheduler import LambdaLR
 
 from src.data.table import Table
 from src.data.electra_corruption import build_non_fk_mask, corrupt_tables, pad_labels
+from src.eval.retrieval_metrics import compute_map
 from src.training.losses import (
     cross_score_queries_tables,
     electra_discriminator_loss,
@@ -309,12 +310,13 @@ class FinetuneTrainer:
         self.grad_clip_norm = grad_clip_norm
         self.temperature = temperature
         self.scoring_mode = scoring_mode
-
-        # owns its own seeded RNG (not the bare `random` module) so
-        # between-epoch batch reshuffling is reproducible given the same
-        # seed -- construction-time batch/example sampling in the calling
-        # script should use this same seed for a fully reproducible run.
-        self._rng = random.Random(seed)
+        self.seed = seed
+        # Unlike PretrainTrainer, this trainer doesn't own the batch
+        # construction itself -- fit()'s batch_fn (see its docstring) is
+        # called fresh every epoch by the CALLER (e.g.
+        # scripts/finetune_query_table.py's build_train_batches), which
+        # should use its own random.Random(seed) with this same `seed`
+        # for a fully reproducible run; no separate RNG is kept here.
 
         self.checkpoint_dir = checkpoint_dir
         os.makedirs(checkpoint_dir, exist_ok=True)
@@ -338,29 +340,46 @@ class FinetuneTrainer:
             if p.requires_grad
         ]
 
-    def _score_batch(self, batch: list[tuple[str, Table]]) -> torch.Tensor:
-        """batch: list of B (question, positive_table) pairs, ALREADY
-        resolved to exactly one positive table per query (if a query
-        has multiple valid positives in your dataset, pick one -- e.g.
-        randomly -- before calling this; this trainer stays agnostic to
-        how that resolution happened, same as it's agnostic to the data
-        source). Other tables in the batch serve as in-batch negatives
-        for every query, so avoid two queries in the same batch sharing
-        an identical positive table unless that's intentional.
+    def _score_batch(
+        self, batch: tuple[list[tuple[str, Table]], list[Table]]
+    ) -> torch.Tensor:
+        """batch: (pairs, hard_negatives).
 
-        returns: [B, B] cross-score matrix (query i vs. table j)
+        pairs: list of Bq (question, positive_table) pairs, ALREADY
+            resolved to exactly one positive table per query (if a
+            query has multiple valid positives in your dataset, pick
+            one -- e.g. randomly -- before calling this; this trainer
+            stays agnostic to how that resolution happened, same as
+            it's agnostic to the data source). Every OTHER query's
+            positive table in `pairs` doubles as an in-batch negative
+            for this query, so avoid two queries in the same batch
+            sharing an identical positive table unless that's
+            intentional.
+        hard_negatives: extra candidate tables with no query of their
+            own, appended as columns Bq..Bq+len(hard_negatives)-1 --
+            e.g. same-database, non-gold tables (see
+            scripts/finetune_query_table.py's resolve_train_batches),
+            which are harder negatives than a random other query's
+            positive table since they share schema/domain vocabulary.
+            Pass an empty list to disable (plain in-batch negatives
+            only, previous behavior).
+
+        returns: [Bq, Bq + len(hard_negatives)] cross-score matrix
+            (query i vs. table j); query i's positive is always at
+            column i (see query_table_info_nce_loss's docstring).
         """
-        queries = [q for q, _ in batch]
-        tables = [t for _, t in batch]
+        pairs, hard_negatives = batch
+        queries = [q for q, _ in pairs]
+        tables = [t for _, t in pairs] + list(hard_negatives)
 
-        Q, query_mask = self.query_encoder(queries)  # [B, L, k], [B, L]
+        Q, query_mask = self.query_encoder(queries)  # [Bq, L, k], [Bq, L]
         Q = Q * query_mask.unsqueeze(-1)  # zero out padding-token vectors
 
         X, col_mask, row_mask, cell_mask = self.model.forward_batch_cellwise(tables)
 
         return cross_score_queries_tables(self.scorer, self.scoring_mode, Q, X, row_mask, col_mask)
 
-    def train_step(self, batch: list[tuple[str, Table]]) -> float:
+    def train_step(self, batch: tuple[list[tuple[str, Table]], list[Table]]) -> float:
         self.model.train()
         self.query_encoder.train()
         self.scorer.train()
@@ -378,20 +397,159 @@ class FinetuneTrainer:
 
         return loss.item()
 
+    def evaluate_map(
+        self,
+        examples: list[tuple[str, str, list[str]]],
+        corpus_tables: list[Table],
+        query_batch_size: int | None = None,
+        table_batch_size: int = 32,
+    ) -> float:
+        """
+        Full-corpus Mean Average Precision -- the model-selection metric
+        (NOT the training loss). Ranks EVERY table in corpus_tables
+        against each query in `examples`, not just in-batch negatives
+        the way train_step/evaluate's InfoNCE loss does -- a batch-local
+        loss can look good or bad for reasons that have nothing to do
+        with full-corpus ranking quality, which is what actually matters
+        for retrieval.
+
+        examples:      list of (question, db_id, table_names) -- kept as
+                       plain tuples rather than importing
+                       src.data.synsql_dataset.QueryTableExample, since
+                       this trainer is deliberately decoupled from any
+                       specific data source (see module docstring).
+        corpus_tables: the FIXED, un-split table corpus (see
+                       scripts/build_query_splits.py's docstring -- only
+                       QUERIES are split into train/val/test, the corpus
+                       never is). Pass the SAME corpus_tables for every
+                       split so MAP numbers are comparable across splits
+                       and across epochs. Each Table's table_id must
+                       follow the "{db_id}#sep#{table_name}" convention
+                       SynSQLTableDataset.get_table() uses, since that's
+                       how a query's positive table_names get matched
+                       against corpus_tables here.
+
+        query_batch_size: None (default) encodes every query in `examples`
+                       in ONE QueryEncoder call -- val/test query sets are
+                       plain text through a BERT-sized encoder and are
+                       typically hundreds to a few thousand examples, far
+                       smaller than the corpus, so this is normally cheap
+                       and lets scoring run as one batched op per corpus
+                       chunk. Pass an int only if you have an unusually
+                       large query set that itself doesn't fit in memory.
+        table_batch_size: the corpus-chunk size. This is a hard memory
+                       constraint, not a leftover Python-loop
+                       inefficiency: forward_batch_cellwise pads every
+                       table in a chunk to that chunk's own max
+                       rows/columns, so encoding the entire 100k+ table
+                       corpus in one call would pad every table to the
+                       single largest table's shape and blow up memory.
+                       Chunking the corpus is therefore unavoidable at
+                       this scale; the loop below is the one loop that
+                       has to remain. Tables are sorted by (num_columns,
+                       num_rows) before chunking so similarly-sized
+                       tables land in the same chunk -- this minimizes
+                       wasted padding within each chunk, which matters a
+                       lot once the corpus spans very different table
+                       sizes (as a real ~160k-table corpus will).
+        """
+        self.model.eval()
+        self.query_encoder.eval()
+        self.scorer.eval()
+
+        corpus_ids = [t.table_id for t in corpus_tables]
+        id_to_idx = {tid: i for i, tid in enumerate(corpus_ids)}
+
+        n_queries = len(examples)
+        n_corpus = len(corpus_tables)
+        scores = torch.zeros(n_queries, n_corpus)
+        positive_mask = torch.zeros(n_queries, n_corpus)
+
+        for qi, (_question, db_id, table_names) in enumerate(examples):
+            for t in table_names:
+                tid = f"{db_id}#sep#{t}"
+                if tid in id_to_idx:
+                    positive_mask[qi, id_to_idx[tid]] = 1.0
+
+        # Sort corpus indices by size before chunking (see table_batch_size
+        # docstring above); `order[i]` is the original corpus_tables index
+        # of the i-th table in size-sorted order, so results can be
+        # scattered back to their true column in `scores` regardless of
+        # this reordering.
+        order = sorted(
+            range(n_corpus),
+            key=lambda i: (corpus_tables[i].num_columns, corpus_tables[i].num_rows),
+        )
+
+        with torch.no_grad():
+            # Encode every query ONCE, up front -- no outer query-chunk
+            # loop at all in the common case (query_batch_size=None).
+            if query_batch_size is None:
+                questions = [q for q, _, _ in examples]
+                Q, query_mask = self.query_encoder(questions)
+                Q = Q * query_mask.unsqueeze(-1)
+                query_chunks = [(0, n_queries, Q)]
+            else:
+                query_chunks = []
+                for q_start in range(0, n_queries, query_batch_size):
+                    q_chunk = examples[q_start : q_start + query_batch_size]
+                    questions = [q for q, _, _ in q_chunk]
+                    Qc, query_mask = self.query_encoder(questions)
+                    Qc = Qc * query_mask.unsqueeze(-1)
+                    query_chunks.append((q_start, q_start + len(q_chunk), Qc))
+
+            # The one remaining loop: chunk the corpus (memory-bound, see
+            # docstring), encode each chunk once, score it against every
+            # query chunk with a single vectorized cross_score_queries_tables
+            # call (no per-query Python loop -- see MultiScorer.score_cross).
+            for c_start in range(0, n_corpus, table_batch_size):
+                idx_chunk = order[c_start : c_start + table_batch_size]
+                c_chunk = [corpus_tables[i] for i in idx_chunk]
+                X, col_mask, row_mask, cell_mask = self.model.forward_batch_cellwise(c_chunk)
+
+                idx_tensor = torch.tensor(idx_chunk, dtype=torch.long)
+                for q_lo, q_hi, Q in query_chunks:
+                    cross = cross_score_queries_tables(
+                        self.scorer, self.scoring_mode, Q, X, row_mask, col_mask
+                    )  # [q_hi - q_lo, len(idx_chunk)]
+                    scores[q_lo:q_hi].index_copy_(1, idx_tensor, cross.to(scores.device))
+
+        return compute_map(scores, positive_mask)
+
     def fit(
         self,
-        dataloader: Iterable[list[tuple[str, Table]]],
+        batch_fn: Callable[[], list[tuple[list[tuple[str, Table]], list[Table]]]],
         num_epochs: int,
         steps_per_epoch: int,
+        val_examples: list[tuple[str, str, list[str]]],
+        corpus_tables: list[Table],
+        patience: int = 3,
         log_every: int = 50,
-        val_batches: list[list[tuple[str, Table]]] | None = None,
         resume_from: str | None = None,
-    ) -> None:
-        import time
+    ) -> float:
+        """
+        Early stopping on validation MAP (not loss) -- per-instruction:
+        after each epoch, compute val MAP over the full fixed corpus; if
+        it's better than the best seen so far, save the model (only
+        then); if it hasn't improved for `patience` consecutive epochs,
+        stop. The number that matters at the end is best validation
+        MAP, returned here and logged -- nothing else is used for model
+        selection.
 
-        # Materialized once so it can be RESHUFFLED between epochs below --
-        # same rationale as PretrainTrainer.fit.
-        batches = list(dataloader)
+        batch_fn: called ONCE PER EPOCH (not once total) to build a
+            fresh list of training batches -- e.g.
+            scripts/finetune_query_table.py's resolve_train_batches
+            bound to this trainer's own seeded RNG. This is deliberate,
+            not just an epoch-order reshuffle: calling it fresh every
+            epoch also re-samples which positive table is used for a
+            query with multiple valid positives, and re-samples which
+            hard-negative tables get appended, so a query doesn't see
+            the exact same in-batch/hard negatives on every single
+            epoch of the whole run.
+
+        val_examples/corpus_tables: see evaluate_map's docstring.
+        """
+        import time
 
         total_steps = num_epochs * steps_per_epoch
         warmup_steps = int(total_steps * self.warmup_ratio)
@@ -409,15 +567,18 @@ class FinetuneTrainer:
         )
 
         run_start = time.time()
+        best_map = -1.0
+        epochs_without_improvement = 0
 
         for epoch in range(start_epoch, num_epochs):
-            # reshuffle BATCH ORDER between epochs (query/table pairing
-            # within each batch stays fixed -- only the sequence of
-            # batches changes) so every epoch sees a different order
-            # instead of the exact same sequence every time. Uses this
-            # trainer's own seeded RNG (not the bare random module) so
-            # the whole run is reproducible given the same seed.
-            self._rng.shuffle(batches)
+            # Rebuilt from scratch every epoch (see batch_fn's docstring
+            # above) -- not just a reshuffle of one fixed list. Uses this
+            # trainer's own seeded RNG internally (not the bare random
+            # module) so the whole run is still reproducible given the
+            # same seed, while still giving every epoch a genuinely
+            # different batch order, positive-table choice, and
+            # hard-negative sample.
+            batches = batch_fn()
 
             epoch_losses = []
             epoch_start = time.time()
@@ -438,18 +599,39 @@ class FinetuneTrainer:
             epoch_avg = sum(epoch_losses) / max(1, len(epoch_losses))
             epoch_elapsed = time.time() - epoch_start
 
-            val_msg = ""
-            if val_batches:
-                val_loss = self.evaluate(val_batches)
-                val_msg = f", val loss {val_loss:.4f}"
+            val_map = self.evaluate_map(val_examples, corpus_tables)
 
-            self._log(
-                f"== [finetune] epoch {epoch} done, avg train loss {epoch_avg:.4f}{val_msg}, "
-                f"took {epoch_elapsed/60:.1f} min =="
-            )
-            self.save_checkpoint(epoch)
+            if val_map > best_map:
+                best_map = val_map
+                epochs_without_improvement = 0
+                self.save_checkpoint(epoch, extra={"val_map": val_map})
+                self._log(
+                    f"== [finetune] epoch {epoch} done, avg train loss {epoch_avg:.4f}, "
+                    f"val MAP {val_map:.4f} (NEW BEST), took {epoch_elapsed/60:.1f} min =="
+                )
+            else:
+                epochs_without_improvement += 1
+                self._log(
+                    f"== [finetune] epoch {epoch} done, avg train loss {epoch_avg:.4f}, "
+                    f"val MAP {val_map:.4f} (best so far: {best_map:.4f}, "
+                    f"{epochs_without_improvement}/{patience} epoch(s) without improvement), "
+                    f"took {epoch_elapsed/60:.1f} min =="
+                )
+                if epochs_without_improvement >= patience:
+                    self._log(
+                        f"[finetune] early stopping at epoch {epoch}: no val MAP "
+                        f"improvement for {patience} epoch(s)."
+                    )
+                    break
 
-    def evaluate(self, val_batches: list[list[tuple[str, Table]]]) -> float:
+        self._log(f"[finetune] training complete. best validation MAP: {best_map:.4f}")
+        return best_map
+
+    def evaluate(self, val_batches: list[tuple[list[tuple[str, Table]], list[Table]]]) -> float:
+        """In-batch-negative InfoNCE loss over pre-built batches --
+        diagnostic only (e.g. to sanity-check training is proceeding
+        sensibly step to step). NOT used for early stopping or model
+        selection -- see evaluate_map for that."""
         self.model.eval()
         self.query_encoder.eval()
         self.scorer.eval()
@@ -463,20 +645,24 @@ class FinetuneTrainer:
 
         return sum(losses) / max(1, len(losses))
 
-    def save_checkpoint(self, epoch: int) -> None:
-        path = os.path.join(self.checkpoint_dir, f"checkpoint_epoch{epoch}.pt")
-        torch.save(
-            {
-                "epoch": epoch,
-                "global_step": self.global_step,
-                "model_state_dict": self.model.state_dict(),
-                "query_encoder_state_dict": self.query_encoder.state_dict(),
-                "scorer_state_dict": self.scorer.state_dict(),
-                "optimizer_state_dict": self.optimizer.state_dict(),
-            },
-            path,
-        )
-        self._log(f"saved checkpoint: {path}")
+    def save_checkpoint(self, epoch: int, extra: dict | None = None) -> None:
+        """Overwrites a single best_model.pt -- FinetuneTrainer only
+        ever saves when val MAP improves (see fit()), so there's no
+        reason to accumulate one file per epoch the way PretrainTrainer
+        does; the only checkpoint worth keeping is the best one."""
+        path = os.path.join(self.checkpoint_dir, "best_model.pt")
+        payload = {
+            "epoch": epoch,
+            "global_step": self.global_step,
+            "model_state_dict": self.model.state_dict(),
+            "query_encoder_state_dict": self.query_encoder.state_dict(),
+            "scorer_state_dict": self.scorer.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+        }
+        if extra:
+            payload.update(extra)
+        torch.save(payload, path)
+        self._log(f"saved new best checkpoint: {path}")
 
     def load_checkpoint(self, path: str) -> None:
         checkpoint = torch.load(path, map_location=self.device)
