@@ -35,7 +35,7 @@ defaults:
   negatives: in_batch                     # [known issue, not a settable parameter -- no --flag] two queries sharing the same positive table in one batch currently corrupts each other's negatives; not yet deduplicated
 
   # -- batching / epochs --
-  batch_size: 32                          # [default] smaller than pretrain's 64 by guess only (the cross-query-vs-table scoring loop's cost grows faster with batch size here than in the other stages), not measured
+  batch_size: 96                          # [changed from 32 -> 64 -> 96] the currently-running "ours" finetune process was launched at bs=64 and is NOT restarted for this bump (FinetuneTrainer has no resume support, so a restart would lose its progress) -- 64 measured a genuine ~2.4x examples/min throughput gain over 32 (not just per-step overhead amortization, so the GPU wasn't compute-saturated at 32 either). 96 is untested -- applies to any freshly-launched run (the baseline sweep via scripts/run_baselines.sh) picking up this default. Re-measure steps/min once a baseline run reaches ~100+ steps to confirm 96 doesn't OOM and to get a real throughput number; watch nvidia-smi memory headroom given RCPE's O(rows^2) attention cost can spike with unlucky wide/tall tables in a batch.
   num_epochs: 10                          # [default] no principled stopping criterion yet
   max_rows: 50                            # [deliberate] matches MAX_ROWS convention referenced in training_config.md
   max_columns: 20                         # [default] truncation cap for outlier-wide tables, used by the size-bucketing batcher
