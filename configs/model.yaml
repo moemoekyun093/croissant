@@ -1,0 +1,51 @@
+# Hyperparameters for the custom transformer architecture (dims, layers, heads).
+#
+# Sourced from: src/models/table_encoder.py, src/models/rcpe.py,
+# src/encoding/cell_encoder.py, src/training/training_config.md
+#
+# `defaults` = current values used in code today.
+# `sweep`    = candidate values worth trying, for settings flagged 🤷
+#              (reasonable-but-unvalidated) in training_config.md.
+#              Settings flagged 🎯 (deliberately reasoned) are left out
+#              of `sweep` on purpose -- change them only with a specific
+#              reason, not as part of a blind grid search.
+#
+# NOTE (current simplification): numeric cells are no longer routed to a
+# separate NumericEmbedder -- every cell (numeric-looking or not) is
+# encoded as text via BERT. A cell's final embedding is the RAW
+# CONCATENATION of its own text embedding and its column's header
+# embedding -- concat only, NO projection back down afterward. Headers
+# are embedded independently via BERT's own [CLS] token per header (no
+# joined-sequence encoding, no cross-header contextualizer transformer
+# on top -- that HeaderContextualizer step has been dropped from the
+# main path). numeric_embedder.py / cell_type.py routing logic and the
+# HeaderContextualizer class are unused for now; revisit later if
+# numeric-aware encoding is worth reintroducing.
+#
+# Because there's no projection after the concat, `embed_dim` below is
+# the FINAL per-cell width, and BERT itself projects to `embed_dim // 2`
+# for the cell half and the header half separately (so concatenating the
+# two lands exactly on `embed_dim`). `embed_dim` must be even.
+
+defaults:
+  # -- cell + header encoder (single shared BERT + projection) --
+  text_model_name: bert-base-uncased      # 🤷 never compared against alternatives
+  text_trainable: false                   # 🎯 frozen BERT + trainable projection (CLIP-style)
+  text_max_length: 32                     # 🎯 sized for short cell values; known-inadequate for prose-heavy cells
+  text_max_batch_size: 2048               # 🎯 internal BERT chunk size, safety bound
+
+  # -- table encoder / RCPE table layers --
+  embed_dim: 64                           # 🤷 inconsistent across scripts (64 in pilot_train.py, 32 in sanity_checks.py) -- pick one; must be even (BERT projects to embed_dim // 2 per half)
+  num_layers: 1                           # cheap to increase; cell encoding (BERT) dominates >99% of wall time
+  nonlinearity: sigmoid                   # 🎯 follows original spec sigma(gate * X X^T); tanh/relu wired but untested
+  channel_mix_hidden_dim: null            # defaults to embed_dim * 2 when null; 🤷 lighter than standard transformer FFN (x4)
+
+  # -- data / corpus shape caps --
+  max_rows_per_table: 50                  # 🎯 MAX_ROWS, caps O(m^2) attention cost in ColumnAggregator
+  max_columns_per_table: 20               # truncation cap used in scripts/pilot_train.py make_batches
+
+sweep:
+  embed_dim: [32, 64, 96, 128]
+  nonlinearity: [sigmoid, tanh, relu]
+  channel_mix_hidden_dim: [null, 128, 256]   # null = embed_dim * 2
+  num_layers: [1, 2, 3]

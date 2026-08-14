@@ -1,0 +1,120 @@
+"""
+Baseline #1 — Plain BERT.
+
+Flattens the whole table into one token sequence and runs vanilla BERT
+self-attention over it: every token attends to every other token, with no
+row/column structural bias beyond BERT's own absolute position ids (which
+here just encode "flattening order", not table geometry).
+
+This is the weakest structural baseline in the suite and exists mainly as a
+lower bound: any of the structure-aware encoders (TABBIE, StruBERT, TAPAS,
+TURL, HyTrel) should outperform this if table structure is actually useful
+for your task.
+
+Reference: standard `transformers.BertModel`, no external repo needed --
+plain BERT has no notion of a "table" at all, so there is no paper-defined
+convention for folding headers into cell text here. We use the same
+"header : value" per-cell serialization the other baselines' papers use
+in spirit (see e.g. StruBERT's "[header] [type] [value]"), but it's an
+arbitrary choice made for this baseline specifically, not something
+inherited from a reference implementation.
+"""
+from __future__ import annotations
+
+from typing import List, Optional, Sequence, Tuple
+
+import torch
+from transformers import AutoModel, AutoTokenizer
+
+from .common import BaseTableEncoder, TableEncoding, clean_cell, mean_pool_span, validate_table
+
+
+def _serialize_cell(header: str, value: object) -> str:
+    """Arbitrary "header : value" flattening -- see module docstring."""
+    return f"{clean_cell(header)} : {clean_cell(value)}"
+
+
+class BertTableEncoder(BaseTableEncoder):
+    def __init__(
+        self,
+        model_name: str = "bert-base-uncased",
+        max_length: int = 512,
+        device: Optional[str] = None,
+    ):
+        super().__init__(model_name, device)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.backbone = AutoModel.from_pretrained(model_name).to(self.device)
+        self.max_length = max_length
+        self.hidden_size = self.backbone.config.hidden_size
+
+    def _build_sequence(
+        self,
+        headers: Sequence[str],
+        rows: Sequence[Sequence[object]],
+        caption: Optional[str],
+    ) -> Tuple[List[int], List[List[List[Tuple[int, int]]]]]:
+        """Flatten table row-major into a single token id sequence, tracking
+        the [start, end) token span of every cell for later mean-pooling.
+        Truncates whole cells (never splits a cell) once max_length is hit.
+        """
+        input_ids: List[int] = [self.tokenizer.cls_token_id]
+        cell_spans: List[List[Tuple[int, int]]] = [
+            [(0, 0) for _ in headers] for _ in rows
+        ]
+
+        def add_text(text: str) -> List[int]:
+            ids = self.tokenizer.encode(text, add_special_tokens=False)
+            return ids
+
+        if caption:
+            input_ids += add_text(caption)
+            input_ids.append(self.tokenizer.sep_token_id)
+
+        truncated = False
+        for i, row in enumerate(rows):
+            if truncated:
+                break
+            for j, val in enumerate(row):
+                text = _serialize_cell(headers[j], val)
+                ids = add_text(text)
+                if len(input_ids) + len(ids) + 1 >= self.max_length:
+                    truncated = True
+                    break
+                start = len(input_ids)
+                input_ids += ids
+                end = len(input_ids)
+                cell_spans[i][j] = (start, end)
+                input_ids.append(self.tokenizer.sep_token_id)
+
+        if input_ids[-1] != self.tokenizer.sep_token_id:
+            input_ids.append(self.tokenizer.sep_token_id)
+        return input_ids, cell_spans
+
+    def forward(
+        self,
+        headers: Sequence[str],
+        rows: Sequence[Sequence[object]],
+        caption: Optional[str] = None,
+    ) -> TableEncoding:
+        validate_table(headers, rows)
+        n_rows, n_cols = len(rows), len(headers)
+
+        input_ids, cell_spans = self._build_sequence(headers, rows, caption)
+        ids_t = torch.tensor([input_ids], device=self.device)
+        attn_mask = torch.ones_like(ids_t)
+
+        out = self.backbone(input_ids=ids_t, attention_mask=attn_mask)
+        hidden = out.last_hidden_state[0]  # [seq_len, dim]
+        cls = hidden[0]
+
+        cell_emb = torch.zeros(n_rows, n_cols, self.hidden_size, device=self.device)
+        for i in range(n_rows):
+            for j in range(n_cols):
+                start, end = cell_spans[i][j]
+                cell_emb[i, j] = mean_pool_span(hidden, start, end) if end > start else cls
+
+        row_emb = cell_emb.mean(dim=1)
+        col_emb = cell_emb.mean(dim=0)
+        table_emb = cls
+
+        return TableEncoding(cell_emb, row_emb, col_emb, table_emb)

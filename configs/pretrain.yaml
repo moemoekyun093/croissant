@@ -1,0 +1,43 @@
+# ELECTRA-style pretraining hyperparameters: cell corruption + per-cell
+# discriminator (src/data/electra_corruption.py, DiscriminatorHead +
+# PretrainTrainer in src/models/table_encoder.py / src/training/trainer.py).
+#
+# `defaults` = current values used in code today (scripts/pretrain_electra.py's
+#              argparse defaults + PretrainTrainer's constructor defaults).
+# `sweep`    = candidate values worth trying. Everything here is genuinely
+#              untuned -- this whole training stage is new, nothing has
+#              been run against real data yet -- so treat `defaults` as a
+#              reasonable starting point, not a validated choice.
+
+defaults:
+  # -- corruption (src/data/electra_corruption.py::corrupt_tables) --
+  corrupt_frac: 0.15                      # 🤷 fraction of real cells corrupted per table, chosen by analogy to BERT's 15% MLM rate -- not derived for this task
+  corruption_pool_scope: batch_column_match  # 🎯 pool = every real value seen anywhere in the batch under the SAME header text (own table included) -- see conversation: exact header-string match only, no fuzzy/cross-name matching yet
+
+  # -- discriminator head (src/models/table_encoder.py::DiscriminatorHead) --
+  discriminator_hidden_dim: null          # defaults to embed_dim when null; 2-layer MLP w/ GELU, one logit per cell
+
+  # -- optimizer / schedule (shared AdamW + linear warmup/decay, same as training.yaml) --
+  lr: 1.0e-4                              # 🤷 carried over from the contrastive-pretraining default, not re-tuned for this task
+  weight_decay: 0.01                      # 🤷 standard AdamW default
+  warmup_ratio: 0.1                       # 🎯 standard convention
+  grad_clip_norm: 1.0                     # 🎯 standard safeguard
+
+  # -- batching / epochs --
+  batch_size: 64                          # 🤷 carried over from pilot_train.py's GPU-headroom-based choice -- not re-checked for this task's memory profile (row-resolved X is [B,N,M,k], not pooled -- higher memory than the old contrastive path at the same batch size)
+  num_epochs: 15                          # 🤷 no principled stopping criterion yet
+  max_rows: 50                            # 🎯 matches MAX_ROWS convention used elsewhere (model.yaml)
+
+  # -- data split --
+  val_frac: 0.1                           # 🤷 standard default, not tuned
+
+  # -- infra / logging --
+  device: cuda:2                          # 🎯 re-check via nvidia-smi before reuse, same caveat as training.yaml
+  checkpoint_dir: eval/report_runs/pretrain
+  log_every: 10
+
+sweep:
+  corrupt_frac: [0.10, 0.15, 0.20, 0.30]
+  lr: [5.0e-5, 1.0e-4, 2.0e-4]
+  batch_size: [32, 64, 128]
+  num_epochs: [10, 15, 20]

@@ -1,0 +1,50 @@
+# Query->table finetuning hyperparameters: real (question, positive
+# table) contrastive training via MultiScorer, starting from an
+# ELECTRA-pretrained encoder checkpoint
+# (src/training/query_encoder.py, FinetuneTrainer in src/training/trainer.py,
+# src/scoring/multi_score.py).
+#
+# `defaults` = current values used in code today (scripts/finetune_query_table.py's
+#              argparse defaults + FinetuneTrainer's constructor defaults).
+# `sweep`    = candidate values worth trying. Like pretrain.yaml, this
+#              whole stage is new and unvalidated against real data --
+#              `defaults` is a starting point, not a checked choice.
+
+defaults:
+  # -- query encoder (src/training/query_encoder.py::QueryEncoder) --
+  query_model_name: bert-base-uncased     # 🤷 same backbone as CellEncoder, never compared against alternatives
+  query_trainable: true                   # 🎯 unlike CellEncoder's frozen BERT, the query tower trains from the start -- finetuning is exactly the stage with real query supervision (see QueryEncoder docstring)
+  query_max_length: 32                    # 🤷 carried over from CellEncoder's cell/header max_length, not re-checked for query length distribution
+  exclude_special_tokens: false           # 🎯 keeps [CLS]/[SEP] as ordinary query vectors, matching ColBERT's own convention
+
+  # -- scoring (src/scoring/multi_score.py::MultiScorer) --
+  scoring_mode: row_match                 # 🎯 chosen over column_match/mixture/etc. -- see conversation; structurally closest to the existing table-table MaxSim convention
+
+  # -- optimizer / schedule --
+  lr: 1.0e-4                              # 🤷 not re-tuned for this stage; finetuning often wants a LOWER lr than pretraining since the encoder already has learned structure to preserve -- worth checking explicitly, not just reusing pretrain.yaml's value
+  weight_decay: 0.01                      # 🤷 standard AdamW default
+  warmup_ratio: 0.1                       # 🎯 standard convention
+  grad_clip_norm: 1.0                     # 🎯 standard safeguard
+
+  # -- contrastive loss (src/training/losses.py::query_table_info_nce_loss) --
+  temperature: 0.07                       # 🤷 carried over from the table-table InfoNCE default, not re-derived for query-table scoring's different score scale/range
+  negatives: in_batch                     # ⚠️ known issue, not just untuned -- see conversation: two queries sharing the same positive table in one batch currently corrupts each other's negatives; not yet deduplicated
+
+  # -- batching / epochs --
+  batch_size: 32                          # 🤷 smaller than pretrain's 64 by guess only (cross_score_queries_tables loops Bq times per step, so cost grows faster with batch size here than in the other two stages) -- not measured
+  num_epochs: 10                          # 🤷 no principled stopping criterion yet
+
+  # -- data split --
+  val_frac: 0.1                           # 🤷 standard default, not tuned
+
+  # -- infra / logging --
+  device: cuda:2                          # 🎯 re-check via nvidia-smi before reuse
+  checkpoint_dir: eval/report_runs/finetune
+  log_every: 10
+
+sweep:
+  lr: [1.0e-5, 5.0e-5, 1.0e-4]
+  temperature: [0.03, 0.05, 0.07, 0.1]
+  batch_size: [16, 32, 64]
+  scoring_mode: [row_match, column_match, mixture, global]
+  num_epochs: [5, 10, 15]
