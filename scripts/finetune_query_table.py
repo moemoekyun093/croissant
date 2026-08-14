@@ -205,6 +205,18 @@ if __name__ == "__main__":
              "vocabulary, so they're a harder, more informative negative than a "
              "random other query's positive table. Set to 0 to disable.",
     )
+    parser.add_argument(
+        "--val_sample_size", type=int, default=None,
+        help="subsample the val query split to this many examples for the "
+             "PER-EPOCH early-stopping MAP/MRR check -- see "
+             "scripts/train_model.py's --val_sample_size for the full "
+             "rationale (a real split's val set can be hundreds of thousands "
+             "of queries; ranking all of them against the full corpus every "
+             "epoch is enormously expensive for a per-epoch signal). Fixed "
+             "subset (drawn once via --seed), not resampled per epoch. Does "
+             "NOT affect final test-set evaluation. Omit to use the full val "
+             "split every epoch, as before.",
+    )
     parser.add_argument("--lr", type=float)
     parser.add_argument("--weight_decay", type=float)
     parser.add_argument("--warmup_ratio", type=float)
@@ -271,7 +283,21 @@ if __name__ == "__main__":
         )
 
     steps_per_epoch = len(build_train_batches())
-    val_examples = to_eval_examples(query_dataset, val_indices)
+
+    eval_val_indices = val_indices
+    if args.val_sample_size is not None and args.val_sample_size < len(val_indices):
+        # Fixed once, not resampled per epoch -- see --val_sample_size's
+        # help text. Independent random.Random(args.seed), not `rng`
+        # (which keeps advancing for batch construction), so this
+        # selection is reproducible from --seed alone.
+        eval_val_indices = random.Random(args.seed).sample(val_indices, args.val_sample_size)
+        print(
+            f"subsampled val set for per-epoch checks: "
+            f"{len(eval_val_indices)}/{len(val_indices)} val quer(ies) "
+            f"(--val_sample_size {args.val_sample_size})"
+        )
+
+    val_examples = to_eval_examples(query_dataset, eval_val_indices)
     test_examples = to_eval_examples(query_dataset, test_indices)
     print(
         f"{steps_per_epoch} train batches/epoch (n_hard_negatives={args.n_hard_negatives}), "
@@ -358,6 +384,7 @@ if __name__ == "__main__":
         "test_map": test_map,
         "n_train": len(train_indices),
         "n_val": len(val_indices),
+        "n_val_used_for_early_stopping": len(eval_val_indices),
         "n_test": len(test_indices),
         "corpus_size": len(corpus_tables),
         "seed": args.seed,

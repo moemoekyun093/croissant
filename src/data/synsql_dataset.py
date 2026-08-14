@@ -227,6 +227,44 @@ class SynSQLTableDataset:
             self._foreign_key_columns_cache[key] = {row[3] for row in cur.fetchall()}
         return self._foreign_key_columns_cache[key]
 
+    def _sample_bounded_rowids(
+        self, cur: sqlite3.Cursor, table_name: str, min_rowid: int, max_rowid: int
+    ) -> list[int]:
+        """
+        Randomly samples up to self.max_rows real rowids from a table
+        WITHOUT ever fetching every rowid into Python -- generates
+        candidate rowids in [min_rowid, max_rowid] via this dataset's
+        own seeded RNG and checks which actually exist via a single
+        `WHERE rowid IN (...)` query per round. SQLite rowids can have
+        gaps (deleted rows), so not every candidate is guaranteed to
+        exist -- oversample a bit and retry a bounded number of rounds
+        rather than looping until exactly max_rows are found, which
+        could spin indefinitely on a very sparse table.
+
+        Cost is a handful of small queries regardless of table size --
+        the whole point (see get_table's docstring): for a table with
+        millions of rows, this is the difference between touching a few
+        hundred rows total versus materializing every rowid in the
+        table into a Python list just to discard nearly all of them.
+        """
+        chosen: set[int] = set()
+        for _ in range(5):  # bounded retries, not "until enough found"
+            if len(chosen) >= self.max_rows:
+                break
+            n_needed = self.max_rows - len(chosen)
+            candidates = {
+                self._rng.randint(min_rowid, max_rowid) for _ in range(n_needed * 2)
+            } - chosen
+            if not candidates:
+                continue
+            placeholders = ",".join("?" * len(candidates))
+            cur.execute(
+                f'SELECT rowid FROM "{table_name}" WHERE rowid IN ({placeholders})',
+                list(candidates),
+            )
+            chosen.update(r[0] for r in cur.fetchall())
+        return list(chosen)[: self.max_rows]
+
     def get_table(self, db_id: str, table_name: str) -> Table:
         """
         Fetches up to `max_rows` real rows for (db_id, table_name) from
@@ -234,8 +272,10 @@ class SynSQLTableDataset:
         row sampling uses this dataset's own seeded RNG (not SQLite's
         own RANDOM(), which ignores Python's random.seed() -- same fix
         build_bird_jsonl.py::sample_base_rows already applies), via a
-        bounded rowid scan + WHERE rowid IN (...) lookup so this stays
-        cheap even for a huge table.
+        bounded rowid scan + WHERE rowid IN (...) lookup (see
+        _sample_bounded_rowids) so this stays cheap even for a huge
+        table -- NEVER fetches every rowid in the table just to sample
+        from it.
         """
         if not self.has_table(db_id, table_name):
             raise KeyError(f"unknown table: db_id={db_id!r} table_name={table_name!r}")
@@ -243,15 +283,18 @@ class SynSQLTableDataset:
         column_names = self._column_names(db_id, table_name)
         cur = self._connection(db_id).cursor()
 
-        cur.execute(f'SELECT rowid FROM "{table_name}"')
-        all_rowids = [r[0] for r in cur.fetchall()]
+        cur.execute(f'SELECT COUNT(*) FROM "{table_name}"')
+        n_rows = cur.fetchone()[0]
 
-        if not all_rowids:
+        if n_rows == 0:
             chosen: list[int] = []
-        elif len(all_rowids) <= self.max_rows:
-            chosen = all_rowids
+        elif n_rows <= self.max_rows:
+            cur.execute(f'SELECT rowid FROM "{table_name}"')
+            chosen = [r[0] for r in cur.fetchall()]
         else:
-            chosen = self._rng.sample(all_rowids, self.max_rows)
+            cur.execute(f'SELECT MIN(rowid), MAX(rowid) FROM "{table_name}"')
+            min_rowid, max_rowid = cur.fetchone()
+            chosen = self._sample_bounded_rowids(cur, table_name, min_rowid, max_rowid)
 
         rows = _select_columns_by_name(cur, table_name, column_names, chosen)
 
@@ -299,14 +342,28 @@ class SynSQLTableDataset:
         with open(corpus_json_path, "r", encoding="utf-8") as f:
             corpus = json.load(f)
 
+        total = len(corpus["tables"])
+        print(f"[load_corpus] materializing {total} table(s) from {corpus_json_path!r} ...")
+
+        import time
+        t0 = time.time()
+        progress_every = max(1, total // 20)  # ~20 progress lines regardless of corpus size
+
         tables = []
         missing = 0
-        for record in corpus["tables"]:
+        for i, record in enumerate(corpus["tables"]):
             db_id, table_name = record["db_id"], record["table_name"]
             if self.has_table(db_id, table_name):
                 tables.append(self.get_table(db_id, table_name))
             else:
                 missing += 1
+            if (i + 1) % progress_every == 0 or (i + 1) == total:
+                elapsed = time.time() - t0
+                rate = (i + 1) / elapsed if elapsed > 0 else 0.0
+                print(
+                    f"[load_corpus] {i + 1}/{total} tables loaded "
+                    f"({rate:.1f} tables/s, {elapsed:.1f}s elapsed)"
+                )
         if missing:
             print(
                 f"[load_corpus] {missing} table(s) from {corpus_json_path!r} "

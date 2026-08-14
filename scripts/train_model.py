@@ -171,6 +171,20 @@ if __name__ == "__main__":
              "meaning, applied identically across every encoder for a fair "
              "comparison (consistent hyperparameters across models).",
     )
+    parser.add_argument(
+        "--val_sample_size", type=int, default=None,
+        help="subsample the val query split to this many examples for the "
+             "PER-EPOCH early-stopping MAP/MRR check, instead of using every val "
+             "query. evaluate_ranking_metrics ranks every val query against the "
+             "FULL corpus -- with a real split (hundreds of thousands of val "
+             "queries) that's an enormous score matrix recomputed every single "
+             "epoch. A fixed random subsample (same subset every epoch, drawn "
+             "once via --seed) gives a stable, far cheaper per-epoch signal; a "
+             "few thousand queries is already a low-variance MAP estimate. Does "
+             "NOT affect the final test-set evaluation, which always uses the "
+             "full test split exactly once at the end. Omit (default) to use the "
+             "full val split every epoch, as before.",
+    )
 
     # shared optimizer/infra
     parser.add_argument("--weight_decay", type=float)
@@ -335,6 +349,16 @@ if __name__ == "__main__":
             seed=args.seed,
         )
 
+        # Resume from an existing checkpoint if this encoder's pretrain_dir
+        # already has one -- e.g. a previous run of this exact command was
+        # interrupted partway through pretraining. Without this,
+        # restarting train_model.py always retrained from epoch 0 even
+        # though PretrainTrainer.save_checkpoint was writing a checkpoint
+        # every epoch the whole time -- those files just sat there unused.
+        resume_ckpt = latest_checkpoint(pretrain_dir)
+        if resume_ckpt is not None:
+            print(f"found existing pretrain checkpoint, resuming from {resume_ckpt}")
+
         print(f"\n=== [{args.encoder}] stage 1/2: ELECTRA pretraining on {args.device} ===")
         pretrainer.fit(
             pretrain_batches,
@@ -342,6 +366,7 @@ if __name__ == "__main__":
             steps_per_epoch=len(pretrain_batches),
             log_every=args.log_every,
             val_batches=pretrain_val_batches,
+            resume_from=resume_ckpt,
         )
 
         if args.encoder == "ours":
@@ -378,7 +403,25 @@ if __name__ == "__main__":
         )
 
     finetune_steps_per_epoch = len(build_train_batches())
-    val_examples = to_eval_examples(query_dataset, val_indices)
+
+    eval_val_indices = val_indices
+    if args.val_sample_size is not None and args.val_sample_size < len(val_indices):
+        # Fixed once (not resampled per epoch) -- the whole point is a
+        # STABLE per-epoch signal so epoch-to-epoch MAP changes reflect
+        # the model improving, not a different random subset of queries
+        # each time. random.Random(args.seed) here is intentionally a
+        # FRESH generator, not `rng` (which keeps advancing for batch
+        # construction) -- this selection must be reproducible given
+        # just --seed, independent of how many other random draws
+        # happened before it.
+        eval_val_indices = random.Random(args.seed).sample(val_indices, args.val_sample_size)
+        print(
+            f"finetune: subsampled val set for per-epoch checks: "
+            f"{len(eval_val_indices)}/{len(val_indices)} val quer(ies) "
+            f"(--val_sample_size {args.val_sample_size})"
+        )
+
+    val_examples = to_eval_examples(query_dataset, eval_val_indices)
     test_examples = to_eval_examples(query_dataset, test_indices)
     print(
         f"finetune: {finetune_steps_per_epoch} train batches/epoch "
@@ -442,6 +485,7 @@ if __name__ == "__main__":
         "test_map": test_map,
         "n_train": len(train_indices),
         "n_val": len(val_indices),
+        "n_val_used_for_early_stopping": len(eval_val_indices),
         "n_test": len(test_indices),
         "corpus_size": len(corpus_tables),
         "seed": args.seed,
