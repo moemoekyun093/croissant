@@ -39,7 +39,7 @@ Architecture (Sec 3.1-3.2 of the paper):
 """
 from __future__ import annotations
 
-from typing import Optional, Sequence
+from typing import List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -149,7 +149,6 @@ class TabbieTableEncoder(BaseTableEncoder):
     ) -> TableEncoding:
         validate_table(headers, rows)
         n_rows, n_cols = len(rows), len(headers)
-        n_rows_total = n_rows + 1  # +1 for the header row
 
         # row 0 = header cells (their own text, NOT "header : value"); rows 1.. = data cells
         flat_texts = [clean_cell(h) for h in headers]
@@ -157,6 +156,72 @@ class TabbieTableEncoder(BaseTableEncoder):
             flat_texts += [clean_cell(rows[i][j]) for j in range(n_cols)]
 
         cls = self._encode_cells_isolated(flat_texts)  # [(1+n_rows)*n_cols, D]
+        return self._forward_from_cls(cls, n_rows, n_cols)
+
+    def forward_batch(
+        self,
+        tables: Sequence[Tuple[Sequence[str], Sequence[Sequence[object]], Optional[str]]],
+    ) -> List[TableEncoding]:
+        """Batched version of forward(): runs ONE frozen-BERT cell-encoder
+        pass for MULTIPLE tables' cells/headers combined, instead of one
+        pass per table -- same fix, same rationale as bert_baseline.py's
+        forward_batch (see its docstring for the full "why ours was
+        faster" explanation). See adapter.py's forward_batch_cellwise for
+        how this gets picked up automatically (hasattr check).
+
+        Unlike bert_baseline.py/tapas_encoder.py, this doesn't need any
+        new padding/stacking logic: _encode_cells_isolated already
+        accepts an arbitrary flat list of texts and batches internally
+        (with its own cross-string cache) -- the only change is
+        concatenating every table's flat_texts together BEFORE calling
+        it once, instead of calling it once per table the way forward()
+        (looped by the adapter) used to. The row/column transformer
+        stack below (self.row_layers/col_layers) is small and already
+        cheap relative to the frozen BERT cell encoder, so it stays a
+        per-table loop -- this only batches the expensive part.
+
+        tables: list of (headers, rows, caption) tuples, one per table
+                (caption unused -- TABBIE has no caption handling on the
+                current adapter call path, same as forward()'s own
+                caption parameter).
+        returns: list of TableEncoding, one per table, SAME ORDER as the
+                 input list.
+        """
+        if not tables:
+            return []
+
+        per_table_offsets: List[Tuple[int, int]] = []
+        per_table_shape: List[Tuple[int, int]] = []
+        all_texts: List[str] = []
+
+        offset = 0
+        for headers, rows, _caption in tables:
+            validate_table(headers, rows)
+            n_rows, n_cols = len(rows), len(headers)
+            flat_texts = [clean_cell(h) for h in headers]
+            for i in range(n_rows):
+                flat_texts += [clean_cell(rows[i][j]) for j in range(n_cols)]
+            all_texts.extend(flat_texts)
+            per_table_offsets.append((offset, offset + len(flat_texts)))
+            per_table_shape.append((n_rows, n_cols))
+            offset += len(flat_texts)
+
+        all_cls = self._encode_cells_isolated(all_texts)  # [total_cells_across_all_tables, D]
+
+        results: List[TableEncoding] = []
+        for (start, end), (n_rows, n_cols) in zip(per_table_offsets, per_table_shape):
+            cls = all_cls[start:end]
+            results.append(self._forward_from_cls(cls, n_rows, n_cols))
+        return results
+
+    def _forward_from_cls(self, cls: torch.Tensor, n_rows: int, n_cols: int) -> TableEncoding:
+        """Everything AFTER cell/header encoding: row/col positional
+        embeddings + the row/column transformer stack. Shared by
+        forward() (cls from a single table's own _encode_cells_isolated
+        call) and forward_batch() (cls sliced out of a combined
+        multi-table call) -- identical computation either way, this
+        stack only ever sees one table's own cls vectors at a time."""
+        n_rows_total = n_rows + 1  # +1 for the header row
         x = cls.view(n_rows_total, n_cols, self.hidden_size)
 
         row_ids = torch.arange(min(n_rows_total, self.row_pos_embed.num_embeddings), device=self.device)

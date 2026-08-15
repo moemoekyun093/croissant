@@ -117,30 +117,72 @@ class BaselineCellwiseAdapter(nn.Module):
 
         device = next(self.parameters()).device
 
-        per_table_cell = []  # each [n_cols_i, n_rows_i, embed_dim]
+        per_table_cell: list = [None] * len(tables)  # each [n_cols_i, n_rows_i, embed_dim]
 
-        for table in tables:
+        cache_hit_indices = []
+        cache_miss_indices = []
+        for i, table in enumerate(tables):
             if self.cacheable and table.table_id in self._table_cache:
-                # Cache hit: skip tokenization + backbone forward +
-                # cell-pooling entirely -- see cacheable's docstring.
-                # Cached in raw (pre-projection) form on CPU, same
-                # convention as TextEmbedder's cache, so self.projection
-                # (trainable, though typically Identity for bert/tapas
-                # when embed_dim matches native_dim) is still re-applied
-                # fresh every call.
-                raw_cell = self._table_cache[table.table_id].to(device)
+                cache_hit_indices.append(i)
             else:
-                headers, rows = self._table_to_headers_rows(table)
-                encoding = self.baseline_encoder(headers, rows)
-                # encoding.cell_embeddings: [n_rows, n_cols, native_dim]
-                # (row-major, per common.py) -> [n_cols, n_rows, native_dim]
-                # (column-major, our convention)
-                raw_cell = encoding.cell_embeddings.transpose(0, 1)
-                if self.cacheable:
-                    self._table_cache[table.table_id] = raw_cell.detach().cpu()
+                cache_miss_indices.append(i)
 
-            cell = self.projection(raw_cell)
-            per_table_cell.append(cell)
+        # Cache hits: skip tokenization + backbone forward + cell-pooling
+        # entirely -- see cacheable's docstring. Cached in raw
+        # (pre-projection) form on CPU, same convention as TextEmbedder's
+        # cache, so self.projection (trainable, though typically Identity
+        # for bert/tapas when embed_dim matches native_dim) is still
+        # re-applied fresh every call.
+        for i in cache_hit_indices:
+            raw_cell = self._table_cache[tables[i].table_id].to(device)
+            per_table_cell[i] = self.projection(raw_cell)
+
+        # Cache misses: use the baseline's forward_batch (ONE backbone
+        # forward pass for every miss table at once) when it exposes one
+        # -- currently bert_baseline.py, tapas_encoder.py, tabbie.py, and
+        # strubert.py, see their forward_batch docstrings for the full
+        # "why this matters" rationale (this used to call
+        # self.baseline_encoder(headers, rows) once PER TABLE here, i.e.
+        # one batch-of-1 (or, for strubert, batch-of-1 TWICE) backbone
+        # forward pass per table -- the single biggest reason those
+        # baselines were slower than 'ours', which always batches every
+        # cell across the whole table batch into one call). turl.py and
+        # hytrel.py deliberately do NOT implement forward_batch: their
+        # expensive part isn't a frozen-backbone forward call at all
+        # (self.token_embed is a cheap nn.Embedding lookup for both) --
+        # it's their OWN trainable per-table architecture (turl's
+        # visibility-masked attention stack, sized by that table's own
+        # n_rows*n_cols visibility matrix; hytrel's hypergraph message
+        # passing, sized by that table's own row/column/table hyperedges)
+        # that's inherently table-shape-dependent, not something a
+        # "concatenate + one combined call + slice back out" fix like the
+        # other four applies to without a much larger restructuring
+        # (padding every table's structure to a shared max shape and
+        # batching the whole trainable stack itself). They fall back to
+        # the original per-table forward() loop, unchanged.
+        if cache_miss_indices:
+            if hasattr(self.baseline_encoder, "forward_batch"):
+                batch_inputs = [
+                    (*self._table_to_headers_rows(tables[i]), None) for i in cache_miss_indices
+                ]
+                encodings = self.baseline_encoder.forward_batch(batch_inputs)
+                for miss_pos, i in enumerate(cache_miss_indices):
+                    encoding = encodings[miss_pos]
+                    raw_cell = encoding.cell_embeddings.transpose(0, 1)
+                    if self.cacheable:
+                        self._table_cache[tables[i].table_id] = raw_cell.detach().cpu()
+                    per_table_cell[i] = self.projection(raw_cell)
+            else:
+                for i in cache_miss_indices:
+                    headers, rows = self._table_to_headers_rows(tables[i])
+                    encoding = self.baseline_encoder(headers, rows)
+                    # encoding.cell_embeddings: [n_rows, n_cols, native_dim]
+                    # (row-major, per common.py) -> [n_cols, n_rows, native_dim]
+                    # (column-major, our convention)
+                    raw_cell = encoding.cell_embeddings.transpose(0, 1)
+                    if self.cacheable:
+                        self._table_cache[tables[i].table_id] = raw_cell.detach().cpu()
+                    per_table_cell[i] = self.projection(raw_cell)
 
         B = len(tables)
         max_n = max((c.shape[0] for c in per_table_cell), default=1)

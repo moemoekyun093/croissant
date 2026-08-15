@@ -137,34 +137,32 @@ class BertTableEncoder(BaseTableEncoder):
             input_ids.append(self.tokenizer.sep_token_id)
         return input_ids, cell_spans
 
-    def forward(
+    def _pool_cells(
         self,
-        headers: Sequence[str],
-        rows: Sequence[Sequence[object]],
-        caption: Optional[str] = None,
-    ) -> TableEncoding:
-        validate_table(headers, rows)
-        n_rows, n_cols = len(rows), len(headers)
+        hidden: torch.Tensor,
+        cell_spans: List[List[Tuple[int, int]]],
+        n_rows: int,
+        n_cols: int,
+    ) -> torch.Tensor:
+        """Vectorized mean-pool over every cell's token span at once via a
+        prefix-sum trick, instead of calling mean_pool_span (one small
+        GPU op each) in a Python double loop -- with up to 1,000 cells
+        per table and up to ~192 tables/step (batch_size=64 plus
+        n_hard_negatives=2), that loop was up to ~192,000 individual
+        tiny GPU calls per training step, each paying its own
+        kernel-launch overhead. csum[b] = sum of hidden[0:b], so a
+        span's sum is csum[end] - csum[start] for every cell in one
+        shot; truncated/empty spans (end <= start) fall back to cls,
+        same as the original per-cell logic.
 
-        input_ids, cell_spans = self._build_sequence(headers, rows, caption)
-        ids_t = torch.tensor([input_ids], device=self.device)
-        attn_mask = torch.ones_like(ids_t)
-
-        with torch.no_grad():
-            out = self.backbone(input_ids=ids_t, attention_mask=attn_mask)
-        hidden = out.last_hidden_state[0]  # [seq_len, dim]
+        Shared by forward() (single table, hidden = that table's own
+        [seq_len, dim]) and forward_batch() (hidden = one table's own
+        SLICE out of a batched [B, maxlen, dim] backbone output, real
+        tokens only -- see forward_batch's docstring).
+        """
+        hidden = hidden.to(hidden.dtype)
         cls = hidden[0]
 
-        # Vectorized mean-pool over every cell's token span at once via a
-        # prefix-sum trick, instead of calling mean_pool_span (one small
-        # GPU op each) in a Python double loop -- with up to 1,000 cells
-        # per table and up to ~192 tables/step (batch_size=64 plus
-        # n_hard_negatives=2), that loop was up to ~192,000 individual
-        # tiny GPU calls per training step, each paying its own
-        # kernel-launch overhead. csum[b] = sum of hidden[0:b], so a
-        # span's sum is csum[end] - csum[start] for every cell in one
-        # shot; truncated/empty spans (end <= start) fall back to cls,
-        # same as the original per-cell logic.
         zero_row = torch.zeros(1, self.hidden_size, device=self.device, dtype=hidden.dtype)
         csum = torch.cat([zero_row, hidden.cumsum(dim=0)], dim=0)  # [seq_len+1, dim]
 
@@ -182,10 +180,154 @@ class BertTableEncoder(BaseTableEncoder):
 
         empty_mask = (ends <= starts).unsqueeze(-1)  # [n_rows, n_cols, 1]
         cls_broadcast = cls.view(1, 1, -1).expand(n_rows, n_cols, -1)
-        cell_emb = torch.where(empty_mask, cls_broadcast, means)
+        return torch.where(empty_mask, cls_broadcast, means)
 
+    def forward(
+        self,
+        headers: Sequence[str],
+        rows: Sequence[Sequence[object]],
+        caption: Optional[str] = None,
+    ) -> TableEncoding:
+        validate_table(headers, rows)
+        n_rows, n_cols = len(rows), len(headers)
+
+        input_ids, cell_spans = self._build_sequence(headers, rows, caption)
+        ids_t = torch.tensor([input_ids], device=self.device)
+        attn_mask = torch.ones_like(ids_t)
+
+        with torch.no_grad():
+            out = self.backbone(input_ids=ids_t, attention_mask=attn_mask)
+        hidden = out.last_hidden_state[0]  # [seq_len, dim]
+
+        cell_emb = self._pool_cells(hidden, cell_spans, n_rows, n_cols)
         row_emb = cell_emb.mean(dim=1)
         col_emb = cell_emb.mean(dim=0)
-        table_emb = cls
+        table_emb = hidden[0]
 
         return TableEncoding(cell_emb, row_emb, col_emb, table_emb)
+
+    def forward_batch(
+        self,
+        tables: List[Tuple[Sequence[str], Sequence[Sequence[object]], Optional[str]]],
+    ) -> List[TableEncoding]:
+        """Batched version of forward(): encodes MULTIPLE tables in ONE
+        BertModel forward pass instead of one pass per table.
+
+        This is the real reason 'ours' (src/encoding/cell_encoder.py)
+        was faster than this baseline even after every earlier
+        vectorization/caching fix this session: CellEncoder always
+        batches every cell across the WHOLE batch of tables into a
+        single BERT call. This baseline's adapter
+        (BaselineCellwiseAdapter.forward_batch_cellwise) used to call
+        forward() once PER TABLE -- e.g. 192 separate batch-of-1
+        BertModel forward passes for a 192-table training step, instead
+        of one batch-of-192 pass. GPUs run one large batched matmul far
+        more efficiently than many tiny sequential ones (each paying its
+        own kernel-launch overhead, leaving most of the GPU idle).
+        BaselineCellwiseAdapter checks for this method (hasattr) and
+        uses it instead of looping forward() calls when present -- see
+        adapter.py's forward_batch_cellwise.
+
+        tables: list of (headers, rows, caption) tuples, one per table
+                (caption is always None on the current adapter call
+                path, same as forward()'s default -- kept as a real
+                parameter here for API parity with forward() regardless).
+        returns: list of TableEncoding, one per table, SAME ORDER as
+                 the input list.
+        """
+        if not tables:
+            return []
+
+        per_table_ids: List[List[int]] = []
+        per_table_spans: List[List[List[Tuple[int, int]]]] = []
+        per_table_shape: List[Tuple[int, int]] = []
+
+        for headers, rows, caption in tables:
+            validate_table(headers, rows)
+            input_ids, cell_spans = self._build_sequence(headers, rows, caption)
+            per_table_ids.append(input_ids)
+            per_table_spans.append(cell_spans)
+            per_table_shape.append((len(rows), len(headers)))
+
+        B = len(tables)
+        maxlen = max(len(ids) for ids in per_table_ids)
+        pad_id = self.tokenizer.pad_token_id
+        if pad_id is None:  # some tokenizers have no pad token configured; 0 is BERT's own [PAD] id
+            pad_id = 0
+
+        ids_t = torch.full((B, maxlen), pad_id, dtype=torch.long, device=self.device)
+        attn_mask = torch.zeros((B, maxlen), dtype=torch.long, device=self.device)
+        for i, ids in enumerate(per_table_ids):
+            ids_t[i, : len(ids)] = torch.tensor(ids, device=self.device)
+            attn_mask[i, : len(ids)] = 1
+
+        # Defensive checks BEFORE the backbone call. An out-of-range
+        # token id, or a sequence longer than this backbone's
+        # max_position_embeddings, would otherwise surface as an opaque
+        # CUDA "index out of bounds" device-side assert deep inside an
+        # embedding lookup -- and CRITICALLY, get reported ASYNCHRONOUSLY
+        # at some unrelated LATER call (observed in practice: the crash
+        # this was added for showed up several lines later, inside
+        # trainer.py's _corpus_scores, at an unrelated .to(device) sync
+        # point, with a traceback pointing at the wrong line entirely).
+        # Catching it here, on values we just built ourselves, gives an
+        # immediate, correctly-attributed Python error instead of an
+        # unattributable device-side assert. Both checks are vectorized
+        # (two whole-tensor comparisons) -- only the list comprehension
+        # building the error message itself is a Python loop, and that
+        # only runs on the failure path.
+        vocab_size = getattr(self.backbone.config, "vocab_size", None)
+        if vocab_size is not None and bool((ids_t.ge(vocab_size) | ids_t.lt(0)).any()):
+            bad = [
+                (i, tid)
+                for i, ids in enumerate(per_table_ids)
+                for tid in ids
+                if tid < 0 or tid >= vocab_size
+            ]
+            raise ValueError(
+                f"forward_batch: token id(s) outside this backbone's vocab_size "
+                f"({vocab_size}) -- would have crashed as an unattributed CUDA "
+                f"device-side assert inside the embedding lookup instead. "
+                f"offending (table_index_in_this_call, token_id): {bad[:5]}"
+            )
+
+        max_pos = getattr(self.backbone.config, "max_position_embeddings", None)
+        if max_pos is not None and maxlen > max_pos:
+            offending = [(i, len(ids)) for i, ids in enumerate(per_table_ids) if len(ids) > max_pos]
+            raise ValueError(
+                f"forward_batch: batch's max sequence length ({maxlen}) exceeds "
+                f"this backbone's max_position_embeddings ({max_pos}) -- "
+                f"self.max_length={self.max_length} should prevent this via "
+                f"_build_sequence's truncation, so either self.max_length is "
+                f"configured above max_pos, or there's an edge case letting a "
+                f"sequence through un-truncated. offending "
+                f"(table_index_in_this_call, seq_len): {offending[:5]}"
+            )
+
+        with torch.no_grad():
+            out = self.backbone(input_ids=ids_t, attention_mask=attn_mask)
+        hidden_batch = out.last_hidden_state  # [B, maxlen, dim]
+
+        # Per-table pooling loop below is O(B) (tens to low hundreds of
+        # tables), not O(cells) -- the expensive part (the BertModel
+        # call itself) already happened once, batched, above. Each
+        # table's own real (non-padding) token span is sliced out before
+        # pooling so padding positions never contribute to its cell
+        # embeddings, even though they were attention-masked out of the
+        # backbone call already too (belt and suspenders -- padding
+        # tokens' hidden states are typically near-zero/meaningless
+        # under a correct attention mask, but never actually indexed
+        # into cell_spans regardless, since every span was built from
+        # that table's own un-padded input_ids length).
+        results: List[TableEncoding] = []
+        for i in range(B):
+            seq_len = len(per_table_ids[i])
+            hidden = hidden_batch[i, :seq_len]  # [seq_len_i, dim] -- real tokens only
+            n_rows, n_cols = per_table_shape[i]
+            cell_emb = self._pool_cells(hidden, per_table_spans[i], n_rows, n_cols)
+            row_emb = cell_emb.mean(dim=1)
+            col_emb = cell_emb.mean(dim=0)
+            table_emb = hidden[0]
+            results.append(TableEncoding(cell_emb, row_emb, col_emb, table_emb))
+
+        return results

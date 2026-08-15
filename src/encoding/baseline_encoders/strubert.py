@@ -40,7 +40,7 @@ faithful, checkpoint-agnostic stand-in for baseline comparison purposes).
 """
 from __future__ import annotations
 
-from typing import List, Optional, Sequence
+from typing import List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -149,13 +149,15 @@ class StruBertTableEncoder(BaseTableEncoder):
         coarse = hidden[:, 0, :]
         return fine, coarse
 
-    def forward(
+    def _build_seqs(
         self,
         headers: Sequence[str],
         rows: Sequence[Sequence[object]],
-        caption: Optional[str] = None,
-    ) -> TableEncoding:
-        validate_table(headers, rows)
+        caption: Optional[str],
+    ) -> Tuple[List[str], List[str]]:
+        """Builds this table's own col_seqs/row_seqs (see forward()'s
+        original comment) -- pure string assembly, no tokenizer/backbone
+        call. Shared by forward() and forward_batch()."""
         n_rows, n_cols = len(rows), len(headers)
         cap = clean_cell(caption) if caption else ""
 
@@ -178,9 +180,21 @@ class StruBertTableEncoder(BaseTableEncoder):
             parts += [_serialize_cell(headers[j], col_types[j], rows[i][j]) for j in range(n_cols)]
             row_seqs.append(f" {self.tokenizer.sep_token} ".join(parts))
 
-        col_fine, col_coarse = self._cellwise_pool_sequence(col_seqs)  # [n_cols, D] each
-        row_fine, row_coarse = self._cellwise_pool_sequence(row_seqs)  # [n_rows, D] each
+        return col_seqs, row_seqs
 
+    def _forward_from_pooled(
+        self,
+        col_fine: torch.Tensor,
+        col_coarse: torch.Tensor,
+        row_fine: torch.Tensor,
+        row_coarse: torch.Tensor,
+    ) -> TableEncoding:
+        """Everything AFTER the (expensive, frozen-BERT) row/column-view
+        pooling: vertical/horizontal self-attention + final fusion. Shared
+        by forward() and forward_batch() -- identical computation either
+        way, this stack only ever sees one table's own pooled vectors at
+        a time (it's small/cheap relative to the frozen backbone, so it
+        stays a per-table call even in forward_batch)."""
         # vertical self-attention over column embeddings C -> refined columns
         col_refined = self.vertical_attn(col_fine.unsqueeze(0)).squeeze(0)  # [n_cols, D]
         # horizontal self-attention over row embeddings R -> refined rows
@@ -197,3 +211,78 @@ class StruBertTableEncoder(BaseTableEncoder):
         table_emb = self.fuse_proj(four_features)
 
         return TableEncoding(cell_emb, row_refined, col_refined, table_emb)
+
+    def forward(
+        self,
+        headers: Sequence[str],
+        rows: Sequence[Sequence[object]],
+        caption: Optional[str] = None,
+    ) -> TableEncoding:
+        validate_table(headers, rows)
+
+        col_seqs, row_seqs = self._build_seqs(headers, rows, caption)
+
+        col_fine, col_coarse = self._cellwise_pool_sequence(col_seqs)  # [n_cols, D] each
+        row_fine, row_coarse = self._cellwise_pool_sequence(row_seqs)  # [n_rows, D] each
+
+        return self._forward_from_pooled(col_fine, col_coarse, row_fine, row_coarse)
+
+    def forward_batch(
+        self,
+        tables: Sequence[Tuple[Sequence[str], Sequence[Sequence[object]], Optional[str]]],
+    ) -> List[TableEncoding]:
+        """Batched version of forward(): runs the frozen BERT backbone
+        TWICE TOTAL (once for every table's column-view sequences
+        combined, once for every table's row-view sequences combined)
+        instead of TWICE PER TABLE -- StruBERT is actually the worst
+        offender of this "batch-of-1 backbone call" class of issue among
+        the baselines, since forward() already called
+        _cellwise_pool_sequence (i.e. self.backbone(**enc)) twice per
+        table on its own. Same fix/rationale as bert_baseline.py's
+        forward_batch (see its docstring) -- see adapter.py's
+        forward_batch_cellwise for how this gets picked up automatically.
+
+        tables: list of (headers, rows, caption) tuples, one per table.
+        returns: list of TableEncoding, one per table, SAME ORDER as the
+                 input list.
+        """
+        if not tables:
+            return []
+
+        all_col_seqs: List[str] = []
+        all_row_seqs: List[str] = []
+        col_offsets: List[Tuple[int, int]] = []
+        row_offsets: List[Tuple[int, int]] = []
+
+        col_off = 0
+        row_off = 0
+        for headers, rows, caption in tables:
+            validate_table(headers, rows)
+            col_seqs, row_seqs = self._build_seqs(headers, rows, caption)
+            all_col_seqs.extend(col_seqs)
+            all_row_seqs.extend(row_seqs)
+            col_offsets.append((col_off, col_off + len(col_seqs)))
+            row_offsets.append((row_off, row_off + len(row_seqs)))
+            col_off += len(col_seqs)
+            row_off += len(row_seqs)
+
+        # ONE backbone call for every table's column-view sequences
+        # combined, ONE for every table's row-view sequences combined --
+        # _cellwise_pool_sequence already batches whatever list it's
+        # given via one tokenizer call + one backbone call, so passing it
+        # ALL tables' sequences at once (instead of one table's worth at
+        # a time, looped) is the entire fix.
+        all_col_fine, all_col_coarse = self._cellwise_pool_sequence(all_col_seqs)
+        all_row_fine, all_row_coarse = self._cellwise_pool_sequence(all_row_seqs)
+
+        results: List[TableEncoding] = []
+        for (c_start, c_end), (r_start, r_end) in zip(col_offsets, row_offsets):
+            results.append(
+                self._forward_from_pooled(
+                    all_col_fine[c_start:c_end],
+                    all_col_coarse[c_start:c_end],
+                    all_row_fine[r_start:r_end],
+                    all_row_coarse[r_start:r_end],
+                )
+            )
+        return results
