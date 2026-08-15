@@ -130,16 +130,42 @@ class HyTrelTableEncoder(BaseTableEncoder):
         """Mean-pool raw (non-contextualized) BERT token embeddings for a
         batch of texts -- mirrors the reference repo's `Embedding.forward`,
         which mean-pools token embeddings directly rather than running a
-        full BERT forward pass, for both node and hyperedge initialization."""
-        ids_list = [
-            self.tokenizer.encode(t, add_special_tokens=False)[: self.cell_max_tokens] or [self.tokenizer.unk_token_id]
-            for t in texts
-        ]
-        maxlen = max(len(x) for x in ids_list)
-        ids_t = torch.full((len(ids_list), maxlen), self.tokenizer.pad_token_id, dtype=torch.long, device=self.device)
-        for k, ids in enumerate(ids_list):
-            ids_t[k, : len(ids)] = torch.tensor(ids, device=self.device)
-        mask = (ids_t != self.tokenizer.pad_token_id).unsqueeze(-1).float()
+        full BERT forward pass, for both node and hyperedge initialization.
+
+        Batch-tokenizes every text in ONE tokenizer call instead of a
+        Python loop with one .encode() call per text -- same bug/fix as
+        bert_baseline.py's _build_sequence, just missed for this file
+        during this session's earlier vectorization audit (that pass only
+        checked GPU-tensor loops, not tokenizer calls). Matters a lot
+        here specifically: called with up to n_rows*n_cols texts at once
+        for node init, plus once for headers and once for the caption,
+        EVERY forward pass -- at real batch scale that was hundreds of
+        thousands of individual Python-level tokenizer calls per training
+        step.
+        """
+        texts = list(texts)
+        encoded = self.tokenizer(
+            texts,
+            add_special_tokens=False,
+            truncation=True,
+            max_length=self.cell_max_tokens,
+            padding=True,
+            return_tensors="pt",
+        )
+        ids_t = encoded["input_ids"].to(self.device)
+        attn = encoded["attention_mask"].to(self.device)  # [N, L], 1 = real token
+
+        # Empty-text fallback -- a text that tokenizes to zero real tokens
+        # (attention_mask row all zero, e.g. an empty/whitespace-only
+        # cell) would otherwise mean-pool to a zero vector. Original
+        # per-text loop used `or [unk_token_id]` for this; same fallback,
+        # applied vectorized here instead of per string.
+        empty_rows = attn.sum(dim=1) == 0
+        if empty_rows.any():
+            ids_t[empty_rows, 0] = self.tokenizer.unk_token_id
+            attn[empty_rows, 0] = 1
+
+        mask = attn.unsqueeze(-1).float()
         embeds = self.token_embed(ids_t)  # [N, L, D]
         return (embeds * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)  # [N, D]
 

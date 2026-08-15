@@ -151,6 +151,23 @@ class BaselineCellwiseAdapter(nn.Module):
         row_mask = torch.zeros(B, max_m, device=device)
         cell_mask = torch.zeros(B, max_n, max_m, device=device)
 
+        # Walking table.columns/col.cells to find which cells are
+        # non-null is an irreducible Python-level loop over raw strings
+        # (same as cell_encoder.py's encode_tables_batched -- see its
+        # docstring) -- but the actual mask WRITE doesn't need to be:
+        # previously this did `cell_mask[b, c_idx, r_idx] = 1.0` inside
+        # the loop itself, i.e. one single-element GPU tensor write per
+        # non-null cell (up to n_rows*n_cols of them, PER TABLE, every
+        # single training/validation step, for every one of the 6
+        # baseline encoders that share this adapter -- not something
+        # specific to any one baseline). Collecting positions in plain
+        # Python lists (cheap) and scattering ONCE via advanced indexing
+        # at the end is the same fix cell_encoder.py already uses for
+        # its own nonnull cell_mask.
+        nonnull_b: list[int] = []
+        nonnull_c: list[int] = []
+        nonnull_r: list[int] = []
+
         for b, (table, cell) in enumerate(zip(tables, per_table_cell)):
             n, m = cell.shape[0], cell.shape[1]
             X[b, :n, :m, :] = cell
@@ -159,7 +176,15 @@ class BaselineCellwiseAdapter(nn.Module):
             for c_idx, col in enumerate(table.columns):
                 for r_idx, val in enumerate(col.cells):
                     if val.strip() != "":
-                        cell_mask[b, c_idx, r_idx] = 1.0
+                        nonnull_b.append(b)
+                        nonnull_c.append(c_idx)
+                        nonnull_r.append(r_idx)
+
+        if nonnull_b:
+            bt = torch.tensor(nonnull_b, device=device)
+            ct = torch.tensor(nonnull_c, device=device)
+            rt = torch.tensor(nonnull_r, device=device)
+            cell_mask[bt, ct, rt] = 1.0
 
         return X, col_mask, row_mask, cell_mask
 

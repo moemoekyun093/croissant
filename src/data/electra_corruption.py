@@ -150,11 +150,32 @@ def pad_labels(
     max_m = max(m_list) if m_list else 1
 
     labels = torch.zeros(B, max_n, max_m, device=device)
+
+    # Walking the ragged label_grids to find which (col, row) positions
+    # are labeled 1 is an irreducible Python-level loop over nested
+    # lists -- but the WRITE doesn't need to be: previously this did
+    # `labels[t_idx, c_idx, r_idx] = 1.0` inside the loop itself, one
+    # single-element GPU tensor write per cell visited (every cell in
+    # every table, called every single pretraining step). Same fix as
+    # adapter.py's cell_mask / cell_encoder.py's nonnull scatter:
+    # collect positions in plain Python lists, scatter ONCE via advanced
+    # indexing at the end.
+    pos_t: list[int] = []
+    pos_c: list[int] = []
+    pos_r: list[int] = []
     for t_idx, grid in enumerate(label_grids):
         for c_idx, col_labels in enumerate(grid):
             for r_idx, label in enumerate(col_labels):
                 if label:
-                    labels[t_idx, c_idx, r_idx] = 1.0
+                    pos_t.append(t_idx)
+                    pos_c.append(c_idx)
+                    pos_r.append(r_idx)
+
+    if pos_t:
+        tt = torch.tensor(pos_t, device=device)
+        ct = torch.tensor(pos_c, device=device)
+        rt = torch.tensor(pos_r, device=device)
+        labels[tt, ct, rt] = 1.0
 
     return labels
 

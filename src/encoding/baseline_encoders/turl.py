@@ -113,19 +113,46 @@ class TurlTableEncoder(BaseTableEncoder):
         cls_span: token span of the [CLS]/caption/header block (globally visible)
         """
         n_rows, n_cols = len(rows), len(headers)
+
+        # Batch-tokenize every text (caption + headers + every cell) in ONE
+        # tokenizer call up front instead of one self._tokenize_cell (i.e.
+        # one Python-level .encode() call) per text -- same bug/fix as
+        # hytrel.py's _mean_pool_texts and bert_baseline.py's
+        # _build_sequence, missed here during this session's earlier
+        # vectorization audit (that pass only checked GPU-tensor loops,
+        # not tokenizer calls). Assembly/truncation logic below is
+        # otherwise unchanged -- this only replaces WHERE each text gets
+        # tokenized, not the sequence-building order.
+        all_texts: List[str] = []
+        if caption:
+            all_texts.append(clean_cell(caption))
+        all_texts.extend(clean_cell(h) for h in headers)
+        for i in range(n_rows):
+            for j in range(n_cols):
+                all_texts.append(clean_cell(rows[i][j]))
+
+        batch_ids = self.tokenizer(all_texts, add_special_tokens=False)["input_ids"] if all_texts else []
+        tok_lists = [
+            ids[: self.cell_max_tokens] if ids else [self.tokenizer.unk_token_id]
+            for ids in batch_ids
+        ]
+        ptr = 0
+
         input_ids: List[int] = [self.tokenizer.cls_token_id]
         token_row = [-1]  # -1 = globally visible (CLS/caption/headers)
         token_col = [-1]
 
         if caption:
-            ids = self._tokenize_cell(clean_cell(caption))
+            ids = tok_lists[ptr]
+            ptr += 1
             input_ids += ids
             token_row += [-1] * len(ids)
             token_col += [-1] * len(ids)
 
         header_spans = []
         for j, h in enumerate(headers):
-            ids = self._tokenize_cell(clean_cell(h))
+            ids = tok_lists[ptr]
+            ptr += 1
             start = len(input_ids)
             input_ids += ids
             token_row += [-1] * len(ids)  # headers are globally visible, but tagged with their column too
@@ -135,7 +162,8 @@ class TurlTableEncoder(BaseTableEncoder):
         cell_spans: List[List[Tuple[int, int]]] = [[(0, 0)] * n_cols for _ in range(n_rows)]
         for i in range(n_rows):
             for j in range(n_cols):
-                ids = self._tokenize_cell(clean_cell(rows[i][j]))
+                ids = tok_lists[ptr]
+                ptr += 1
                 start = len(input_ids)
                 input_ids += ids
                 token_row += [i] * len(ids)
