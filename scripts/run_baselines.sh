@@ -29,14 +29,24 @@ CORPUS_JSON="${CORPUS_JSON:-configs/splits/corpus.json}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-eval/report_runs}"
 LOG_DIR="${LOG_DIR:-eval/report_runs/logs}"
 SEED="${SEED:-42}"
-PRETRAIN_EPOCHS="${PRETRAIN_EPOCHS:-1}"
+PRETRAIN_EPOCHS="${PRETRAIN_EPOCHS:-1}"  # ignored when SKIP_PRETRAIN=true, kept for when you flip it back
 VAL_SAMPLE_SIZE="${VAL_SAMPLE_SIZE:-3000}"
+SKIP_PRETRAIN="${SKIP_PRETRAIN:-true}"  # see train_model.py's --skip_pretrain docstring: finetune-only,
+                                         # treat as a smoke test / fast iteration run, not a result to
+                                         # report as "ELECTRA pretrain + finetune" per the agreed methodology
 
 FREE_GPU="${FREE_GPU:-3}"
 BUSY_GPU="${BUSY_GPU:-2}"
 POLL_SECONDS="${POLL_SECONDS:-60}"
 FREE_THRESHOLD_MIB="${FREE_THRESHOLD_MIB:-2000}"  # under this = "free enough" to start
 CONSECUTIVE_FREE_CHECKS="${CONSECUTIVE_FREE_CHECKS:-3}"  # avoid starting on a single transient dip
+SKIP_BUSY_GPU="${SKIP_BUSY_GPU:-false}"  # true = never touch BUSY_GPU at all -- no polling loop, no
+                                          # risk of racing a manual kill+restart on that GPU (a brief
+                                          # gap between the old process dying and the new one's memory
+                                          # climbing back up could otherwise read as "free" for 3
+                                          # consecutive checks and launch a baseline right into it).
+                                          # Run the BUSY_GPU-queued encoders manually once you're sure
+                                          # that GPU has settled.
 
 # Everything except "ours" -- that model is assumed already running
 # manually. Rerun scripts/run_all_models.sh (or pass --encoder ours to
@@ -48,6 +58,11 @@ mkdir -p "$LOG_DIR"
 TABLES_FLAG=()
 if [ -n "$TABLES_JSON" ]; then
   TABLES_FLAG=(--tables_json "$TABLES_JSON")
+fi
+
+SKIP_PRETRAIN_FLAG=()
+if [ "$SKIP_PRETRAIN" = "true" ]; then
+  SKIP_PRETRAIN_FLAG=(--skip_pretrain)
 fi
 
 run_encoder() {
@@ -66,6 +81,7 @@ run_encoder() {
     --seed "$SEED" \
     --pretrain_epochs "$PRETRAIN_EPOCHS" \
     --val_sample_size "$VAL_SAMPLE_SIZE" \
+    "${SKIP_PRETRAIN_FLAG[@]}" \
     "${TABLES_FLAG[@]}" \
     > "$log_file" 2>&1
   local status=$?
@@ -139,17 +155,27 @@ for i in "${!BASELINES[@]}"; do
 done
 
 echo "GPU ${FREE_GPU} (starts now) queue: ${queue_free[*]}"
-echo "GPU ${BUSY_GPU} (waits until free) queue: ${queue_busy[*]}"
+if [ "$SKIP_BUSY_GPU" = "true" ]; then
+  echo "GPU ${BUSY_GPU} queue SKIPPED (SKIP_BUSY_GPU=true): ${queue_busy[*]} -- run these manually later"
+else
+  echo "GPU ${BUSY_GPU} (waits until free) queue: ${queue_busy[*]}"
+fi
 echo
 
 run_queue "$FREE_GPU" "false" "${queue_free[@]}" &
 pid_free=$!
-run_queue "$BUSY_GPU" "true" "${queue_busy[@]}" &
-pid_busy=$!
+
+pid_busy=""
+if [ "$SKIP_BUSY_GPU" != "true" ]; then
+  run_queue "$BUSY_GPU" "true" "${queue_busy[@]}" &
+  pid_busy=$!
+fi
 
 exit_code=0
 wait $pid_free || exit_code=1
-wait $pid_busy || exit_code=1
+if [ -n "$pid_busy" ]; then
+  wait $pid_busy || exit_code=1
+fi
 
 echo
 echo "=== Summary (best validation MAP / test MAP per encoder) ==="
