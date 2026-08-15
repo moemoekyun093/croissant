@@ -164,7 +164,17 @@ if __name__ == "__main__":
     parser.add_argument("--finetune_epochs", type=int, default=15)
     parser.add_argument("--finetune_lr", type=float)
     parser.add_argument("--temperature", type=float)
-    parser.add_argument("--patience", type=int, default=3)
+    parser.add_argument(
+        "--patience", type=int, default=None,
+        help="stop early after this many epochs without a val MAP "
+             "improvement. Left as None by default so it can auto-scale "
+             "with --train_sample_size -- see scripts/finetune_query_table.py's "
+             "--patience for the full rationale: without chunking, defaults "
+             "to 3 (same as before); with --train_sample_size chunking one "
+             "full pass into many short epochs, defaults to ~20% of the "
+             "resulting epoch count instead (floor 3). Pass an explicit "
+             "value to override either default.",
+    )
     parser.add_argument(
         "--n_hard_negatives", type=int, default=2,
         help="see scripts/finetune_query_table.py's --n_hard_negatives -- same "
@@ -184,6 +194,36 @@ if __name__ == "__main__":
              "NOT affect the final test-set evaluation, which always uses the "
              "full test split exactly once at the end. Omit (default) to use the "
              "full val split every epoch, as before.",
+    )
+    parser.add_argument(
+        "--train_sample_size", type=int, default=None,
+        help="see scripts/finetune_query_table.py's --train_sample_size -- "
+             "chunk size (in queries) for one finetuning epoch. The full "
+             "train split is shuffled once (fixed via --seed) and sliced "
+             "into non-overlapping chunks of this size; each chunk becomes "
+             "one epoch, and --finetune_epochs is auto-overridden to the "
+             "resulting chunk count so the whole run sweeps every train "
+             "query exactly once in total. Omit to keep the old behavior: "
+             "one giant epoch over the entire train split, repeated for "
+             "--finetune_epochs.",
+    )
+    parser.add_argument(
+        "--val_corpus_sample_size", type=int, default=None,
+        help="see scripts/finetune_query_table.py's --val_corpus_sample_size "
+             "-- subsample the fixed corpus to this many tables for the "
+             "PER-EPOCH early-stopping MAP/MRR check only (forced positives "
+             "+ forced same-db hard negatives, see --val_n_hard_negatives, "
+             "+ random fill). Final test-set MAP still scores the full "
+             "corpus. Omit to score the full corpus every epoch, as before.",
+    )
+    parser.add_argument(
+        "--val_n_hard_negatives", type=int, default=2,
+        help="see scripts/finetune_query_table.py's --val_n_hard_negatives "
+             "-- only used together with --val_corpus_sample_size. Per "
+             "unique db_id among the (possibly subsampled) val queries, "
+             "force-include up to this many other same-database tables "
+             "into the per-epoch val corpus subsample, so the cheap check "
+             "isn't dominated by easy, unrelated-db negatives.",
     )
 
     # shared optimizer/infra
@@ -408,15 +448,52 @@ if __name__ == "__main__":
     # ---------------------------------------------------------------
     # stage 2: query-table finetuning (early stopping on val MAP)
     # ---------------------------------------------------------------
+    # Chunk the train split into bounded-size epochs -- see
+    # scripts/finetune_query_table.py's --train_sample_size for the full
+    # rationale (bounding wall-clock time per epoch while still sweeping
+    # every train query exactly once across the whole run).
+    if args.train_sample_size is not None and args.train_sample_size < len(train_indices):
+        n_train_full = len(train_indices)
+        shuffled_train = list(train_indices)
+        random.Random(args.seed).shuffle(shuffled_train)
+        train_chunks = [
+            shuffled_train[i : i + args.train_sample_size]
+            for i in range(0, n_train_full, args.train_sample_size)
+        ]
+        args.finetune_epochs = len(train_chunks)
+        print(
+            f"finetune: chunked {n_train_full} train quer(ies) into "
+            f"{len(train_chunks)} epoch(s) of up to {args.train_sample_size} "
+            f"quer(ies) each (exactly 1 pass over the full train set) -- "
+            f"overriding --finetune_epochs to {args.finetune_epochs}"
+        )
+    else:
+        train_chunks = [train_indices]
+
+    if args.patience is None:
+        if len(train_chunks) > 1:
+            args.patience = max(3, round(len(train_chunks) * 0.2))
+        else:
+            args.patience = 3
+        print(f"finetune: defaulting --patience to {args.patience} (epochs={len(train_chunks)})")
+
+    # See scripts/finetune_query_table.py's build_train_batches for why
+    # fit() calling this exactly once per epoch, strictly in increasing
+    # epoch order, is what makes a plain advancing counter safe here.
+    _epoch_counter = {"i": 0}
+
     def build_train_batches():
         """Called fresh once per epoch by FinetuneTrainer.fit (see its
-        batch_fn docstring) -- see finetune_query_table.py's
-        build_train_batches for why this can't just be a static list."""
+        batch_fn docstring). Consumes the NEXT chunk in train_chunks --
+        with --train_sample_size unset, train_chunks has just the one
+        full-train-set entry, reused every call, same as before."""
+        idx = min(_epoch_counter["i"], len(train_chunks) - 1)
+        _epoch_counter["i"] += 1
         return list(
             resolve_train_batches(
                 query_dataset,
                 table_dataset,
-                train_indices,
+                train_chunks[idx],
                 args.finetune_batch_size,
                 args.max_columns,
                 rng,
@@ -425,12 +502,11 @@ if __name__ == "__main__":
         )
 
     # Arithmetic count, NOT len(list(build_train_batches())) -- see
-    # count_batches' docstring. At real dataset scale (millions of train
-    # examples), materializing every batch just to count them means
-    # doing millions of extra live SQL hard-negative fetches before
-    # training even starts -- this is what was actually causing a
-    # "stuck" run, not slowness in the training loop itself.
-    finetune_steps_per_epoch = count_batches(len(train_indices), args.finetune_batch_size)
+    # count_batches' docstring. Uses train_chunks[0]'s size as
+    # representative (every chunk is that size except possibly the last
+    # remainder) -- feeds only the LR warmup/decay schedule's total_steps
+    # estimate, not per-epoch correctness.
+    finetune_steps_per_epoch = count_batches(len(train_chunks[0]), args.finetune_batch_size)
 
     eval_val_indices = val_indices
     if args.val_sample_size is not None and args.val_sample_size < len(val_indices):
@@ -451,10 +527,59 @@ if __name__ == "__main__":
 
     val_examples = to_eval_examples(query_dataset, eval_val_indices)
     test_examples = to_eval_examples(query_dataset, test_indices)
+
+    # Cheap per-epoch val corpus -- see scripts/finetune_query_table.py's
+    # --val_corpus_sample_size/--val_n_hard_negatives for the full
+    # rationale (forced positives + forced same-db hard negatives + random
+    # fill; final test-set MAP below still scores the FULL corpus_tables,
+    # unaffected by this).
+    corpus_tables_for_val = corpus_tables
+    if args.val_corpus_sample_size is not None and args.val_corpus_sample_size < len(corpus_tables):
+        positive_ids = {
+            f"{db_id}#sep#{t}" for _q, db_id, table_names in val_examples for t in table_names
+        }
+        forced = [t for t in corpus_tables if t.table_id in positive_ids]
+        forced_ids = {t.table_id for t in forced}
+
+        n_hard = 0
+        if args.val_n_hard_negatives > 0:
+            db_to_tables = {}
+            for t in corpus_tables:
+                db_id_of_t = t.table_id.split("#sep#", 1)[0]
+                db_to_tables.setdefault(db_id_of_t, []).append(t)
+
+            hard_neg_rng = random.Random(args.seed)
+            val_db_ids = {db_id for _q, db_id, _table_names in val_examples}
+            for db_id in val_db_ids:
+                candidates = [t for t in db_to_tables.get(db_id, []) if t.table_id not in forced_ids]
+                if not candidates:
+                    continue
+                hard_neg_rng.shuffle(candidates)
+                for t in candidates[: args.val_n_hard_negatives]:
+                    if t.table_id not in forced_ids:
+                        forced.append(t)
+                        forced_ids.add(t.table_id)
+                        n_hard += 1
+
+        remaining_pool = [t for t in corpus_tables if t.table_id not in forced_ids]
+        n_fill = max(0, args.val_corpus_sample_size - len(forced))
+        filler = random.Random(args.seed).sample(remaining_pool, min(n_fill, len(remaining_pool)))
+        corpus_tables_for_val = forced + filler
+        print(
+            f"finetune: subsampled corpus for per-epoch val checks: "
+            f"{len(corpus_tables_for_val)}/{len(corpus_tables)} table(s) "
+            f"({len(forced) - n_hard} forced-included positive(s) + "
+            f"{n_hard} forced same-db hard negative(s) + {len(filler)} random) "
+            f"(--val_corpus_sample_size {args.val_corpus_sample_size}, "
+            f"--val_n_hard_negatives {args.val_n_hard_negatives})"
+        )
+
     print(
         f"finetune: {finetune_steps_per_epoch} train batches/epoch "
         f"(n_hard_negatives={args.n_hard_negatives}), "
-        f"{len(val_examples)} val example(s), {len(test_examples)} test example(s)"
+        f"{len(val_examples)} val example(s) scored against "
+        f"{len(corpus_tables_for_val)} corpus table(s) per epoch, "
+        f"{len(test_examples)} test example(s)"
     )
 
     query_encoder = QueryEncoder(
@@ -485,7 +610,7 @@ if __name__ == "__main__":
         num_epochs=args.finetune_epochs,
         steps_per_epoch=finetune_steps_per_epoch,
         val_examples=val_examples,
-        corpus_tables=corpus_tables,
+        corpus_tables=corpus_tables_for_val,
         patience=args.patience,
         log_every=args.log_every,
     )

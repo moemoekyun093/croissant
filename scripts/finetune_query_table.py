@@ -235,8 +235,16 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int)
     parser.add_argument("--num_epochs", type=int)
     parser.add_argument(
-        "--patience", type=int, default=3,
-        help="stop early after this many epochs without a val MAP improvement",
+        "--patience", type=int, default=None,
+        help="stop early after this many epochs without a val MAP "
+             "improvement. Left as None by default so it can auto-scale "
+             "with --train_sample_size: without chunking (one epoch = "
+             "the whole train set), defaults to 3, same as before. WITH "
+             "--train_sample_size chunking a full pass into many short "
+             "epochs, 3 epochs of patience is only a few percent of one "
+             "pass -- see the auto-scaling logic below, which sets it to "
+             "~20% of the total (chunked) epoch count instead, floor 3. "
+             "Pass an explicit value to override either default.",
     )
     parser.add_argument(
         "--n_hard_negatives", type=int, default=2,
@@ -246,6 +254,19 @@ if __name__ == "__main__":
              "queries' positive tables. Same-database tables share schema/domain "
              "vocabulary, so they're a harder, more informative negative than a "
              "random other query's positive table. Set to 0 to disable.",
+    )
+    parser.add_argument(
+        "--train_sample_size", type=int, default=None,
+        help="chunk size (in queries) for one training epoch, used to "
+             "bound wall-clock time per epoch. The FULL train split is "
+             "shuffled once (fixed via --seed) and sliced into "
+             "non-overlapping chunks of this size; each chunk becomes one "
+             "epoch, and --num_epochs is AUTO-OVERRIDDEN to the resulting "
+             "number of chunks so the whole run sweeps every train query "
+             "EXACTLY ONCE in total -- not the same subset repeated every "
+             "epoch. Does not touch val/test queries. Omit to keep the "
+             "old behavior: one giant epoch over the entire train split, "
+             "using whatever --num_epochs says.",
     )
     parser.add_argument(
         "--val_sample_size", type=int, default=None,
@@ -258,6 +279,45 @@ if __name__ == "__main__":
              "subset (drawn once via --seed), not resampled per epoch. Does "
              "NOT affect final test-set evaluation. Omit to use the full val "
              "split every epoch, as before.",
+    )
+    parser.add_argument(
+        "--val_corpus_sample_size", type=int, default=None,
+        help="subsample the FIXED corpus to this many tables for the "
+             "PER-EPOCH early-stopping MAP/MRR check ONLY -- scoring the "
+             "full corpus (often 100k+ tables) every epoch is itself "
+             "expensive, on top of whatever --val_sample_size already "
+             "trims on the query side; this trims the table side for that "
+             "same frequent check, which is what actually makes "
+             "validating every short (e.g. --train_sample_size-bounded) "
+             "epoch affordable. Every table that's a valid positive for "
+             "one of the (possibly --val_sample_size-subsampled) val "
+             "queries is force-included first -- a naive uniform sample "
+             "would drop most positives entirely for a corpus this size "
+             "and silently tank MAP to ~0 for reasons that have nothing "
+             "to do with the model -- then filled up to this size with a "
+             "random sample of the rest (fixed once via --seed). The "
+             "FINAL test-set MAP after training still scores the FULL "
+             "corpus, unaffected by this flag. Omit to score the full "
+             "corpus every epoch, as before.",
+    )
+    parser.add_argument(
+        "--val_n_hard_negatives", type=int, default=2,
+        help="only used together with --val_corpus_sample_size: per "
+             "unique db_id among the (possibly subsampled) val queries, "
+             "force-include up to this many OTHER same-database tables "
+             "(excluding gold positives) into the per-epoch val corpus "
+             "subsample, same idea as --n_hard_negatives for training "
+             "batches. Without this, a small random corpus subsample is "
+             "mostly easy negatives from unrelated databases, and MAP "
+             "looks artificially high -- a model can rank the one "
+             "obviously-relevant table above a pile of random ones "
+             "without actually distinguishing it from its true, harder, "
+             "same-schema neighbors. Sampled once per db_id (fixed via "
+             "--seed), not per query, so queries sharing a db_id share "
+             "the same forced hard negatives. Set to 0 to disable (forced "
+             "positives + random fill only, previous behavior). No "
+             "effect when --val_corpus_sample_size is unset (full corpus "
+             "already contains every same-db table).",
     )
     parser.add_argument("--lr", type=float)
     parser.add_argument("--weight_decay", type=float)
@@ -303,20 +363,78 @@ if __name__ == "__main__":
     train_indices, val_indices, test_indices = resolved["train"], resolved["val"], resolved["test"]
     print(f"split: {len(train_indices)} train / {len(val_indices)} val / {len(test_indices)} test")
 
-    print(f"loading fixed corpus from {args.corpus_json} ...")
-    corpus_tables = table_dataset.load_corpus(args.corpus_json)
-    print(f"corpus: {len(corpus_tables)} table(s) -- used unsplit for every val/test ranking")
+    if args.train_sample_size is not None and args.train_sample_size < len(train_indices):
+        # Shuffle the FULL train set once (fixed via --seed, independent
+        # of `rng` which stays reserved for per-epoch in-chunk batch
+        # order / positive-table choice / hard-negative resampling) and
+        # slice it into non-overlapping chunks of --train_sample_size
+        # queries each. Each chunk becomes exactly one epoch below, so
+        # training for num_epochs = number of chunks sweeps every train
+        # query EXACTLY ONCE in total -- not the same subset repeated
+        # every epoch (that would never reach the rest of the train set)
+        # and not one giant epoch over everything (that's what made a
+        # single epoch take hours -- see the 41-min/2900-step log this
+        # was sized from).
+        n_train_full = len(train_indices)
+        shuffled_train = list(train_indices)
+        random.Random(args.seed).shuffle(shuffled_train)
+        train_chunks = [
+            shuffled_train[i : i + args.train_sample_size]
+            for i in range(0, n_train_full, args.train_sample_size)
+        ]
+        args.num_epochs = len(train_chunks)
+        print(
+            f"chunked {n_train_full} train quer(ies) into {len(train_chunks)} "
+            f"epoch(s) of up to {args.train_sample_size} quer(ies) each "
+            f"(exactly 1 pass over the full train set) -- overriding "
+            f"--num_epochs to {args.num_epochs}"
+        )
+    else:
+        # Previous behavior: one epoch = the entire train split, repeated
+        # (reshuffled/resampled fresh each time) for whatever --num_epochs
+        # says.
+        train_chunks = [train_indices]
+
+    if args.patience is None:
+        if len(train_chunks) > 1:
+            # See --patience's help text: 3 epochs of patience made sense
+            # when one epoch was a full pass over the train set, but here
+            # one epoch is only 1/len(train_chunks) of a pass, so 3 would
+            # stop the run after a tiny fraction of the data and on a
+            # noisier signal (cheap, subsampled val corpus/queries).
+            # Scale to ~20% of the chunked epoch count instead, floor 3.
+            args.patience = max(3, round(len(train_chunks) * 0.2))
+        else:
+            args.patience = 3
+        print(f"defaulting --patience to {args.patience} (epochs={len(train_chunks)})")
+
+    # fit() calls batch_fn() exactly once per epoch, strictly in
+    # increasing epoch order (see FinetuneTrainer.fit) -- so a plain
+    # counter that advances on every call correctly hands out
+    # train_chunks[0] on epoch 0, train_chunks[1] on epoch 1, etc. Not
+    # thread-safe, but fit()'s loop is single-threaded/sequential, so
+    # that's not a concern here. (Doesn't correctly resume mid-run via
+    # trainer.fit's resume_from, which this script doesn't currently
+    # expose as a flag anyway -- start_epoch would be nonzero but this
+    # counter always starts at 0; flagging in case resume support is
+    # added here later.)
+    _epoch_counter = {"i": 0}
 
     def build_train_batches():
         """Called fresh once per epoch by FinetuneTrainer.fit (see its
-        batch_fn docstring) -- reshuffles query order, re-picks a
-        positive among multiple valid ones, and re-samples hard
-        negatives every call, using this script's shared `rng`."""
+        batch_fn docstring). Consumes the NEXT chunk in train_chunks (see
+        above) -- with --train_sample_size unset, train_chunks has just
+        the one full-train-set entry, reused every call, same as before.
+        Still uses `rng` for in-chunk batch order / positive-table choice
+        / hard-negative sampling, so each epoch's batches differ even
+        when train_chunks has only one entry."""
+        idx = min(_epoch_counter["i"], len(train_chunks) - 1)
+        _epoch_counter["i"] += 1
         return list(
             resolve_train_batches(
                 query_dataset,
                 table_dataset,
-                train_indices,
+                train_chunks[idx],
                 args.batch_size,
                 args.max_columns,
                 rng,
@@ -328,8 +446,12 @@ if __name__ == "__main__":
     # count_batches' docstring. At real dataset scale (millions of train
     # examples), materializing every batch just to count them means
     # doing millions of extra live SQL hard-negative fetches before
-    # training even starts.
-    steps_per_epoch = count_batches(len(train_indices), args.batch_size)
+    # training even starts. Uses train_chunks[0]'s size as representative
+    # -- every chunk is that size except possibly the last (remainder),
+    # so this is exact for all but the final epoch and only feeds the LR
+    # warmup/decay schedule's total_steps estimate, not per-epoch
+    # correctness.
+    steps_per_epoch = count_batches(len(train_chunks[0]), args.batch_size)
 
     eval_val_indices = val_indices
     if args.val_sample_size is not None and args.val_sample_size < len(val_indices):
@@ -346,9 +468,70 @@ if __name__ == "__main__":
 
     val_examples = to_eval_examples(query_dataset, eval_val_indices)
     test_examples = to_eval_examples(query_dataset, test_indices)
+
+    print(f"loading fixed corpus from {args.corpus_json} ...")
+    corpus_tables = table_dataset.load_corpus(args.corpus_json)
+    print(f"corpus: {len(corpus_tables)} table(s) -- full corpus, used unsplit for final test ranking")
+
+    corpus_tables_for_val = corpus_tables
+    if args.val_corpus_sample_size is not None and args.val_corpus_sample_size < len(corpus_tables):
+        # Force-include every table that's a valid positive for one of
+        # the val_examples above -- see --val_corpus_sample_size's help
+        # text for why a naive uniform sample would wreck MAP.
+        positive_ids = {
+            f"{db_id}#sep#{t}" for _q, db_id, table_names in val_examples for t in table_names
+        }
+        forced = [t for t in corpus_tables if t.table_id in positive_ids]
+        forced_ids = {t.table_id for t in forced}
+
+        # Also force-include same-database hard negatives -- see
+        # --val_n_hard_negatives' help text: without these, a small
+        # random subsample is nearly all easy, unrelated-db negatives,
+        # which inflates val MAP without actually testing whether the
+        # model can tell a table apart from its true, harder, same-schema
+        # siblings. Grouped by db_id (not per query) so queries sharing a
+        # db_id share the same forced negatives instead of each
+        # separately inflating the forced set.
+        n_hard = 0
+        if args.val_n_hard_negatives > 0:
+            db_to_tables: dict[str, list[Table]] = {}
+            for t in corpus_tables:
+                db_id_of_t = t.table_id.split("#sep#", 1)[0]
+                db_to_tables.setdefault(db_id_of_t, []).append(t)
+
+            hard_neg_rng = random.Random(args.seed)
+            val_db_ids = {db_id for _q, db_id, _table_names in val_examples}
+            for db_id in val_db_ids:
+                candidates = [t for t in db_to_tables.get(db_id, []) if t.table_id not in forced_ids]
+                if not candidates:
+                    continue
+                hard_neg_rng.shuffle(candidates)
+                chosen = candidates[: args.val_n_hard_negatives]
+                for t in chosen:
+                    if t.table_id not in forced_ids:
+                        forced.append(t)
+                        forced_ids.add(t.table_id)
+                        n_hard += 1
+
+        # Filled up to val_corpus_sample_size with a random sample of
+        # whatever's left, fixed once via --seed (independent of `rng`).
+        remaining_pool = [t for t in corpus_tables if t.table_id not in forced_ids]
+        n_fill = max(0, args.val_corpus_sample_size - len(forced))
+        filler = random.Random(args.seed).sample(remaining_pool, min(n_fill, len(remaining_pool)))
+        corpus_tables_for_val = forced + filler
+        print(
+            f"subsampled corpus for per-epoch val checks: "
+            f"{len(corpus_tables_for_val)}/{len(corpus_tables)} table(s) "
+            f"({len(forced) - n_hard} forced-included positive(s) + "
+            f"{n_hard} forced same-db hard negative(s) + {len(filler)} random) "
+            f"(--val_corpus_sample_size {args.val_corpus_sample_size}, "
+            f"--val_n_hard_negatives {args.val_n_hard_negatives})"
+        )
+
     print(
         f"{steps_per_epoch} train batches/epoch (n_hard_negatives={args.n_hard_negatives}), "
-        f"{len(val_examples)} val example(s), {len(test_examples)} test example(s)"
+        f"{len(val_examples)} val example(s) scored against {len(corpus_tables_for_val)} corpus table(s) "
+        f"per epoch, {len(test_examples)} test example(s)"
     )
 
     cell_encoder = CellEncoder(
@@ -403,7 +586,7 @@ if __name__ == "__main__":
         num_epochs=args.num_epochs,
         steps_per_epoch=steps_per_epoch,
         val_examples=val_examples,
-        corpus_tables=corpus_tables,
+        corpus_tables=corpus_tables_for_val,
         patience=args.patience,
         log_every=args.log_every,
     )
