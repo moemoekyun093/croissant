@@ -35,7 +35,12 @@ from src.encoding.baseline_encoders.common import BaseTableEncoder
 
 
 class BaselineCellwiseAdapter(nn.Module):
-    def __init__(self, baseline_encoder: BaseTableEncoder, embed_dim: int | None = None):
+    def __init__(
+        self,
+        baseline_encoder: BaseTableEncoder,
+        embed_dim: int | None = None,
+        cacheable: bool = False,
+    ):
         """
         baseline_encoder: any BaseTableEncoder subclass instance
                           (already constructed) -- this adapter doesn't
@@ -46,11 +51,31 @@ class BaselineCellwiseAdapter(nn.Module):
                           width. If None, uses the baseline's native
                           dimension unprojected (no cross-model
                           dimension consistency in that case).
+        cacheable:        True ONLY for baselines with zero trainable
+                          parameters of their own (bert/tapas -- the
+                          frozen backbone IS the whole model for those
+                          two, see build_baseline_model's docstring).
+                          When True, baseline_encoder(headers, rows)'s
+                          raw output is cached per table_id -- since
+                          nothing in that computation ever changes
+                          during training, a table seen again (extremely
+                          common: hard negatives get reused across many
+                          queries in the same db, and every table is
+                          re-seen every epoch) skips tokenization AND
+                          the backbone forward AND cell-pooling entirely,
+                          just a dict lookup. Do NOT set this for
+                          baselines with their own trainable stack
+                          (tabbie/strubert/turl/hytrel) -- their output
+                          changes every step as those layers train, so
+                          caching it would silently serve stale,
+                          increasingly-wrong embeddings.
         """
         super().__init__()
         self.baseline_encoder = baseline_encoder
         native_dim = self._infer_native_dim(baseline_encoder)
         self.embed_dim = embed_dim if embed_dim is not None else native_dim
+        self.cacheable = cacheable
+        self._table_cache: dict[str, torch.Tensor] = {}  # table_id -> raw [n_cols, n_rows, native_dim], CPU
 
         self.projection = (
             nn.Linear(native_dim, self.embed_dim) if self.embed_dim != native_dim else nn.Identity()
@@ -95,13 +120,26 @@ class BaselineCellwiseAdapter(nn.Module):
         per_table_cell = []  # each [n_cols_i, n_rows_i, embed_dim]
 
         for table in tables:
-            headers, rows = self._table_to_headers_rows(table)
-            encoding = self.baseline_encoder(headers, rows)
-            # encoding.cell_embeddings: [n_rows, n_cols, native_dim]
-            # (row-major, per common.py) -> [n_cols, n_rows, native_dim]
-            # (column-major, our convention)
-            cell = encoding.cell_embeddings.transpose(0, 1)
-            cell = self.projection(cell)
+            if self.cacheable and table.table_id in self._table_cache:
+                # Cache hit: skip tokenization + backbone forward +
+                # cell-pooling entirely -- see cacheable's docstring.
+                # Cached in raw (pre-projection) form on CPU, same
+                # convention as TextEmbedder's cache, so self.projection
+                # (trainable, though typically Identity for bert/tapas
+                # when embed_dim matches native_dim) is still re-applied
+                # fresh every call.
+                raw_cell = self._table_cache[table.table_id].to(device)
+            else:
+                headers, rows = self._table_to_headers_rows(table)
+                encoding = self.baseline_encoder(headers, rows)
+                # encoding.cell_embeddings: [n_rows, n_cols, native_dim]
+                # (row-major, per common.py) -> [n_cols, n_rows, native_dim]
+                # (column-major, our convention)
+                raw_cell = encoding.cell_embeddings.transpose(0, 1)
+                if self.cacheable:
+                    self._table_cache[table.table_id] = raw_cell.detach().cpu()
+
+            cell = self.projection(raw_cell)
             per_table_cell.append(cell)
 
         B = len(tables)
@@ -150,6 +188,17 @@ _NUM_LAYERS_KWARG = {
     "hytrel": "num_layers",
     # "bert" and "tapas" deliberately absent -- see comment above.
 }
+
+# Same "bert/tapas have no on-top trainable stack" fact from above also
+# means their entire per-table output is deterministic given the same
+# input -- see BaselineCellwiseAdapter's cacheable docstring. Every other
+# baseline has its own trainable layers whose output changes every
+# training step, so caching their full per-table output would be wrong
+# (silently stale). Kept as a separate set from _NUM_LAYERS_KWARG's
+# absence rather than reusing that as a proxy, in case a future baseline
+# ever has an on-top stack that's ALSO frozen (deliberately not the same
+# condition, even though they happen to coincide for bert/tapas today).
+_FULLY_FROZEN_ENCODERS = {"bert", "tapas"}
 
 
 def build_baseline_model(
@@ -202,7 +251,11 @@ def build_baseline_model(
             kwargs[layer_kwarg] = num_layers
     baseline_encoder = encoder_cls(**kwargs)
 
-    adapter = BaselineCellwiseAdapter(baseline_encoder, embed_dim=embed_dim)
+    adapter = BaselineCellwiseAdapter(
+        baseline_encoder,
+        embed_dim=embed_dim,
+        cacheable=encoder_name in _FULLY_FROZEN_ENCODERS,
+    )
     if device is not None:
         adapter = adapter.to(device)
     return adapter

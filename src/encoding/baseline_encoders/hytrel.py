@@ -198,12 +198,24 @@ class HyTrelTableEncoder(BaseTableEncoder):
         edge_emb = edge_init
 
         # precompute, for each node, which hyperedges it belongs to (row, col, table)
-        node_edges = [
-            [i, n_rows + j, n_rows + n_cols] for i in range(n_rows) for j in range(n_cols)
-        ]
+        # -- EVERY node has exactly 3 incident edges (its row, its column,
+        # the whole-table edge), a fixed/regular shape unlike V2E's ragged
+        # edge_members -- so this can be one vectorized fancy-index per
+        # layer instead of a Python loop over every node (up to
+        # n_rows*n_cols, same cell-count scale as the per-cell loops fixed
+        # in bert_baseline.py/turl.py/tapas_encoder.py) with no padding
+        # needed at all (key_pad_mask2 is always all-False).
+        node_edges_t = torch.tensor(
+            [[i, n_rows + j, n_rows + n_cols] for i in range(n_rows) for j in range(n_cols)],
+            device=self.device,
+        )  # [n_nodes, 3]
+        no_pad_mask = torch.zeros(node_edges_t.size(0), 3, dtype=torch.bool, device=self.device)
 
         for layer in range(self.num_layers):
             # ---- V2E: each hyperedge attention-pools over its member nodes ----
+            # (genuinely ragged sizes -- row/col/table edges have different
+            # member counts -- so padding is unavoidable here; this loop is
+            # only O(n_edges) ~= n_rows+n_cols+1, not O(n_rows*n_cols))
             member_vecs = [node_emb[idx] for idx in edge_members]  # list of [S_i, D]
             padded_members, key_pad_mask = self._pad_stack(member_vecs)
             seeds = edge_emb.unsqueeze(1)  # [n_edges, 1, D]
@@ -212,10 +224,9 @@ class HyTrelTableEncoder(BaseTableEncoder):
             edge_emb = F.dropout(edge_emb, p=0.1, training=self.training)
 
             # ---- E2V: each node attention-pools over its incident hyperedges ----
-            incident_vecs = [edge_emb[idx] for idx in node_edges]  # list of [3, D]
-            padded_incident, key_pad_mask2 = self._pad_stack(incident_vecs)
+            padded_incident = edge_emb[node_edges_t]  # [n_nodes, 3, D] -- one vectorized indexing op
             seeds2 = node_emb.unsqueeze(1)  # [n_nodes, 1, D]
-            node_emb = F.relu(self.e2v[layer](seeds2, padded_incident, key_pad_mask2))
+            node_emb = F.relu(self.e2v[layer](seeds2, padded_incident, no_pad_mask))
             node_emb = F.dropout(node_emb, p=0.1, training=self.training)
 
         cell_emb = node_emb.view(n_rows, n_cols, self.hidden_size)

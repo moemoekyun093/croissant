@@ -36,7 +36,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoModel, AutoTokenizer
 
-from .common import BaseTableEncoder, TableEncoding, mean_pool_span, clean_cell, validate_table
+from .common import BaseTableEncoder, TableEncoding, clean_cell, validate_table
 
 
 class _MaskedEncoderLayer(nn.Module):
@@ -175,11 +175,25 @@ class TurlTableEncoder(BaseTableEncoder):
             x = layer(x, attn_bias)
         hidden = x.squeeze(0)  # [seq, D]
 
-        cell_emb = torch.zeros(n_rows, n_cols, self.hidden_size, device=self.device)
-        for i in range(n_rows):
-            for j in range(n_cols):
-                start, end = cell_spans[i][j]
-                cell_emb[i, j] = mean_pool_span(hidden, start, end)
+        # Vectorized mean-pool over every cell's token span at once via a
+        # prefix-sum trick, instead of one mean_pool_span (small GPU op)
+        # call per cell in a Python double loop -- same fix as
+        # bert_baseline.py, see that file's comment for the full
+        # rationale. Every cell span here is guaranteed non-empty
+        # (_tokenize_cell always returns at least [unk_token_id]), so no
+        # empty-span fallback branch is needed, unlike bert_baseline.py.
+        zero_row = torch.zeros(1, self.hidden_size, device=self.device, dtype=hidden.dtype)
+        csum = torch.cat([zero_row, hidden.cumsum(dim=0)], dim=0)  # [seq_len+1, dim]
+        starts = torch.tensor(
+            [[cell_spans[i][j][0] for j in range(n_cols)] for i in range(n_rows)],
+            device=self.device,
+        )
+        ends = torch.tensor(
+            [[cell_spans[i][j][1] for j in range(n_cols)] for i in range(n_rows)],
+            device=self.device,
+        )
+        lengths = (ends - starts).clamp(min=1).unsqueeze(-1).to(hidden.dtype)
+        cell_emb = (csum[ends] - csum[starts]) / lengths
 
         row_emb = cell_emb.mean(dim=1)
         col_emb = cell_emb.mean(dim=0)

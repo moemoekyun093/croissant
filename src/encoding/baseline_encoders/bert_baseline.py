@@ -26,7 +26,7 @@ from typing import List, Optional, Sequence, Tuple
 import torch
 from transformers import AutoModel, AutoTokenizer
 
-from .common import BaseTableEncoder, TableEncoding, clean_cell, mean_pool_span, validate_table
+from .common import BaseTableEncoder, TableEncoding, clean_cell, validate_table
 
 
 def _serialize_cell(header: str, value: object) -> str:
@@ -155,11 +155,34 @@ class BertTableEncoder(BaseTableEncoder):
         hidden = out.last_hidden_state[0]  # [seq_len, dim]
         cls = hidden[0]
 
-        cell_emb = torch.zeros(n_rows, n_cols, self.hidden_size, device=self.device)
-        for i in range(n_rows):
-            for j in range(n_cols):
-                start, end = cell_spans[i][j]
-                cell_emb[i, j] = mean_pool_span(hidden, start, end) if end > start else cls
+        # Vectorized mean-pool over every cell's token span at once via a
+        # prefix-sum trick, instead of calling mean_pool_span (one small
+        # GPU op each) in a Python double loop -- with up to 1,000 cells
+        # per table and up to ~192 tables/step (batch_size=64 plus
+        # n_hard_negatives=2), that loop was up to ~192,000 individual
+        # tiny GPU calls per training step, each paying its own
+        # kernel-launch overhead. csum[b] = sum of hidden[0:b], so a
+        # span's sum is csum[end] - csum[start] for every cell in one
+        # shot; truncated/empty spans (end <= start) fall back to cls,
+        # same as the original per-cell logic.
+        zero_row = torch.zeros(1, self.hidden_size, device=self.device, dtype=hidden.dtype)
+        csum = torch.cat([zero_row, hidden.cumsum(dim=0)], dim=0)  # [seq_len+1, dim]
+
+        starts = torch.tensor(
+            [[cell_spans[i][j][0] for j in range(n_cols)] for i in range(n_rows)],
+            device=self.device,
+        )
+        ends = torch.tensor(
+            [[cell_spans[i][j][1] for j in range(n_cols)] for i in range(n_rows)],
+            device=self.device,
+        )
+        lengths = (ends - starts).clamp(min=1).unsqueeze(-1).to(hidden.dtype)  # [n_rows, n_cols, 1]
+        span_sums = csum[ends] - csum[starts]  # [n_rows, n_cols, dim]
+        means = span_sums / lengths
+
+        empty_mask = (ends <= starts).unsqueeze(-1)  # [n_rows, n_cols, 1]
+        cls_broadcast = cls.view(1, 1, -1).expand(n_rows, n_cols, -1)
+        cell_emb = torch.where(empty_mask, cls_broadcast, means)
 
         row_emb = cell_emb.mean(dim=1)
         col_emb = cell_emb.mean(dim=0)

@@ -77,6 +77,14 @@ class TabbieTableEncoder(BaseTableEncoder):
         for p in self.cell_encoder.parameters():
             p.requires_grad = False
 
+        # cell text -> raw [CLS] vector (CPU), same pattern as
+        # TextEmbedder in cell_encoder.py -- cell_encoder is frozen, so a
+        # given cell string always produces the same output, and cells
+        # repeat heavily across a real corpus (dates, ids, categorical
+        # values, and the same table's cells re-seen every epoch or as a
+        # hard negative for many queries). See _encode_cells_isolated.
+        self._cell_cache: dict[str, torch.Tensor] = {}
+
         self.row_pos_embed = nn.Embedding(max_rows, self.hidden_size).to(self.device)
         self.col_pos_embed = nn.Embedding(max_cols, self.hidden_size).to(self.device)
         self.cls_row = nn.Parameter(torch.randn(self.hidden_size) * 0.02).to(self.device)
@@ -106,17 +114,32 @@ class TabbieTableEncoder(BaseTableEncoder):
         """Encode a flat list of cell texts independently with BERT (batched)
         and return the [CLS] vector as x for each -- matches the reference
         repo's `bert_embedder`, which never lets one cell's tokens attend to
-        another cell's tokens at this stage."""
-        enc = self.tokenizer(
-            list(texts),
-            padding=True,
-            truncation=True,
-            max_length=self.cell_max_length,
-            return_tensors="pt",
-        ).to(self.device)
-        with torch.no_grad():
-            out = self.cell_encoder(**enc)
-        return out.last_hidden_state[:, 0, :]  # [N, D]
+        another cell's tokens at this stage.
+
+        Cache-aware: only strings never seen before in this process
+        actually get tokenized and run through cell_encoder -- see
+        self._cell_cache's docstring in __init__. Duplicates (including
+        repeats within this same call, e.g. a common header text
+        appearing once per table) are gathered from the single computed
+        result, same as TextEmbedder.forward's approach.
+        """
+        uncached_unique = list({t for t in texts if t not in self._cell_cache})
+
+        if uncached_unique:
+            enc = self.tokenizer(
+                uncached_unique,
+                padding=True,
+                truncation=True,
+                max_length=self.cell_max_length,
+                return_tensors="pt",
+            ).to(self.device)
+            with torch.no_grad():
+                out = self.cell_encoder(**enc)
+            new_cls = out.last_hidden_state[:, 0, :]  # [len(uncached_unique), D]
+            for t, v in zip(uncached_unique, new_cls):
+                self._cell_cache[t] = v.detach().cpu()
+
+        return torch.stack([self._cell_cache[t] for t in texts], dim=0).to(self.device)
 
     def forward(
         self,

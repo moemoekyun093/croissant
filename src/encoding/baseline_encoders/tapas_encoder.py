@@ -95,15 +95,24 @@ class TapasTableEncoder(BaseTableEncoder):
         column_ids = token_type_ids[:, 1]
         row_ids = token_type_ids[:, 2]
 
-        cell_emb = torch.zeros(n_rows, n_cols, self.hidden_size, device=self.device)
-        counts = torch.zeros(n_rows, n_cols, device=self.device)
-        for tok_idx in range(hidden.size(0)):
-            r, c = int(row_ids[tok_idx].item()), int(column_ids[tok_idx].item())
-            if r >= 1 and c >= 1 and r <= n_rows and c <= n_cols:
-                cell_emb[r - 1, c - 1] += hidden[tok_idx]
-                counts[r - 1, c - 1] += 1
-        counts = counts.clamp(min=1).unsqueeze(-1)
-        cell_emb = cell_emb / counts
+        # Vectorized scatter-mean over every token at once, instead of a
+        # Python loop over every token with an individual .item() call
+        # each iteration (forces a GPU->CPU sync per token -- with up to
+        # 512 tokens/table and ~192 tables/step, that's up to ~98,000
+        # blocking syncs per training step) plus a scalar += into
+        # cell_emb. index_add_ does the same accumulation as one
+        # vectorized op, entirely on-device.
+        valid = (row_ids >= 1) & (column_ids >= 1) & (row_ids <= n_rows) & (column_ids <= n_cols)
+        flat_idx = (row_ids[valid] - 1) * n_cols + (column_ids[valid] - 1)  # [n_valid]
+        valid_hidden = hidden[valid]  # [n_valid, D]
+
+        cell_emb_flat = torch.zeros(n_rows * n_cols, self.hidden_size, device=self.device, dtype=hidden.dtype)
+        counts_flat = torch.zeros(n_rows * n_cols, device=self.device, dtype=hidden.dtype)
+        cell_emb_flat.index_add_(0, flat_idx, valid_hidden)
+        counts_flat.index_add_(0, flat_idx, torch.ones(flat_idx.size(0), device=self.device, dtype=hidden.dtype))
+
+        counts = counts_flat.clamp(min=1).unsqueeze(-1)
+        cell_emb = (cell_emb_flat / counts).view(n_rows, n_cols, self.hidden_size)
 
         row_emb = cell_emb.mean(dim=1)
         col_emb = cell_emb.mean(dim=0)
