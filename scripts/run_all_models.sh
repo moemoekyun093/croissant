@@ -40,11 +40,15 @@ CORPUS_JSON="${CORPUS_JSON:-configs/splits/corpus.json}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-eval/report_runs}"
 LOG_DIR="${LOG_DIR:-eval/report_runs/logs}"
 SEED="${SEED:-42}"
-PRETRAIN_EPOCHS="${PRETRAIN_EPOCHS:-1}"
+PRETRAIN_EPOCHS="${PRETRAIN_EPOCHS:-1}"  # ignored when SKIP_PRETRAIN=true
 VAL_SAMPLE_SIZE="${VAL_SAMPLE_SIZE:-3000}"  # see scripts/train_model.py's --val_sample_size --
                                              # a real split's val set can be hundreds of
                                              # thousands of queries; ranking all of them against
                                              # the full corpus every epoch is impractically slow.
+SKIP_PRETRAIN="${SKIP_PRETRAIN:-true}"  # see train_model.py's --skip_pretrain -- finetune-only,
+                                         # treat as a fast comparison run, not the full agreed
+                                         # "ELECTRA pretrain + finetune" methodology for reporting.
+                                         # Set to false to run real pretraining for every encoder.
 GPUS=(2 3)  # 0 and 1 are busy -- do not add them here.
 
 # Every encoder this codebase can train: "ours" + every registered
@@ -63,6 +67,11 @@ if [ -n "$TABLES_JSON" ]; then
   TABLES_FLAG=(--tables_json "$TABLES_JSON")
 fi
 
+SKIP_PRETRAIN_FLAG=()
+if [ "$SKIP_PRETRAIN" = "true" ]; then
+  SKIP_PRETRAIN_FLAG=(--skip_pretrain)
+fi
+
 run_encoder() {
   local encoder="$1"
   local gpu="$2"
@@ -79,6 +88,7 @@ run_encoder() {
     --seed "$SEED" \
     --pretrain_epochs "$PRETRAIN_EPOCHS" \
     --val_sample_size "$VAL_SAMPLE_SIZE" \
+    "${SKIP_PRETRAIN_FLAG[@]}" \
     "${TABLES_FLAG[@]}" \
     > "$log_file" 2>&1
   local status=$?

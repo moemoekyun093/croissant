@@ -77,13 +77,6 @@ class TabbieTableEncoder(BaseTableEncoder):
         for p in self.cell_encoder.parameters():
             p.requires_grad = False
 
-    def train(self, mode: bool = True):
-        """Keep the frozen cell_encoder permanently in eval mode -- see
-        bert_baseline.py's train() override for the full rationale."""
-        super().train(mode)
-        self.cell_encoder.eval()
-        return self
-
         self.row_pos_embed = nn.Embedding(max_rows, self.hidden_size).to(self.device)
         self.col_pos_embed = nn.Embedding(max_cols, self.hidden_size).to(self.device)
         self.cls_row = nn.Parameter(torch.randn(self.hidden_size) * 0.02).to(self.device)
@@ -101,6 +94,13 @@ class TabbieTableEncoder(BaseTableEncoder):
         self.row_layers = nn.ModuleList([make_layer() for _ in range(num_layers)])
         self.col_layers = nn.ModuleList([make_layer() for _ in range(num_layers)])
         self.num_layers = num_layers
+
+    def train(self, mode: bool = True):
+        """Keep the frozen cell_encoder permanently in eval mode -- see
+        bert_baseline.py's train() override for the full rationale."""
+        super().train(mode)
+        self.cell_encoder.eval()
+        return self
 
     def _encode_cells_isolated(self, texts: Sequence[str]) -> torch.Tensor:
         """Encode a flat list of cell texts independently with BERT (batched)

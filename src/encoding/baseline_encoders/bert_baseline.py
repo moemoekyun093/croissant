@@ -85,27 +85,45 @@ class BertTableEncoder(BaseTableEncoder):
         """Flatten table row-major into a single token id sequence, tracking
         the [start, end) token span of every cell for later mean-pooling.
         Truncates whole cells (never splits a cell) once max_length is hit.
+
+        Tokenizes every cell (and the caption) in ONE batched tokenizer
+        call up front, instead of one Python-level self.tokenizer.encode()
+        call per cell -- with max_rows=50/max_columns=20 that was up to
+        1,000 individual (unbatched) tokenizer calls per table, which adds
+        up fast at real batch sizes (e.g. 192 tables/step with
+        n_hard_negatives=2 at batch_size=64). A single batched call lets
+        the underlying fast (Rust) tokenizer parallelize internally;
+        the truncation/assembly logic below is unchanged, just consuming
+        already-tokenized id lists instead of tokenizing as it goes.
         """
+        n_rows, n_cols = len(rows), len(headers)
+        texts: List[str] = []
+        if caption:
+            texts.append(caption)  # raw, matching the original (unbatched) code's behavior exactly
+        for i in range(n_rows):
+            for j in range(n_cols):
+                texts.append(_serialize_cell(headers[j], rows[i][j]))
+
+        all_ids = self.tokenizer(texts, add_special_tokens=False)["input_ids"] if texts else []
+
         input_ids: List[int] = [self.tokenizer.cls_token_id]
         cell_spans: List[List[Tuple[int, int]]] = [
             [(0, 0) for _ in headers] for _ in rows
         ]
 
-        def add_text(text: str) -> List[int]:
-            ids = self.tokenizer.encode(text, add_special_tokens=False)
-            return ids
-
+        idx = 0
         if caption:
-            input_ids += add_text(caption)
+            input_ids += all_ids[idx]
+            idx += 1
             input_ids.append(self.tokenizer.sep_token_id)
 
         truncated = False
-        for i, row in enumerate(rows):
+        for i in range(n_rows):
             if truncated:
                 break
-            for j, val in enumerate(row):
-                text = _serialize_cell(headers[j], val)
-                ids = add_text(text)
+            for j in range(n_cols):
+                ids = all_ids[idx]
+                idx += 1
                 if len(input_ids) + len(ids) + 1 >= self.max_length:
                     truncated = True
                     break

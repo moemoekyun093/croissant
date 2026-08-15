@@ -457,6 +457,27 @@ class FinetuneTrainer:
         self.query_encoder.eval()
         self.scorer.eval()
 
+        # Defensive re-check: corpus_tables SHOULD already be filtered by
+        # SynSQLTableDataset.load_corpus (see _drop_empty_tables there),
+        # but that only applies to processes started after that filter
+        # existed -- a long-running process that loaded its corpus
+        # earlier still carries whatever load_corpus returned at the
+        # time. A table with 0 rows or 0 columns here would zero out an
+        # entire chunk's row_mask/col_mask dimension and crash
+        # MultiScorer's max() reduction (see multi_score.py), losing the
+        # whole epoch's progress with no resume support. Cheap to check
+        # again right here, and fails loudly with which tables were bad
+        # instead of a confusing shape error deep in scoring code.
+        bad = [t for t in corpus_tables if t.num_rows == 0 or t.num_columns == 0]
+        if bad:
+            print(
+                f"[_corpus_scores] WARNING: dropping {len(bad)} empty table(s) "
+                f"that slipped past load_corpus's own filter (stale in-memory "
+                f"corpus from before that filter existed, or a genuine new "
+                f"bug -- first few ids: {[t.table_id for t in bad[:5]]}): "
+            )
+            corpus_tables = [t for t in corpus_tables if t.num_rows > 0 and t.num_columns > 0]
+
         corpus_ids = [t.table_id for t in corpus_tables]
         id_to_idx = {tid: i for i, tid in enumerate(corpus_ids)}
 

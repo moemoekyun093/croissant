@@ -101,13 +101,6 @@ class StruBertTableEncoder(BaseTableEncoder):
         for p in self.backbone.parameters():
             p.requires_grad = False
 
-    def train(self, mode: bool = True):
-        """Keep the frozen backbone permanently in eval mode -- see
-        bert_baseline.py's train() override for the full rationale."""
-        super().train(mode)
-        self.backbone.eval()
-        return self
-
         def make_stack():
             layer = nn.TransformerEncoderLayer(
                 d_model=self.hidden_size,
@@ -120,6 +113,13 @@ class StruBertTableEncoder(BaseTableEncoder):
         self.vertical_attn = make_stack()  # refines column embeddings C
         self.horizontal_attn = make_stack()  # refines row embeddings R
         self.fuse_proj = nn.Linear(self.hidden_size * 4, self.hidden_size).to(self.device)
+
+    def train(self, mode: bool = True):
+        """Keep the frozen backbone permanently in eval mode -- see
+        bert_baseline.py's train() override for the full rationale."""
+        super().train(mode)
+        self.backbone.eval()
+        return self
 
     def _cellwise_pool_sequence(self, seq_texts: List[str]) -> torch.Tensor:
         """Given a list of one "row-sequence" or "column-sequence" string per
