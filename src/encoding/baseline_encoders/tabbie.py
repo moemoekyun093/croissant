@@ -141,6 +141,33 @@ class TabbieTableEncoder(BaseTableEncoder):
 
         return torch.stack([self._cell_cache[t] for t in texts], dim=0).to(self.device)
 
+    def save_frozen_cache(self, path: str) -> None:
+        """Persists self._cell_cache (cell/header text -> frozen BERT
+        [CLS] vector) to disk -- same torch.save pattern as
+        TextEmbedder.save_cache_to_disk (cell_encoder.py) and
+        BaselineCellwiseAdapter.save_table_cache (adapter.py). Unlike
+        bert/tapas's per-table cache, this is per-STRING and only covers
+        the frozen sub-step (_encode_cells_isolated) -- the trainable
+        row/column transformer stack on top (self.row_layers/col_layers,
+        _forward_from_cls) always runs fresh regardless of a cache hit
+        here, since ITS output changes every training step and can't be
+        cached. See adapter.py's cacheable docstring for why tabbie's
+        FULL table embedding (unlike bert/tapas's) can't be persisted
+        the same way."""
+        torch.save(self._cell_cache, path)
+
+    def load_frozen_cache(self, path: str, merge: bool = True) -> None:
+        """Loads a previously-saved cell/header text cache. merge=True
+        keeps existing in-memory entries on a key collision (see
+        adapter.py's load_table_cache for why plain dict.update() would
+        get this backwards); merge=False replaces the cache entirely."""
+        loaded = torch.load(path, map_location="cpu")
+        if merge:
+            for k, v in loaded.items():
+                self._cell_cache.setdefault(k, v)
+        else:
+            self._cell_cache = loaded
+
     def forward(
         self,
         headers: Sequence[str],

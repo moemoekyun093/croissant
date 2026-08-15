@@ -293,6 +293,37 @@ if __name__ == "__main__":
              "after finetuning. Delete it if --model_name or the cell "
              "serialization convention changes.",
     )
+    parser.add_argument(
+        "--frozen_cache_path", default=None,
+        help="only meaningful for --encoder tabbie/strubert -- persists "
+             "their frozen-BERT sub-step's output (tabbie: per cell/"
+             "header string -> [CLS] vector; strubert: per row/column-"
+             "sequence string -> (fine, coarse) pooled vectors) to disk. "
+             "Unlike --table_cache_path, this does NOT cache the final "
+             "table embedding -- tabbie/strubert have trainable layers "
+             "(row/col transformer; vertical/horizontal attention + "
+             "fusion) on top of the frozen BERT step, so their final "
+             "output changes every training step and can't be cached the "
+             "way bert/tapas's can (see adapter.py's cacheable "
+             "docstring). Only the expensive frozen part is skipped on a "
+             "hit; the trainable stack always runs fresh. Defaults to "
+             "<checkpoint_dir>/<encoder>/frozen_cache.pt, loaded before "
+             "finetuning if it already exists and saved after finetuning.",
+    )
+    parser.add_argument(
+        "--query_cache_path", default=None,
+        help="only meaningful when query_trainable=False (the default, "
+             "see configs/finetune.yaml) -- persists QueryEncoder's frozen "
+             "BERT output per query string to disk (see "
+             "query_encoder.py's save_frozen_cache). SHARED across every "
+             "--encoder (not nested under <checkpoint_dir>/<encoder>/ "
+             "like the table caches), since the query tower and val/test "
+             "question text don't depend on which table encoder you're "
+             "running -- building this cache once while running 'bert' "
+             "means 'tapas'/'tabbie'/etc.'s runs benefit immediately too. "
+             "Defaults to <checkpoint_dir>/query_cache.pt, loaded before "
+             "finetuning if it exists and saved after finetuning.",
+    )
 
     # model.yaml has no key collisions with anything else, so the
     # generic multi-file merge is fine for it.
@@ -352,6 +383,10 @@ if __name__ == "__main__":
         args.text_cache_path = os.path.join(encoder_checkpoint_dir, "text_cache.pt")
     if args.table_cache_path is None:
         args.table_cache_path = os.path.join(encoder_checkpoint_dir, "table_cache.pt")
+    if args.frozen_cache_path is None:
+        args.frozen_cache_path = os.path.join(encoder_checkpoint_dir, "frozen_cache.pt")
+    if args.query_cache_path is None:
+        args.query_cache_path = os.path.join(args.checkpoint_dir, "query_cache.pt")  # SHARED across encoders, not per-encoder
 
     rng = random.Random(args.seed)
 
@@ -400,6 +435,18 @@ if __name__ == "__main__":
         print(f"loading table-embedding cache from {args.table_cache_path} ...")
         model.load_table_cache(args.table_cache_path)
         print(f"table cache warm-started with {len(model._table_cache)} entries")
+
+    # Frozen-substep cache: tabbie/strubert can't cache their FINAL table
+    # embedding (see --frozen_cache_path's help text), but the frozen
+    # BERT sub-step underneath their trainable layers is just as
+    # deterministic as bert/tapas's whole encoder -- cache that part
+    # only. model.baseline_encoder is the actual TabbieTableEncoder/
+    # StruBertTableEncoder instance inside the adapter.
+    if args.encoder in ("tabbie", "strubert") and os.path.exists(args.frozen_cache_path):
+        print(f"loading frozen-substep cache from {args.frozen_cache_path} ...")
+        model.baseline_encoder.load_frozen_cache(args.frozen_cache_path)
+        cache_attr = "_cell_cache" if args.encoder == "tabbie" else "_seq_cache"
+        print(f"frozen cache warm-started with {len(getattr(model.baseline_encoder, cache_attr))} entries")
 
     # Resume from an existing checkpoint if this encoder's pretrain_dir
     # already has one -- e.g. a previous run of this exact command was
@@ -502,6 +549,14 @@ if __name__ == "__main__":
             print(
                 f"saved table cache ({len(model._table_cache)} entries) "
                 f"to {args.table_cache_path} after pretraining"
+            )
+        if args.encoder in ("tabbie", "strubert"):
+            os.makedirs(os.path.dirname(args.frozen_cache_path) or ".", exist_ok=True)
+            model.baseline_encoder.save_frozen_cache(args.frozen_cache_path)
+            cache_attr = "_cell_cache" if args.encoder == "tabbie" else "_seq_cache"
+            print(
+                f"saved frozen cache ({len(getattr(model.baseline_encoder, cache_attr))} entries) "
+                f"to {args.frozen_cache_path} after pretraining"
             )
 
         ckpt = latest_checkpoint(pretrain_dir)
@@ -655,6 +710,35 @@ if __name__ == "__main__":
         exclude_special_tokens=args.exclude_special_tokens,
     )
 
+    # Query cache: only meaningful when frozen (query_trainable=False,
+    # the default) -- see --query_cache_path's help text. Shared across
+    # every --encoder run, so this can warm-start from a cache built
+    # while running a totally different encoder.
+    if not args.query_trainable and os.path.exists(args.query_cache_path):
+        print(f"loading query cache from {args.query_cache_path} ...")
+        query_encoder.load_frozen_cache(args.query_cache_path)
+        print(f"query cache warm-started with {len(query_encoder._encoder_cache)} entries")
+
+    def save_all_caches() -> None:
+        """Called every time val MAP improves (see fit()'s on_checkpoint)
+        -- saves whichever cache(s) this --encoder actually has, right
+        alongside best_model.pt, so a crash later in this SAME run
+        doesn't lose everything accumulated since the last improvement.
+        Mirrors the end-of-script cache-saving blocks below exactly, just
+        triggered more often and earlier."""
+        if args.encoder == "ours":
+            os.makedirs(os.path.dirname(args.text_cache_path) or ".", exist_ok=True)
+            model.save_text_cache(args.text_cache_path)
+        if args.encoder in ("bert", "tapas"):
+            os.makedirs(os.path.dirname(args.table_cache_path) or ".", exist_ok=True)
+            model.save_table_cache(args.table_cache_path)
+        if args.encoder in ("tabbie", "strubert"):
+            os.makedirs(os.path.dirname(args.frozen_cache_path) or ".", exist_ok=True)
+            model.baseline_encoder.save_frozen_cache(args.frozen_cache_path)
+        if not args.query_trainable:
+            os.makedirs(os.path.dirname(args.query_cache_path) or ".", exist_ok=True)
+            query_encoder.save_frozen_cache(args.query_cache_path)
+
     finetuner = FinetuneTrainer(
         model,
         query_encoder,
@@ -681,6 +765,7 @@ if __name__ == "__main__":
         patience=args.patience,
         log_every=args.log_every,
         val_query_batch_size=args.query_batch_size,
+        on_checkpoint=save_all_caches,
     )
 
     print(f"\n[{args.encoder}] best validation MAP: {best_val_map:.4f}")
@@ -748,6 +833,24 @@ if __name__ == "__main__":
             f"[{args.encoder}] saved table cache "
             f"({len(model._table_cache)} entries) "
             f"to {args.table_cache_path} after finetuning"
+        )
+    if args.encoder in ("tabbie", "strubert"):
+        os.makedirs(os.path.dirname(args.frozen_cache_path) or ".", exist_ok=True)
+        model.baseline_encoder.save_frozen_cache(args.frozen_cache_path)
+        cache_attr = "_cell_cache" if args.encoder == "tabbie" else "_seq_cache"
+        print(
+            f"[{args.encoder}] saved frozen cache "
+            f"({len(getattr(model.baseline_encoder, cache_attr))} entries) "
+            f"to {args.frozen_cache_path} after finetuning"
+        )
+    if not args.query_trainable:
+        os.makedirs(os.path.dirname(args.query_cache_path) or ".", exist_ok=True)
+        query_encoder.save_frozen_cache(args.query_cache_path)
+        print(
+            f"[{args.encoder}] saved query cache "
+            f"({len(query_encoder._encoder_cache)} entries) "
+            f"to {args.query_cache_path} after finetuning -- shared, "
+            f"benefits every other --encoder's runs too"
         )
 
     print(f"\n[{args.encoder}] training complete.")

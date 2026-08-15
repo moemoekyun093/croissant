@@ -114,6 +114,17 @@ class StruBertTableEncoder(BaseTableEncoder):
         self.horizontal_attn = make_stack()  # refines row embeddings R
         self.fuse_proj = nn.Linear(self.hidden_size * 4, self.hidden_size).to(self.device)
 
+        # col/row-sequence text -> (fine, coarse) frozen-BERT pooled
+        # vectors (CPU) -- same pattern as tabbie.py's _cell_cache /
+        # cell_encoder.py's TextEmbedder. backbone is frozen, so a given
+        # sequence string always produces the same (fine, coarse) pair;
+        # the SAME column/row sequence text recurs heavily (a table's
+        # own columns/rows re-seen every epoch, as a hard negative for
+        # many queries, etc). Only the frozen backbone call is cached --
+        # vertical_attn/horizontal_attn/fuse_proj on top always run
+        # fresh, since their output changes every training step.
+        self._seq_cache: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+
     def train(self, mode: bool = True):
         """Keep the frozen backbone permanently in eval mode -- see
         bert_baseline.py's train() override for the full rationale."""
@@ -129,25 +140,60 @@ class StruBertTableEncoder(BaseTableEncoder):
 
         We also return, per sequence, the mean of all non-special tokens as
         the fine-grained "cell-wise pooled" embedding approximation.
+
+        Cache-aware, same pattern as tabbie.py's _encode_cells_isolated:
+        backbone is frozen, so a given sequence string always produces the
+        same (fine, coarse) pair -- only strings never seen before in this
+        process actually get tokenized and run through the backbone.
         """
-        enc = self.tokenizer(
-            seq_texts,
-            padding=True,
-            truncation=True,
-            max_length=self.seq_max_length,
-            return_tensors="pt",
-        ).to(self.device)
-        with torch.no_grad():
-            out = self.backbone(**enc)
-        hidden = out.last_hidden_state  # [N, L, D]
-        mask = enc["attention_mask"].unsqueeze(-1).float()
-        # zero out CLS/SEP contribution to the fine-grained mean by using a
-        # copy of the mask with position 0 (CLS) excluded
-        fine_mask = mask.clone()
-        fine_mask[:, 0, :] = 0.0
-        fine = (hidden * fine_mask).sum(dim=1) / fine_mask.sum(dim=1).clamp(min=1.0)
-        coarse = hidden[:, 0, :]
+        uncached_unique = list({t for t in seq_texts if t not in self._seq_cache})
+
+        if uncached_unique:
+            enc = self.tokenizer(
+                uncached_unique,
+                padding=True,
+                truncation=True,
+                max_length=self.seq_max_length,
+                return_tensors="pt",
+            ).to(self.device)
+            with torch.no_grad():
+                out = self.backbone(**enc)
+            hidden = out.last_hidden_state  # [N, L, D]
+            mask = enc["attention_mask"].unsqueeze(-1).float()
+            # zero out CLS/SEP contribution to the fine-grained mean by using a
+            # copy of the mask with position 0 (CLS) excluded
+            fine_mask = mask.clone()
+            fine_mask[:, 0, :] = 0.0
+            new_fine = (hidden * fine_mask).sum(dim=1) / fine_mask.sum(dim=1).clamp(min=1.0)
+            new_coarse = hidden[:, 0, :]
+            for t, f, c in zip(uncached_unique, new_fine, new_coarse):
+                self._seq_cache[t] = (f.detach().cpu(), c.detach().cpu())
+
+        fine = torch.stack([self._seq_cache[t][0] for t in seq_texts], dim=0).to(self.device)
+        coarse = torch.stack([self._seq_cache[t][1] for t in seq_texts], dim=0).to(self.device)
         return fine, coarse
+
+    def save_frozen_cache(self, path: str) -> None:
+        """Persists self._seq_cache (col/row-sequence text -> frozen BERT
+        (fine, coarse) pooled vectors) to disk -- same torch.save pattern
+        as tabbie.py's save_frozen_cache / adapter.py's
+        save_table_cache. Only the frozen backbone sub-step is cached --
+        vertical_attn/horizontal_attn/fuse_proj always run fresh, since
+        their output changes every training step and can't be cached the
+        way bert/tapas's FULL table embedding can."""
+        torch.save(self._seq_cache, path)
+
+    def load_frozen_cache(self, path: str, merge: bool = True) -> None:
+        """Loads a previously-saved col/row-sequence cache. merge=True
+        keeps existing in-memory entries on a key collision (see
+        adapter.py's load_table_cache for why plain dict.update() would
+        get this backwards); merge=False replaces the cache entirely."""
+        loaded = torch.load(path, map_location="cpu")
+        if merge:
+            for k, v in loaded.items():
+                self._seq_cache.setdefault(k, v)
+        else:
+            self._seq_cache = loaded
 
     def _build_seqs(
         self,

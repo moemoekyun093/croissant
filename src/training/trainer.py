@@ -735,6 +735,7 @@ class FinetuneTrainer:
         log_every: int = 50,
         resume_from: str | None = None,
         val_query_batch_size: int | None = None,
+        on_checkpoint: Callable[[], None] | None = None,
     ) -> float:
         """
         Early stopping on validation MAP (not loss) -- per-instruction:
@@ -769,6 +770,19 @@ class FinetuneTrainer:
             returns) needs its own query_batch_size passed directly to
             that call, since it isn't routed through fit() at all and
             typically uses the FULL, unsampled test split.
+        on_checkpoint: called (no args) immediately after every
+            save_checkpoint() -- i.e. every time val MAP improves, same
+            frequency as best_model.pt itself. Intended for saving any
+            frozen-substep caches (text/table/frozen/query -- see
+            adapter.py/tabbie.py/strubert.py/query_encoder.py's
+            save_*cache methods) alongside the model checkpoint, so a
+            crash later in the SAME run doesn't lose all cache progress
+            accumulated since the last save -- this is exactly what
+            happened to an earlier run that crashed during the final
+            test-set evaluation, after training had already finished:
+            best_model.pt existed, but nothing had EVER been saved to
+            any cache path, since the only save call was previously at
+            the very end of the whole script, after evaluate_map.
         """
         import time
 
@@ -838,6 +852,8 @@ class FinetuneTrainer:
                 best_map = val_map
                 epochs_without_improvement = 0
                 self.save_checkpoint(epoch, extra={"val_map": val_map, "val_mrr": val_mrr})
+                if on_checkpoint is not None:
+                    on_checkpoint()
                 self._log(f"== [finetune] epoch {epoch} done (NEW BEST val MAP) ==")
             else:
                 epochs_without_improvement += 1

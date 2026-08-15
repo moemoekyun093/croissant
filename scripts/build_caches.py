@@ -18,11 +18,27 @@ the full rationale -- this script is just a thin driver):
   4. table-embedding     (BaselineCellwiseAdapter, --encoder bert/tapas
      cache                  only) -- BERT's actual output vectors for
                           every corpus table, so the backbone never has
-                          to run again for a table already seen. Skipped
-                          entirely for --encoder ours/tabbie/strubert/
-                          turl/hytrel (see adapter.py's
-                          _FULLY_FROZEN_ENCODERS -- only bert/tapas have
-                          a fully-frozen, cacheable-forever encoder).
+                          to run again for a table already seen. See
+                          adapter.py's _FULLY_FROZEN_ENCODERS -- only
+                          bert/tapas have a fully-frozen, cacheable-
+                          forever encoder, so this is the FULL table
+                          embedding for these two.
+  4'. frozen-substep     (--encoder tabbie/strubert only) -- same idea,
+      cache                 but only the frozen-BERT sub-step underneath
+                          their trainable row/col-transformer or
+                          attention+fusion layers is cacheable (see
+                          save_frozen_cache's docstring in tabbie.py/
+                          strubert.py) -- their FINAL table embedding
+                          can't be cached the way bert/tapas's can, since
+                          it depends on trainable weights that change
+                          every training step. Skipped entirely for
+                          --encoder ours/turl/hytrel: turl/hytrel's
+                          embedding step is already cheap (a raw
+                          nn.Embedding lookup, not a real backbone call)
+                          so there's nothing expensive to cache there,
+                          and "ours" already has its own equivalent
+                          (CellEncoder's text_cache.pt, built by
+                          train_model.py directly, not this script).
 
 Steps 1-2 happen automatically just by constructing the datasets (no
 extra code needed -- this script's value for those two is purely "run
@@ -88,31 +104,25 @@ if __name__ == "__main__":
     print(f"-> {len(corpus_tables)} corpus table(s) materialized\n")
 
     if args.skip_table_cache or args.encoder is None:
-        print("skipping step 4 (table-embedding cache) -- pass --encoder bert (or tapas) to build it.")
+        print("skipping step 4 (embedding cache) -- pass --encoder bert/tapas/tabbie/strubert to build one.")
         raise SystemExit(0)
 
-    if args.encoder not in _FULLY_FROZEN_ENCODERS:
+    if args.encoder not in _FULLY_FROZEN_ENCODERS and args.encoder not in ("tabbie", "strubert"):
         print(
-            f"=== step 4: skipped -- --encoder {args.encoder!r} is not in "
-            f"_FULLY_FROZEN_ENCODERS ({sorted(_FULLY_FROZEN_ENCODERS)}). "
-            f"Its table embeddings depend on trainable weights that change "
-            f"every training step, so they can't be cached once and reused "
-            f"across a whole run -- see adapter.py's cacheable docstring. ==="
+            f"=== step 4: skipped -- --encoder {args.encoder!r} has no "
+            f"disk-cacheable step here. bert/tapas ({sorted(_FULLY_FROZEN_ENCODERS)}) "
+            f"cache their FULL table embedding; tabbie/strubert cache their "
+            f"frozen BERT sub-step only (see build_caches.py's module "
+            f"docstring for why). turl/hytrel's embedding step is already "
+            f"cheap (a raw nn.Embedding lookup, not a real backbone call) "
+            f"so there's nothing worth caching there. 'ours' has its own "
+            f"equivalent (CellEncoder's text_cache.pt), built directly by "
+            f"train_model.py, not this script. ==="
         )
         raise SystemExit(0)
 
-    print(f"=== step 4: table-embedding cache ({args.encoder}, {len(corpus_tables)} table(s), device={args.device}) ===")
-    table_cache_path = args.table_cache_path or os.path.join("eval/report_runs", args.encoder, "table_cache.pt")
-
     model = build_baseline_model(args.encoder, embed_dim=args.embed_dim, device=args.device)
-    if os.path.exists(table_cache_path):
-        print(f"found existing table cache at {table_cache_path!r} -- loading and topping up any missing tables ...")
-        model.load_table_cache(table_cache_path)
-        print(f"loaded {len(model._table_cache)} entries")
-
     model.eval()
-
-    n_before = len(model._table_cache)
 
     # Same size-sort _corpus_scores uses (largest tables last), purely so
     # progress printing is informative -- doesn't affect correctness.
@@ -121,20 +131,56 @@ if __name__ == "__main__":
 
     import torch
 
-    with torch.no_grad():
-        for chunk_idx, c_start in enumerate(range(0, len(order), args.table_batch_size)):
-            idx_chunk = order[c_start : c_start + args.table_batch_size]
-            c_chunk = [corpus_tables[i] for i in idx_chunk]
-            n_already_cached = sum(1 for t in c_chunk if t.table_id in model._table_cache)
-            if n_already_cached == len(c_chunk):
-                continue  # every table in this chunk is already cached -- skip the backbone call entirely
-            print(f"[{chunk_idx + 1}/{n_chunks}] encoding {len(c_chunk) - n_already_cached}/{len(c_chunk)} new table(s) ...")
-            model.forward_batch_cellwise(c_chunk)
+    if args.encoder in _FULLY_FROZEN_ENCODERS:
+        print(f"=== step 4: table-embedding cache ({args.encoder}, {len(corpus_tables)} table(s), device={args.device}) ===")
+        table_cache_path = args.table_cache_path or os.path.join("eval/report_runs", args.encoder, "table_cache.pt")
 
-    n_new = len(model._table_cache) - n_before
-    if n_new == 0 and os.path.exists(table_cache_path):
-        print(f"-> every corpus table was already cached ({n_before} entries) -- {table_cache_path} left untouched.")
-    else:
-        os.makedirs(os.path.dirname(table_cache_path) or ".", exist_ok=True)
-        model.save_table_cache(table_cache_path)
-        print(f"-> encoded {n_new} new table(s), saved {len(model._table_cache)} total entries to {table_cache_path}")
+        if os.path.exists(table_cache_path):
+            print(f"found existing table cache at {table_cache_path!r} -- loading and topping up any missing tables ...")
+            model.load_table_cache(table_cache_path)
+            print(f"loaded {len(model._table_cache)} entries")
+
+        n_before = len(model._table_cache)
+        with torch.no_grad():
+            for chunk_idx, c_start in enumerate(range(0, len(order), args.table_batch_size)):
+                idx_chunk = order[c_start : c_start + args.table_batch_size]
+                c_chunk = [corpus_tables[i] for i in idx_chunk]
+                n_already_cached = sum(1 for t in c_chunk if t.table_id in model._table_cache)
+                if n_already_cached == len(c_chunk):
+                    continue  # every table in this chunk is already cached -- skip the backbone call entirely
+                print(f"[{chunk_idx + 1}/{n_chunks}] encoding {len(c_chunk) - n_already_cached}/{len(c_chunk)} new table(s) ...")
+                model.forward_batch_cellwise(c_chunk)
+
+        n_new = len(model._table_cache) - n_before
+        if n_new == 0 and os.path.exists(table_cache_path):
+            print(f"-> every corpus table was already cached ({n_before} entries) -- {table_cache_path} left untouched.")
+        else:
+            os.makedirs(os.path.dirname(table_cache_path) or ".", exist_ok=True)
+            model.save_table_cache(table_cache_path)
+            print(f"-> encoded {n_new} new table(s), saved {len(model._table_cache)} total entries to {table_cache_path}")
+
+    else:  # tabbie / strubert -- frozen sub-step only, see module docstring
+        print(f"=== step 4': frozen-substep cache ({args.encoder}, {len(corpus_tables)} table(s), device={args.device}) ===")
+        frozen_cache_path = os.path.join("eval/report_runs", args.encoder, "frozen_cache.pt")
+        cache_attr = "_cell_cache" if args.encoder == "tabbie" else "_seq_cache"
+
+        if os.path.exists(frozen_cache_path):
+            print(f"found existing frozen cache at {frozen_cache_path!r} -- loading and topping up ...")
+            model.baseline_encoder.load_frozen_cache(frozen_cache_path)
+            print(f"loaded {len(getattr(model.baseline_encoder, cache_attr))} entries")
+
+        n_before = len(getattr(model.baseline_encoder, cache_attr))
+        with torch.no_grad():
+            for chunk_idx, c_start in enumerate(range(0, len(order), args.table_batch_size)):
+                idx_chunk = order[c_start : c_start + args.table_batch_size]
+                c_chunk = [corpus_tables[i] for i in idx_chunk]
+                print(f"[{chunk_idx + 1}/{n_chunks}] running frozen BERT sub-step for {len(c_chunk)} table(s) (cache-aware -- misses only) ...")
+                model.forward_batch_cellwise(c_chunk)
+
+        n_new = len(getattr(model.baseline_encoder, cache_attr)) - n_before
+        if n_new == 0 and os.path.exists(frozen_cache_path):
+            print(f"-> every cell/sequence string was already cached ({n_before} entries) -- {frozen_cache_path} left untouched.")
+        else:
+            os.makedirs(os.path.dirname(frozen_cache_path) or ".", exist_ok=True)
+            model.baseline_encoder.save_frozen_cache(frozen_cache_path)
+            print(f"-> encoded {n_new} new string(s), saved {len(getattr(model.baseline_encoder, cache_attr))} total entries to {frozen_cache_path}")

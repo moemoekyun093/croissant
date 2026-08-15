@@ -71,6 +71,22 @@ class QueryEncoder(nn.Module):
         hidden_size = self.encoder.config.hidden_size
         self.proj = nn.Linear(hidden_size, output_dim, bias=False)
 
+        # query text -> (raw last_hidden_state [true_len, H], input_ids
+        # [true_len]) on CPU, UNPADDED (real tokens only) -- same pattern
+        # as every frozen baseline table encoder's cache (see adapter.py's
+        # save_table_cache docstring). Only meaningful when trainable is
+        # False: self.encoder's output for a given query string never
+        # changes then, and the SAME val/test questions get re-encoded
+        # from scratch every single validation epoch by _corpus_scores
+        # otherwise -- e.g. 40 epochs means the same ~3000 validation
+        # questions run through BERT 40 separate times for no reason.
+        # input_ids are cached alongside the hidden state (not just the
+        # hidden state alone) so exclude_special_tokens can still recompute
+        # get_special_tokens_mask correctly on a cache hit. self.proj
+        # (always trainable) is re-applied fresh to every query regardless
+        # of hit/miss.
+        self._encoder_cache: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+
     def train(self, mode: bool = True):
         """When frozen, keep self.encoder permanently in eval mode (no
         dropout) even though Trainer.fit() calls model.train() every
@@ -101,27 +117,56 @@ class QueryEncoder(nn.Module):
 
         device = next(self.encoder.parameters()).device
 
-        encoded = self.tokenizer(
-            queries,
-            padding=True,
-            truncation=True,
-            max_length=self.max_length,
-            return_tensors="pt",
-        ).to(device)
+        if not self.trainable:
+            # Cache-aware path -- only queries never seen before in this
+            # process actually get tokenized and run through self.encoder.
+            uncached_unique = list({q for q in queries if q not in self._encoder_cache})
+            if uncached_unique:
+                enc = self.tokenizer(
+                    uncached_unique,
+                    padding=True,
+                    truncation=True,
+                    max_length=self.max_length,
+                    return_tensors="pt",
+                ).to(device)
+                with torch.no_grad():
+                    outputs = self.encoder(**enc)
+                attn = enc["attention_mask"]  # [U, Lmax_uncached]
+                for i, q in enumerate(uncached_unique):
+                    true_len = int(attn[i].sum().item())
+                    hidden_i = outputs.last_hidden_state[i, :true_len].detach().cpu()  # [true_len, H]
+                    ids_i = enc["input_ids"][i, :true_len].detach().cpu()  # [true_len]
+                    self._encoder_cache[q] = (hidden_i, ids_i)
 
-        if self.trainable:
-            outputs = self.encoder(**encoded)
+            per_query = [self._encoder_cache[q] for q in queries]  # [(hidden[Li,H], ids[Li]), ...]
+            Lmax = max(h.shape[0] for h, _ in per_query)
+            B = len(queries)
+            hidden_size = per_query[0][0].shape[1]
+            pad_id = self.tokenizer.pad_token_id or 0
+
+            hidden_batch = torch.zeros(B, Lmax, hidden_size, device=device)
+            ids_batch = torch.full((B, Lmax), pad_id, dtype=torch.long, device=device)
+            query_mask = torch.zeros(B, Lmax, device=device)
+            for i, (h, ids) in enumerate(per_query):
+                L = h.shape[0]
+                hidden_batch[i, :L] = h.to(device)
+                ids_batch[i, :L] = ids.to(device)
+                query_mask[i, :L] = 1.0
+
+            Q = self.proj(hidden_batch)  # [B, Lmax, output_dim] -- self.proj always trainable, applied fresh
+            input_ids_for_mask = ids_batch
         else:
-            # No gradient tracking at all through the frozen backbone --
-            # requires_grad=False on its params already stops it from
-            # accumulating grads, but wrapping in no_grad() also avoids
-            # building/retaining the intermediate activation graph in the
-            # first place, same as every frozen baseline table encoder.
-            with torch.no_grad():
-                outputs = self.encoder(**encoded)
-        Q = self.proj(outputs.last_hidden_state)  # [B, L, output_dim] -- self.proj always trainable
-
-        query_mask = encoded["attention_mask"].float()  # [B, L]
+            encoded = self.tokenizer(
+                queries,
+                padding=True,
+                truncation=True,
+                max_length=self.max_length,
+                return_tensors="pt",
+            ).to(device)
+            outputs = self.encoder(**encoded)
+            Q = self.proj(outputs.last_hidden_state)  # [B, L, output_dim]
+            query_mask = encoded["attention_mask"].float()  # [B, L]
+            input_ids_for_mask = encoded["input_ids"]
 
         if self.exclude_special_tokens:
             special_mask = torch.tensor(
@@ -129,10 +174,33 @@ class QueryEncoder(nn.Module):
                     self.tokenizer.get_special_tokens_mask(
                         ids, already_has_special_tokens=True
                     )
-                    for ids in encoded["input_ids"].tolist()
+                    for ids in input_ids_for_mask.tolist()
                 ],
                 device=device,
             ).float()
             query_mask = query_mask * (1.0 - special_mask)
 
         return Q, query_mask
+
+    def save_frozen_cache(self, path: str) -> None:
+        """Persists self._encoder_cache (query text -> frozen BERT output)
+        to disk -- same torch.save pattern as every other frozen-substep
+        cache this session (adapter.py's save_table_cache, tabbie.py/
+        strubert.py's save_frozen_cache, cell_encoder.py's
+        save_cache_to_disk). No-op (empty dict) if trainable=True, since
+        caching is skipped entirely in that case -- a query's encoding
+        legitimately changes every step when the query tower itself is
+        being finetuned."""
+        torch.save(self._encoder_cache, path)
+
+    def load_frozen_cache(self, path: str, merge: bool = True) -> None:
+        """Loads a previously-saved query cache. merge=True keeps
+        existing in-memory entries on a key collision (see adapter.py's
+        load_table_cache for why plain dict.update() would get this
+        backwards); merge=False replaces the cache entirely."""
+        loaded = torch.load(path, map_location="cpu")
+        if merge:
+            for k, v in loaded.items():
+                self._encoder_cache.setdefault(k, v)
+        else:
+            self._encoder_cache = loaded
