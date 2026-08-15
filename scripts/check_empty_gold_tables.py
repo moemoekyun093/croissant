@@ -61,25 +61,40 @@ def main() -> None:
     print(f"loading split from {args.split_json} ...")
     resolved = query_dataset.resolve_split(args.split_json)
 
+    # Raw list from corpus.json BEFORE the empty-table filter -- used
+    # only to distinguish "genuinely missing from corpus.json" (a table
+    # build_query_splits.py never included at all) from "listed in
+    # corpus.json but dropped as empty" (the case this script actually
+    # cares about) below.
     with open(args.corpus_json, "r", encoding="utf-8") as f:
         corpus_raw = json.load(f)
-    corpus_ids = {
+    corpus_ids_raw = {
         f"{t['db_id']}#sep#{t['table_name']}" for t in corpus_raw["tables"]
     }
-    print(f"corpus.json lists {len(corpus_ids)} table(s)")
+    print(f"corpus.json lists {len(corpus_ids_raw)} table(s) (pre-filter)")
 
-    # cache Table.num_rows/num_columns lookups -- a gold table is very
-    # likely referenced by more than one query (same db, same table,
-    # different questions), no reason to re-fetch it from SQLite every
-    # time.
-    empty_cache: dict[tuple[str, str], bool] = {}
+    # The corpus is ALREADY materialized -- load_corpus() loads it from
+    # its own JSON cache (instant, no SQLite reads) if one exists, or
+    # materializes it once from SQLite (with progress logging) and
+    # caches it for next time either way. It also already runs the same
+    # empty-table filter this script cares about internally, printing
+    # how many it dropped. No live per-query SQLite fetches needed at
+    # all: every gold table is guaranteed (by build_query_splits.py's
+    # build_corpus()) to be listed in corpus.json, so checking whether a
+    # gold table is empty is just checking whether it survived this ONE
+    # already-cached load -- pure in-memory set/dict lookups from here.
+    print(f"loading corpus from {args.corpus_json} (materialized cache if present) ...")
+    corpus_tables = table_dataset.load_corpus(args.corpus_json)
+    corpus_by_id = {t.table_id: t for t in corpus_tables}
+    print(f"corpus: {len(corpus_by_id)} table(s) survived the empty-table filter")
 
     def is_empty(db_id: str, table_name: str) -> bool:
-        key = (db_id, table_name)
-        if key not in empty_cache:
-            table = table_dataset.get_table(db_id, table_name)
-            empty_cache[key] = table.num_rows == 0 or table.num_columns == 0
-        return empty_cache[key]
+        """A gold table is empty iff it's listed in corpus.json but did
+        NOT survive load_corpus()'s internal _drop_empty_tables filter
+        -- no SQLite call needed, corpus_by_id already reflects that
+        filter's outcome for every table in corpus.json."""
+        table_id = f"{db_id}#sep#{table_name}"
+        return table_id in corpus_ids_raw and table_id not in corpus_by_id
 
     grand_total_fully_unanswerable = 0
     grand_total_degraded = 0
@@ -102,7 +117,7 @@ def main() -> None:
                     all_empty_gold_tables.add((ex.db_id, table_name))
 
                 table_id = f"{ex.db_id}#sep#{table_name}"
-                if table_id not in corpus_ids:
+                if table_id not in corpus_ids_raw:
                     missing_from_corpus.add((ex.db_id, table_name))
                     all_missing_from_corpus.add((ex.db_id, table_name))
 
