@@ -13,6 +13,7 @@ pass (TableEncoder) are project-specific.
 
 import os
 import random
+import time
 from typing import Callable, Iterable
 
 import torch
@@ -298,11 +299,21 @@ class FinetuneTrainer:
         checkpoint_dir: str = "eval/report_runs/finetune",
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
         seed: int = 42,
+        profile: bool = False,
+        profile_every: int = 20,
     ):
         self.model = model.to(device)
         self.query_encoder = query_encoder.to(device)
         self.scorer = MultiScorer().to(device)
         self.device = device
+
+        # Per-stage timing (query encoding vs. table encoding vs. scoring)
+        # inside _score_batch, to expose which part of a training step is
+        # actually slow -- see _record_profile. Off by default since it
+        # adds a few torch.cuda-syncing time.perf_counter() calls per step.
+        self.profile = profile
+        self.profile_every = profile_every
+        self._profile_accum = {"n": 0, "n_queries": 0, "n_tables": 0, "query_s": 0.0, "table_s": 0.0, "score_s": 0.0}
 
         self.lr = lr
         self.weight_decay = weight_decay
@@ -407,12 +418,116 @@ class FinetuneTrainer:
         queries = [q for q, _ in pairs]
         tables = [t for _, t in pairs] + list(hard_negatives)
 
-        Q, query_mask = self.query_encoder(queries)  # [Bq, L, k], [Bq, L]
+        # Each stage wrapped separately so a crash's traceback -- and any
+        # printed diagnostic -- clearly names WHICH stage (query encoding
+        # vs. table encoding vs. scoring) failed, instead of one opaque
+        # exception somewhere inside this function. On a table-encoding
+        # failure, tables are retried ONE AT A TIME to isolate the exact
+        # offending table (or prove it's a batch-composition interaction,
+        # not a single bad table) -- modular, isolate first, ask questions
+        # later.
+        t_start = time.perf_counter()
+        try:
+            Q, query_mask = self.query_encoder(queries)  # [Bq, L, k], [Bq, L]
+        except Exception:
+            print(
+                f"[_score_batch] CRASHED during QUERY encoding "
+                f"({len(queries)} question(s)). first few: {queries[:5]!r}"
+            )
+            raise
         Q = Q * query_mask.unsqueeze(-1)  # zero out padding-token vectors
+        t_query = time.perf_counter()
 
-        X, col_mask, row_mask, cell_mask = self.model.forward_batch_cellwise(tables)
+        try:
+            X, col_mask, row_mask, cell_mask = self.model.forward_batch_cellwise(tables)
+        except Exception:
+            print(
+                f"[_score_batch] CRASHED during TABLE encoding "
+                f"({len(tables)} table(s)) -- isolating which one ..."
+            )
+            self._isolate_table_encoding_failure(tables)
+            raise  # unreachable if isolation above found+raised the culprit
+        t_table = time.perf_counter()
 
-        return cross_score_queries_tables(self.scorer, self.scoring_mode, Q, X, row_mask, col_mask)
+        try:
+            scores = cross_score_queries_tables(self.scorer, self.scoring_mode, Q, X, row_mask, col_mask)
+        except Exception:
+            print(
+                f"[_score_batch] CRASHED during SCORING. "
+                f"Q shape={tuple(Q.shape)}, X shape={tuple(X.shape)}, "
+                f"row_mask shape={tuple(row_mask.shape)}, col_mask shape={tuple(col_mask.shape)}, "
+                f"scoring_mode={self.scoring_mode!r}"
+            )
+            raise
+        t_score = time.perf_counter()
+
+        if self.profile:
+            self._record_profile(
+                n_queries=len(queries),
+                n_tables=len(tables),
+                query_s=t_query - t_start,
+                table_s=t_table - t_query,
+                score_s=t_score - t_table,
+            )
+
+        return scores
+
+    def _isolate_table_encoding_failure(self, tables: list[Table]) -> None:
+        """Retry table encoding ONE TABLE AT A TIME to pinpoint exactly
+        which table (if any single one) triggers the failure a batched
+        forward_batch_cellwise call just hit. Raises a RuntimeError naming
+        the offending table's id/shape/headers the moment one is found;
+        if every table succeeds in isolation, raises a different error
+        pointing at batch-composition (e.g. padding to a shared max
+        length) as the likely cause instead of any single table's data.
+        """
+        for i, t in enumerate(tables):
+            try:
+                self.model.forward_batch_cellwise([t])
+            except Exception as e:
+                raise RuntimeError(
+                    f"table encoding fails in ISOLATION (batch of 1) on "
+                    f"table {i}/{len(tables)}: table_id={t.table_id!r}, "
+                    f"rows={t.num_rows}, cols={t.num_columns}, "
+                    f"headers={list(t.headers)[:10]!r}"
+                ) from e
+        raise RuntimeError(
+            f"table encoding failed as a batch of {len(tables)}, but EVERY "
+            f"table in it succeeded when retried one at a time -- this "
+            f"points at a batch-composition interaction (e.g. padding/"
+            f"stacking multiple tables to a shared max sequence length), "
+            f"not a single bad table's data. table_ids in this batch: "
+            f"{[t.table_id for t in tables]}"
+        )
+
+    def _record_profile(
+        self, n_queries: int, n_tables: int, query_s: float, table_s: float, score_s: float
+    ) -> None:
+        """Accumulate per-stage timings and print a running average every
+        self.profile_every steps, so the printed numbers reflect a stable
+        average rather than one noisy step. Reset after each print."""
+        acc = self._profile_accum
+        acc["n"] += 1
+        acc["n_queries"] += n_queries
+        acc["n_tables"] += n_tables
+        acc["query_s"] += query_s
+        acc["table_s"] += table_s
+        acc["score_s"] += score_s
+
+        if acc["n"] >= self.profile_every:
+            n = acc["n"]
+            total = acc["query_s"] + acc["table_s"] + acc["score_s"]
+            self._log(
+                f"[profile] avg over {n} step(s) -- "
+                f"query encode: {1000 * acc['query_s'] / n:.1f}ms "
+                f"({100 * acc['query_s'] / total:.0f}%, avg {acc['n_queries'] / n:.0f} queries/step) | "
+                f"table encode: {1000 * acc['table_s'] / n:.1f}ms "
+                f"({100 * acc['table_s'] / total:.0f}%, avg {acc['n_tables'] / n:.0f} tables/step) | "
+                f"scoring: {1000 * acc['score_s'] / n:.1f}ms "
+                f"({100 * acc['score_s'] / total:.0f}%)"
+            )
+            for k in acc:
+                acc[k] = 0
 
     def train_step(self, batch: tuple[list[tuple[str, Table]], list[Table]]) -> float:
         self.model.train()

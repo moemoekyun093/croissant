@@ -231,6 +231,13 @@ if __name__ == "__main__":
     parser.add_argument("--warmup_ratio", type=float)
     parser.add_argument("--grad_clip_norm", type=float)
     parser.add_argument("--device")
+    parser.add_argument(
+        "--profile", action="store_true",
+        help="log a running average of query-encode/table-encode/scoring "
+             "time per training step (see trainer.py's _record_profile), "
+             "printed every --profile_every steps",
+    )
+    parser.add_argument("--profile_every", type=int, default=20)
     parser.add_argument("--checkpoint_dir", default="eval/report_runs")
     parser.add_argument("--log_every", type=int, default=50)
     parser.add_argument("--seed", type=int, default=42)
@@ -602,6 +609,8 @@ if __name__ == "__main__":
         checkpoint_dir=finetune_dir,
         device=args.device,
         seed=args.seed,
+        profile=args.profile,
+        profile_every=args.profile_every,
     )
 
     print(f"\n=== [{args.encoder}] stage 2/2: finetuning on {args.device} (scoring_mode={args.scoring_mode}, patience={args.patience}) ===")
