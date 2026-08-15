@@ -369,6 +369,41 @@ class FinetuneTrainer:
             column i (see query_table_info_nce_loss's docstring).
         """
         pairs, hard_negatives = batch
+
+        # Same empty-table guard _corpus_scores applies to the validation
+        # corpus -- a table with 0 rows or 0 columns reaching
+        # forward_batch_cellwise produces degenerate tokenization/pooling
+        # (e.g. _pool_cells' index_add_ into a buffer sized n_rows*n_cols,
+        # which collapses to 0 elements) that's a strong match for the
+        # CUDA IndexKernel.cu "index out of bounds" assert seen during
+        # training. This path never had the check the validation path
+        # has, so a bad table here would fail as a queued/async CUDA
+        # error only reported later, at validation's first sync point --
+        # which is exactly what every crash trace pointed at.
+        #
+        # Positive tables (`pairs`) can't be silently dropped -- doing so
+        # would misalign query_table_info_nce_loss's column-i-is-query-i's
+        # positive convention -- so a bad positive raises loudly instead.
+        # Hard negatives are safe to just drop.
+        bad_pairs = [(q, t) for q, t in pairs if t.num_rows == 0 or t.num_columns == 0]
+        if bad_pairs:
+            raise ValueError(
+                f"_score_batch: {len(bad_pairs)} query's positive table has "
+                f"0 rows or 0 columns -- would otherwise reach "
+                f"forward_batch_cellwise and likely crash as an unattributed "
+                f"CUDA device-side assert instead. offending (question, "
+                f"table_id, rows, cols): "
+                f"{[(q, t.table_id, t.num_rows, t.num_columns) for q, t in bad_pairs[:5]]}"
+            )
+        bad_negs = [t for t in hard_negatives if t.num_rows == 0 or t.num_columns == 0]
+        if bad_negs:
+            print(
+                f"[_score_batch] WARNING: dropping {len(bad_negs)} empty "
+                f"hard-negative table(s): "
+                f"{[(t.table_id, t.num_rows, t.num_columns) for t in bad_negs[:5]]}"
+            )
+            hard_negatives = [t for t in hard_negatives if t.num_rows > 0 and t.num_columns > 0]
+
         queries = [q for q, _ in pairs]
         tables = [t for _, t in pairs] + list(hard_negatives)
 
