@@ -734,6 +734,7 @@ class FinetuneTrainer:
         patience: int = 3,
         log_every: int = 50,
         resume_from: str | None = None,
+        val_query_batch_size: int | None = None,
     ) -> float:
         """
         Early stopping on validation MAP (not loss) -- per-instruction:
@@ -756,6 +757,18 @@ class FinetuneTrainer:
             epoch of the whole run.
 
         val_examples/corpus_tables: see evaluate_map's docstring.
+        val_query_batch_size: forwarded as evaluate_ranking_metrics'
+            query_batch_size for the per-epoch validation pass -- see
+            _corpus_scores' docstring for what it does. Left at its
+            default (None -- encode every val_examples question in ONE
+            QueryEncoder call) unless val_examples is itself large
+            enough that a single unbatched call risks OOMing; pass an
+            int (e.g. 1000-4000) if so. NOTE this only guards the
+            per-epoch val pass -- the separate FINAL test-set evaluation
+            (scripts/train_model.py's call to evaluate_map after fit()
+            returns) needs its own query_batch_size passed directly to
+            that call, since it isn't routed through fit() at all and
+            typically uses the FULL, unsampled test split.
         """
         import time
 
@@ -808,7 +821,9 @@ class FinetuneTrainer:
             epoch_train_elapsed = time.time() - epoch_start
 
             val_start = time.time()
-            val_metrics = self.evaluate_ranking_metrics(val_examples, corpus_tables)
+            val_metrics = self.evaluate_ranking_metrics(
+                val_examples, corpus_tables, query_batch_size=val_query_batch_size
+            )
             val_map, val_mrr = val_metrics["map"], val_metrics["mrr"]
             val_elapsed = time.time() - val_start
 

@@ -112,6 +112,8 @@ if __name__ == "__main__":
 
     model.eval()
 
+    n_before = len(model._table_cache)
+
     # Same size-sort _corpus_scores uses (largest tables last), purely so
     # progress printing is informative -- doesn't affect correctness.
     order = sorted(range(len(corpus_tables)), key=lambda i: (corpus_tables[i].num_columns, corpus_tables[i].num_rows))
@@ -129,6 +131,10 @@ if __name__ == "__main__":
             print(f"[{chunk_idx + 1}/{n_chunks}] encoding {len(c_chunk) - n_already_cached}/{len(c_chunk)} new table(s) ...")
             model.forward_batch_cellwise(c_chunk)
 
-    os.makedirs(os.path.dirname(table_cache_path) or ".", exist_ok=True)
-    model.save_table_cache(table_cache_path)
-    print(f"-> saved {len(model._table_cache)} table embedding(s) to {table_cache_path}")
+    n_new = len(model._table_cache) - n_before
+    if n_new == 0 and os.path.exists(table_cache_path):
+        print(f"-> every corpus table was already cached ({n_before} entries) -- {table_cache_path} left untouched.")
+    else:
+        os.makedirs(os.path.dirname(table_cache_path) or ".", exist_ok=True)
+        model.save_table_cache(table_cache_path)
+        print(f"-> encoded {n_new} new table(s), saved {len(model._table_cache)} total entries to {table_cache_path}")

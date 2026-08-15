@@ -65,6 +65,14 @@ from src.training.config import apply_yaml_defaults
 from src.training.query_encoder import QueryEncoder
 from src.training.trainer import FinetuneTrainer, PretrainTrainer
 
+
+def _int_or_none(value: str) -> int | None:
+    """argparse type= for flags that accept either an int or the literal
+    string "None" to disable (e.g. --query_batch_size None)."""
+    if value.lower() == "none":
+        return None
+    return int(value)
+
 from scripts.pretrain_electra import make_batches
 from scripts.finetune_query_table import cap_columns, count_batches, resolve_train_batches, to_eval_examples
 
@@ -174,6 +182,20 @@ if __name__ == "__main__":
              "full pass into many short epochs, defaults to ~20% of the "
              "resulting epoch count instead (floor 3). Pass an explicit "
              "value to override either default.",
+    )
+    parser.add_argument(
+        "--query_batch_size", type=_int_or_none, default=2000,
+        help="caps how many questions QueryEncoder encodes in ONE forward "
+             "pass during MAP/MRR evaluation (per-epoch val AND the final "
+             "test-set evaluation) -- see trainer.py's _corpus_scores' "
+             "query_batch_size docstring. Left unbounded (None) this "
+             "defaults to encoding EVERY query in the split in a single "
+             "batched call, which is fine for a --val_sample_size-capped "
+             "val set but WILL CUDA-OOM on an unsampled test split at real "
+             "dataset scale (confirmed: a ~226k-question test split tried "
+             "to allocate 20+ GiB in one scaled_dot_product_attention call "
+             "here). Pass --query_batch_size None to disable chunking "
+             "entirely if you're sure your query set is small enough.",
     )
     parser.add_argument(
         "--n_hard_negatives", type=int, default=2,
@@ -658,6 +680,7 @@ if __name__ == "__main__":
         corpus_tables=corpus_tables_for_val,
         patience=args.patience,
         log_every=args.log_every,
+        val_query_batch_size=args.query_batch_size,
     )
 
     print(f"\n[{args.encoder}] best validation MAP: {best_val_map:.4f}")
@@ -666,7 +689,13 @@ if __name__ == "__main__":
     test_map = None
     if os.path.exists(best_ckpt_path):
         finetuner.load_checkpoint(best_ckpt_path)
-        test_map = finetuner.evaluate_map(test_examples, corpus_tables)
+        # test_examples is the FULL, unsampled test split (unlike
+        # val_examples, which --val_sample_size may have capped) -- at
+        # real SynSQL-2.5M scale this is ~226k questions, so
+        # query_batch_size here is NOT optional the way it might appear
+        # to be for val (confirmed: omitting it CUDA-OOM'd trying to
+        # encode the whole test split in one QueryEncoder call).
+        test_map = finetuner.evaluate_map(test_examples, corpus_tables, query_batch_size=args.query_batch_size)
         print(f"[{args.encoder}] test MAP (best-val-MAP checkpoint): {test_map:.4f}")
     else:
         print(f"[{args.encoder}] no best checkpoint found (val MAP never improved) -- skipping test evaluation")
