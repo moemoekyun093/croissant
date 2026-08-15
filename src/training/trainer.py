@@ -732,22 +732,40 @@ class FinetuneTrainer:
             key=lambda i: (corpus_tables[i].num_columns, corpus_tables[i].num_rows),
         )
 
+        # Same async-CUDA-deferral concern as _score_batch/train_step (see
+        # their comment blocks) -- this loop previously had NO sync/try-
+        # except instrumentation at all, so a bad kernel queued by ANY
+        # call in here (query encoding, table encoding, or scoring) could
+        # surface at whatever unrelated call happened to sync next --
+        # including, misleadingly, the index_copy_ two lines below the
+        # ACTUAL culprit, or the masked_fill inside a LATER chunk's
+        # scoring call. This is exactly why earlier crashes pointed at
+        # index_copy_/masked_fill without those actually being the real
+        # cause. Every GPU-touching call below now gets its own
+        # try/except + self._maybe_sync(), so the NEXT crash here prints
+        # which stage AND which corpus chunk (with table ids) it
+        # actually happened in.
         with torch.no_grad():
             # Encode every query ONCE, up front -- no outer query-chunk
             # loop at all in the common case (query_batch_size=None).
-            if query_batch_size is None:
-                questions = [q for q, _, _ in examples]
-                Q, query_mask = self.query_encoder(questions)
-                Q = Q * query_mask.unsqueeze(-1)
-                query_chunks = [(0, n_queries, Q)]
-            else:
-                query_chunks = []
-                for q_start in range(0, n_queries, query_batch_size):
-                    q_chunk = examples[q_start : q_start + query_batch_size]
-                    questions = [q for q, _, _ in q_chunk]
-                    Qc, query_mask = self.query_encoder(questions)
-                    Qc = Qc * query_mask.unsqueeze(-1)
-                    query_chunks.append((q_start, q_start + len(q_chunk), Qc))
+            try:
+                if query_batch_size is None:
+                    questions = [q for q, _, _ in examples]
+                    Q, query_mask = self.query_encoder(questions)
+                    Q = Q * query_mask.unsqueeze(-1)
+                    query_chunks = [(0, n_queries, Q)]
+                else:
+                    query_chunks = []
+                    for q_start in range(0, n_queries, query_batch_size):
+                        q_chunk = examples[q_start : q_start + query_batch_size]
+                        questions = [q for q, _, _ in q_chunk]
+                        Qc, query_mask = self.query_encoder(questions)
+                        Qc = Qc * query_mask.unsqueeze(-1)
+                        query_chunks.append((q_start, q_start + len(q_chunk), Qc))
+                self._maybe_sync()
+            except Exception:
+                print(f"[_corpus_scores] CRASHED during QUERY encoding ({n_queries} question(s))")
+                raise
 
             # The one remaining loop: chunk the corpus (memory-bound, see
             # docstring), encode each chunk once, score it against every
@@ -756,14 +774,38 @@ class FinetuneTrainer:
             for c_start in range(0, n_corpus, table_batch_size):
                 idx_chunk = order[c_start : c_start + table_batch_size]
                 c_chunk = [corpus_tables[i] for i in idx_chunk]
-                X, col_mask, row_mask, cell_mask = self.model.forward_batch_cellwise(c_chunk)
+
+                try:
+                    X, col_mask, row_mask, cell_mask = self.model.forward_batch_cellwise(c_chunk)
+                    self._maybe_sync()
+                except Exception:
+                    print(
+                        f"[_corpus_scores] CRASHED during TABLE encoding, "
+                        f"corpus chunk starting at {c_start} ({len(c_chunk)} table(s)) "
+                        f"-- isolating which one ..."
+                    )
+                    self._isolate_table_encoding_failure(c_chunk)
+                    raise  # unreachable if isolation above found+raised the culprit
 
                 idx_tensor = torch.tensor(idx_chunk, dtype=torch.long)
                 for q_lo, q_hi, Q in query_chunks:
-                    cross = cross_score_queries_tables(
-                        self.scorer, self.scoring_mode, Q, X, row_mask, col_mask
-                    )  # [q_hi - q_lo, len(idx_chunk)]
-                    scores[q_lo:q_hi].index_copy_(1, idx_tensor, cross.to(scores.device))
+                    try:
+                        cross = cross_score_queries_tables(
+                            self.scorer, self.scoring_mode, Q, X, row_mask, col_mask
+                        )  # [q_hi - q_lo, len(idx_chunk)]
+                        scores[q_lo:q_hi].index_copy_(1, idx_tensor, cross.to(scores.device))
+                        self._maybe_sync()
+                    except Exception:
+                        print(
+                            f"[_corpus_scores] CRASHED during SCORING. "
+                            f"corpus chunk starting at {c_start} ({len(c_chunk)} table(s), "
+                            f"table_ids={[t.table_id for t in c_chunk][:5]!r}...), "
+                            f"query range [{q_lo}:{q_hi}], "
+                            f"Q shape={tuple(Q.shape)}, X shape={tuple(X.shape)}, "
+                            f"row_mask shape={tuple(row_mask.shape)}, col_mask shape={tuple(col_mask.shape)}, "
+                            f"scoring_mode={self.scoring_mode!r}"
+                        )
+                        raise
 
         return scores, positive_mask
 

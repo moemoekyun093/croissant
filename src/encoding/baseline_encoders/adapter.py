@@ -143,6 +143,38 @@ class BaselineCellwiseAdapter(nn.Module):
         rows = [[col.cells[r] for col in table.columns] for r in range(n_rows)]
         return headers, rows
 
+    @staticmethod
+    def _cache_key(table: Table) -> str:
+        """table_id ALONE is not a safe cache key -- scripts/
+        finetune_query_table.py::cap_columns() builds a NEW Table with
+        the SAME table_id but truncated `columns` (`table.columns[:max_columns]`)
+        for outlier-wide tables during TRAINING batch construction. If a
+        wide table gets cache-MISSED (and so cached) in its capped form
+        during training, then the SAME table_id shows up again during
+        VALIDATION scoring against the (uncapped) corpus -- table_id-only
+        keying would cache-HIT and hand back the capped tensor (fewer
+        columns) while the mask-building loop below iterates the real,
+        uncapped table.columns -- writing column indices past the capped
+        tensor's own width. That's a genuine CUDA
+        "index out of bounds" (IndexKernel.cu) crash, not a shape error
+        PyTorch catches cleanly, and it's asynchronous, so it doesn't
+        surface until whatever GPU call happens to sync next (confirmed:
+        this is what was actually causing the bert crashes previously
+        misattributed to index_copy_/masked_fill in trainer.py's
+        _corpus_scores -- those were just wherever the deferred error
+        happened to surface, not where it originated).
+
+        Including both column and row counts in the key (row count
+        SHOULD already be uniform across every call site via
+        SynSQLTableDataset's own max_rows, applied once at load time --
+        but there's no cap_columns-style per-call row truncation
+        currently, unlike columns) means a capped and an uncapped
+        version of the same table_id simply never collide -- each shape
+        variant gets its own cache entry instead of silently
+        overwriting/misreading the other's.
+        """
+        return f"{table.table_id}#c{len(table.columns)}#r{table.num_rows}"
+
     def forward_batch_cellwise(
         self, tables: list[Table], ablation: str | None = None, profile: bool = False
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -170,7 +202,7 @@ class BaselineCellwiseAdapter(nn.Module):
         cache_hit_indices = []
         cache_miss_indices = []
         for i, table in enumerate(tables):
-            if self.cacheable and table.table_id in self._table_cache:
+            if self.cacheable and self._cache_key(table) in self._table_cache:
                 cache_hit_indices.append(i)
             else:
                 cache_miss_indices.append(i)
@@ -187,7 +219,7 @@ class BaselineCellwiseAdapter(nn.Module):
             torch.cuda.synchronize()
         t_hits_0 = time.perf_counter()
         for i in cache_hit_indices:
-            raw_cell = self._table_cache[tables[i].table_id].to(device)
+            raw_cell = self._table_cache[self._cache_key(tables[i])].to(device)
             per_table_cell[i] = self.projection(raw_cell)
         if is_cuda:
             torch.cuda.synchronize()
@@ -248,7 +280,7 @@ class BaselineCellwiseAdapter(nn.Module):
                     encoding = encodings[miss_pos]
                     raw_cell = encoding.cell_embeddings.transpose(0, 1)
                     if self.cacheable:
-                        self._table_cache[tables[i].table_id] = raw_cell.detach().cpu()
+                        self._table_cache[self._cache_key(tables[i])] = raw_cell.detach().cpu()
                     per_table_cell[i] = self.projection(raw_cell)
             else:
                 if is_cuda:
@@ -262,7 +294,7 @@ class BaselineCellwiseAdapter(nn.Module):
                     # (column-major, our convention)
                     raw_cell = encoding.cell_embeddings.transpose(0, 1)
                     if self.cacheable:
-                        self._table_cache[tables[i].table_id] = raw_cell.detach().cpu()
+                        self._table_cache[self._cache_key(tables[i])] = raw_cell.detach().cpu()
                     per_table_cell[i] = self.projection(raw_cell)
                 if is_cuda:
                     torch.cuda.synchronize()
@@ -302,8 +334,26 @@ class BaselineCellwiseAdapter(nn.Module):
             X[b, :n, :m, :] = cell
             col_mask[b, :n] = 1.0
             row_mask[b, :m] = 1.0
+            # Bound c_idx/r_idx to the ENCODED cell tensor's own [n, m]
+            # dims. table.num_rows is the SHORTEST column (min over
+            # columns -- see Table.num_rows), and that's what the encoder
+            # used to build this table's rows, so the encoded tensor is
+            # n x m. But a RAGGED table (columns of unequal length -- real
+            # in the uncapped corpus) has longer columns whose extra cells
+            # have r_idx >= m. Writing those into cell_mask (sized max_m
+            # across the batch from these same encoded dims) indexes past
+            # the tensor -- the CUDA "IndexKernel.cu ... index out of
+            # bounds" device-side assert, which (being async) only
+            # surfaces later, e.g. in _corpus_scores' masked_fill. Those
+            # cells were never encoded and aren't real rows of the
+            # rectangular table, so drop them here, consistent with how
+            # row_mask/col_mask are built from n/m above.
             for c_idx, col in enumerate(table.columns):
+                if c_idx >= n:
+                    break
                 for r_idx, val in enumerate(col.cells):
+                    if r_idx >= m:
+                        break
                     if val.strip() != "":
                         nonnull_b.append(b)
                         nonnull_c.append(c_idx)

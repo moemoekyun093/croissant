@@ -131,11 +131,23 @@ class QueryEncoder(nn.Module):
                 ).to(device)
                 with torch.no_grad():
                     outputs = self.encoder(**enc)
-                attn = enc["attention_mask"]  # [U, Lmax_uncached]
+                # Move the whole batch GPU->CPU in a handful of transfers,
+                # then slice per query on the CPU side -- instead of the
+                # old per-query loop, which did (a) `attn[i].sum().item()`,
+                # a synchronizing device-to-host copy PER query just to get
+                # a length, plus (b) two more `.detach().cpu()` slices per
+                # query. That was ~3*U tiny synchronizing transfers for U
+                # uncached queries; this is 3 transfers total. .clone()
+                # copies each slice out of the moved block so cache entries
+                # stand alone and the block can be freed.
+                attn_cpu = enc["attention_mask"].detach().cpu()  # [U, Lmax], one D2H
+                hidden_cpu = outputs.last_hidden_state.detach().cpu()  # [U, Lmax, H], one D2H
+                ids_cpu = enc["input_ids"].detach().cpu()  # [U, Lmax], one D2H
+                true_lens = attn_cpu.sum(dim=1).tolist()  # per-query length, computed on CPU
                 for i, q in enumerate(uncached_unique):
-                    true_len = int(attn[i].sum().item())
-                    hidden_i = outputs.last_hidden_state[i, :true_len].detach().cpu()  # [true_len, H]
-                    ids_i = enc["input_ids"][i, :true_len].detach().cpu()  # [true_len]
+                    true_len = int(true_lens[i])
+                    hidden_i = hidden_cpu[i, :true_len].clone()  # [true_len, H]
+                    ids_i = ids_cpu[i, :true_len].clone()  # [true_len]
                     self._encoder_cache[q] = (hidden_i, ids_i)
 
             per_query = [self._encoder_cache[q] for q in queries]  # [(hidden[Li,H], ids[Li]), ...]

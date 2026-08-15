@@ -135,9 +135,18 @@ class TabbieTableEncoder(BaseTableEncoder):
             ).to(self.device)
             with torch.no_grad():
                 out = self.cell_encoder(**enc)
-            new_cls = out.last_hidden_state[:, 0, :]  # [len(uncached_unique), D]
-            for t, v in zip(uncached_unique, new_cls):
-                self._cell_cache[t] = v.detach().cpu()
+            # Move the WHOLE [N, D] block of new [CLS] vectors GPU->CPU in
+            # ONE transfer, then file each row into the cache from CPU --
+            # instead of `for ...: v.detach().cpu()`, which issued one
+            # separate (tiny, synchronizing) device-to-host copy PER cell
+            # (N of them every time new cells are seen, right on the hot
+            # cache-warming path). new_cls[i] is a view into the moved
+            # block; .clone() copies out just that one vector so each cache
+            # entry stands alone and the big block can be freed (cheap
+            # CPU-side copy, no transfer).
+            new_cls = out.last_hidden_state[:, 0, :].detach().cpu()  # [N, D], one D2H copy
+            for i, t in enumerate(uncached_unique):
+                self._cell_cache[t] = new_cls[i].clone()
 
         return torch.stack([self._cell_cache[t] for t in texts], dim=0).to(self.device)
 
@@ -253,10 +262,22 @@ class TabbieTableEncoder(BaseTableEncoder):
             torch.cuda.synchronize()
         t1 = time.perf_counter()
 
-        results: List[TableEncoding] = []
-        for (start, end), (n_rows, n_cols) in zip(per_table_offsets, per_table_shape):
-            cls = all_cls[start:end]
-            results.append(self._forward_from_cls(cls, n_rows, n_cols))
+        # Trainable row/column transformer stack, batched across the whole
+        # table batch instead of looped one table at a time. This used to
+        # be `for ...: results.append(self._forward_from_cls(cls, ...))` --
+        # one row-transformer + one col-transformer forward PER TABLE, per
+        # layer, i.e. ~2 * num_layers * len(tables) separate batch-of-a-few
+        # TransformerEncoderLayer launches every step (the "network on top"
+        # line in trainer.py's profiler -- ~45% of step time and almost
+        # entirely GPU underutilization: hundreds of tiny kernels with the
+        # GPU idle between them, not real compute). _forward_from_cls_batch
+        # groups same-shape tables and runs each group as ONE real batch,
+        # collapsing those hundreds of tiny launches into a handful of full
+        # ones. Numerically identical to the old per-table loop (a
+        # TransformerEncoderLayer applies independently per sequence, so
+        # stacking tables in the batch dim changes nothing but throughput).
+        cls_list = [all_cls[start:end] for (start, end) in per_table_offsets]
+        results: List[TableEncoding] = self._forward_from_cls_batch(cls_list, per_table_shape)
 
         if is_cuda:
             torch.cuda.synchronize()
@@ -310,3 +331,82 @@ class TabbieTableEncoder(BaseTableEncoder):
         table_emb = torch.cat([row_cls_final, col_cls_final], dim=0).mean(dim=0)
 
         return TableEncoding(cell_emb, row_emb, col_emb, table_emb)
+
+    def _forward_from_cls_batch(
+        self, cls_list: List[torch.Tensor], shapes: List[Tuple[int, int]]
+    ) -> List[TableEncoding]:
+        """Batched equivalent of calling _forward_from_cls once per table.
+
+        cls_list[i] is table i's flat cell/header [CLS] stack
+        ([(1+n_rows_i)*n_cols_i, D]); shapes[i] is its (n_rows_i,
+        n_cols_i). Returns one TableEncoding per input, in the SAME order.
+
+        Tables are grouped by identical (n_rows_total, n_cols) shape so
+        each group stacks into a real [G, ...] batch and runs the
+        row/column transformers ONCE for the whole group, instead of once
+        per table. No padding and no attention masks are involved -- only
+        exactly-same-shape tables share a batch -- so every table sees
+        precisely the computation _forward_from_cls did before (a
+        TransformerEncoderLayer is applied independently per sequence in
+        its batch dimension), just with the per-table Python loop and its
+        hundreds of tiny GPU launches collapsed into a few big ones. The
+        row/col positional-embedding lookup, clamp, CLS-token prepend,
+        row/col averaging, and final row/col-CLS mean pooling are all the
+        identical expressions used in _forward_from_cls; see that method
+        for the architecture rationale.
+        """
+        D = self.hidden_size
+        results: List[Optional[TableEncoding]] = [None] * len(cls_list)
+
+        # Bucket table indices by (n_rows_total, n_cols) -- only identical
+        # shapes can share a mask-free batch.
+        groups: dict[Tuple[int, int], List[int]] = {}
+        for i, (n_rows, n_cols) in enumerate(shapes):
+            groups.setdefault((n_rows + 1, n_cols), []).append(i)
+
+        for (n_rows_total, n_cols), idxs in groups.items():
+            G = len(idxs)
+            # [G, n_rows_total, n_cols, D]
+            x = torch.stack(
+                [cls_list[i].view(n_rows_total, n_cols, D) for i in idxs], dim=0
+            )
+
+            row_ids = torch.arange(min(n_rows_total, self.row_pos_embed.num_embeddings), device=self.device)
+            col_ids = torch.arange(min(n_cols, self.col_pos_embed.num_embeddings), device=self.device)
+            row_pos = self.row_pos_embed(row_ids.clamp(max=self.row_pos_embed.num_embeddings - 1))
+            col_pos = self.col_pos_embed(col_ids.clamp(max=self.col_pos_embed.num_embeddings - 1))
+            # broadcast over the batch (dim 0) as well as the row/col axes
+            x = x + row_pos.unsqueeze(0).unsqueeze(2) + col_pos.unsqueeze(0).unsqueeze(1)
+
+            row_cls_final = None
+            col_cls_final = None
+            for layer_idx in range(self.num_layers):
+                # --- row transformer: batch = (tables x rows), seq = [CLS_ROW, cell_0..cell_{C-1}]
+                row_input = x.reshape(G * n_rows_total, n_cols, D)
+                row_cls_tok = self.cls_row.view(1, 1, -1).expand(G * n_rows_total, 1, -1)
+                row_input = torch.cat([row_cls_tok, row_input], dim=1)
+                row_out = self.row_layers[layer_idx](row_input)
+                row_cls_final = row_out[:, 0, :].reshape(G, n_rows_total, D)
+                row_ctx_cells = row_out[:, 1:, :].reshape(G, n_rows_total, n_cols, D)
+
+                # --- column transformer: batch = (tables x cols), seq = [CLS_COL, cell_0..cell_{R-1}]
+                x_by_col = x.transpose(1, 2)  # [G, C, 1+R, D]
+                col_input = x_by_col.reshape(G * n_cols, n_rows_total, D)
+                col_cls_tok = self.cls_col.view(1, 1, -1).expand(G * n_cols, 1, -1)
+                col_input = torch.cat([col_cls_tok, col_input], dim=1)
+                col_out = self.col_layers[layer_idx](col_input)
+                col_cls_final = col_out[:, 0, :].reshape(G, n_cols, D)
+                col_ctx_cells = col_out[:, 1:, :].reshape(G, n_cols, n_rows_total, D).transpose(1, 2)
+
+                x = (row_ctx_cells + col_ctx_cells) / 2.0
+
+            for g, i in enumerate(idxs):
+                rcf = row_cls_final[g]  # [1+n_rows, D]
+                ccf = col_cls_final[g]  # [n_cols, D]
+                cell_emb = x[g, 1:]  # [n_rows, n_cols, D]
+                row_emb = rcf[1:]  # [n_rows, D], header row excluded
+                col_emb = ccf  # [n_cols, D]
+                table_emb = torch.cat([rcf, ccf], dim=0).mean(dim=0)
+                results[i] = TableEncoding(cell_emb, row_emb, col_emb, table_emb)
+
+        return results  # type: ignore[return-value]

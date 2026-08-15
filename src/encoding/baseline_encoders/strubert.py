@@ -166,8 +166,15 @@ class StruBertTableEncoder(BaseTableEncoder):
             fine_mask[:, 0, :] = 0.0
             new_fine = (hidden * fine_mask).sum(dim=1) / fine_mask.sum(dim=1).clamp(min=1.0)
             new_coarse = hidden[:, 0, :]
-            for t, f, c in zip(uncached_unique, new_fine, new_coarse):
-                self._seq_cache[t] = (f.detach().cpu(), c.detach().cpu())
+            # Move both [N, D] blocks GPU->CPU in ONE transfer each, then
+            # index -- instead of `for ...: f.detach().cpu(), c.detach().cpu()`,
+            # which fired TWO tiny (synchronizing) device-to-host copies
+            # PER sequence string. .clone() copies each row out so entries
+            # stand alone and the blocks can be freed (cheap CPU-side).
+            new_fine_cpu = new_fine.detach().cpu()  # [N, D], one D2H copy
+            new_coarse_cpu = new_coarse.detach().cpu()  # [N, D], one D2H copy
+            for i, t in enumerate(uncached_unique):
+                self._seq_cache[t] = (new_fine_cpu[i].clone(), new_coarse_cpu[i].clone())
 
         fine = torch.stack([self._seq_cache[t][0] for t in seq_texts], dim=0).to(self.device)
         coarse = torch.stack([self._seq_cache[t][1] for t in seq_texts], dim=0).to(self.device)

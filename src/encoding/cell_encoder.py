@@ -142,9 +142,15 @@ class TextEmbedder(nn.Module):
                 self._encode_chunk_raw(uncached_unique[i : i + self.max_batch_size])
                 for i in range(0, len(uncached_unique), self.max_batch_size)
             ]
-            new_hidden = torch.cat(chunks, dim=0)
-            for c, h in zip(uncached_unique, new_hidden):
-                self._cache[c] = h.detach().cpu()
+            # Move the whole [N, half_k] block GPU->CPU in ONE transfer,
+            # then index it -- instead of `for ...: h.detach().cpu()`,
+            # which fired one tiny (synchronizing) device-to-host copy PER
+            # cell string. .clone() copies each row out of the moved block
+            # so entries stand alone and the block can be freed (cheap
+            # CPU-side, no transfer).
+            new_hidden = torch.cat(chunks, dim=0).detach().cpu()  # [N, half_k], one D2H copy
+            for i, c in enumerate(uncached_unique):
+                self._cache[c] = new_hidden[i].clone()
 
         # gather in ORIGINAL requested order -- preserves duplicates
         # correctly, including duplicates within this same call
@@ -313,8 +319,23 @@ class CellEncoder(nn.Module):
         nonnull_r: list[int] = []
 
         for t_idx, table in enumerate(tables):
+            # num_rows is the SHORTEST column (min over columns, see
+            # Table.num_rows), and m_list/max_m/row_mask above are built
+            # from it -- so the grid is [max_n, max_m] with max_m derived
+            # from num_rows. A RAGGED table (columns of unequal length --
+            # real in the uncapped corpus) has longer columns whose extra
+            # cells have row_idx >= num_rows >= that table's max_m slot.
+            # Collecting them would scatter into X[ct,cc,cr] and
+            # cell_mask[nnt,nnc,nnr] at cr/nnr past max_m -- the CUDA
+            # "IndexKernel.cu ... index out of bounds" device-side assert
+            # (async, so it surfaces later, e.g. in _corpus_scores'
+            # masked_fill). They aren't real rows of the rectangular
+            # table, so drop them, consistent with num_rows/row_mask.
+            n_rows_t = table.num_rows
             for col_idx, column in enumerate(table.columns):
                 for row_idx, cell in enumerate(column.cells):
+                    if row_idx >= n_rows_t:
+                        break
                     if cell.strip() != "":
                         nonnull_t.append(t_idx)
                         nonnull_c.append(col_idx)
