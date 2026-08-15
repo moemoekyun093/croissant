@@ -265,6 +265,73 @@ class StruBertTableEncoder(BaseTableEncoder):
 
         return TableEncoding(cell_emb, row_refined, col_refined, table_emb)
 
+    def _forward_from_pooled_batch(
+        self,
+        col_fine_l: List[torch.Tensor],
+        col_coarse_l: List[torch.Tensor],
+        row_fine_l: List[torch.Tensor],
+        row_coarse_l: List[torch.Tensor],
+    ) -> List[TableEncoding]:
+        """Batched equivalent of calling _forward_from_pooled once per table.
+
+        The trainable vertical/horizontal self-attention stacks used to run
+        once PER TABLE ([1, n_cols, D] and [1, n_rows, D] each) -- with
+        diverse table shapes that's ~2 tiny, GPU-underutilized attention
+        launches per table per step (the `network on top` profiler cost).
+        Here every table's column embeddings are padded to the batch-max
+        n_cols and run through vertical_attn ONCE for all tables (with a
+        src_key_padding_mask so each table attends only over its own real
+        columns), and likewise all rows through horizontal_attn.
+
+        Numerically identical to _forward_from_pooled on every real
+        position: these are plain (positionless) self-attention stacks, so
+        masked padded keys get exactly-zero attention weight and never
+        affect a real column's/row's refined vector; the mean-pools below
+        are taken over each table's real n_cols/n_rows only. coarse vectors
+        never enter attention (only their mean is used), so they stay
+        per-table.
+        """
+        T = len(col_fine_l)
+        D = self.hidden_size
+        dev = self.device
+        n_cols_l = [t.shape[0] for t in col_fine_l]
+        n_rows_l = [t.shape[0] for t in row_fine_l]
+        maxC = max(n_cols_l)
+        maxR = max(n_rows_l)
+
+        col_pad = torch.zeros(T, maxC, D, device=dev)
+        row_pad = torch.zeros(T, maxR, D, device=dev)
+        col_key_pad = torch.ones(T, maxC, dtype=torch.bool, device=dev)  # True == ignore
+        row_key_pad = torch.ones(T, maxR, dtype=torch.bool, device=dev)
+        for i in range(T):
+            nc, nr = n_cols_l[i], n_rows_l[i]
+            col_pad[i, :nc] = col_fine_l[i]
+            row_pad[i, :nr] = row_fine_l[i]
+            col_key_pad[i, :nc] = False
+            row_key_pad[i, :nr] = False
+
+        col_refined_all = self.vertical_attn(col_pad, src_key_padding_mask=col_key_pad)  # [T, maxC, D]
+        row_refined_all = self.horizontal_attn(row_pad, src_key_padding_mask=row_key_pad)  # [T, maxR, D]
+
+        results: List[TableEncoding] = []
+        for i in range(T):
+            nc, nr = n_cols_l[i], n_rows_l[i]
+            col_refined = col_refined_all[i, :nc]  # [n_cols, D]
+            row_refined = row_refined_all[i, :nr]  # [n_rows, D]
+            cell_emb = (row_refined.unsqueeze(1) + col_refined.unsqueeze(0)) / 2.0  # [R, C, D]
+            four_features = torch.cat(
+                [
+                    row_refined.mean(0),
+                    col_refined.mean(0),
+                    row_coarse_l[i].mean(0),
+                    col_coarse_l[i].mean(0),
+                ],
+                dim=-1,
+            )
+            table_emb = self.fuse_proj(four_features)
+            results.append(TableEncoding(cell_emb, row_refined, col_refined, table_emb))
+        return results
+
     def forward(
         self,
         headers: Sequence[str],
@@ -343,16 +410,15 @@ class StruBertTableEncoder(BaseTableEncoder):
             torch.cuda.synchronize()
         t1 = time.perf_counter()
 
-        results: List[TableEncoding] = []
-        for (c_start, c_end), (r_start, r_end) in zip(col_offsets, row_offsets):
-            results.append(
-                self._forward_from_pooled(
-                    all_col_fine[c_start:c_end],
-                    all_col_coarse[c_start:c_end],
-                    all_row_fine[r_start:r_end],
-                    all_row_coarse[r_start:r_end],
-                )
-            )
+        # Trainable stack (vertical/horizontal attn + fuse), batched across
+        # ALL tables in one call per attention stack instead of the old
+        # per-table loop -- see _forward_from_pooled_batch.
+        results = self._forward_from_pooled_batch(
+            [all_col_fine[c0:c1] for (c0, c1) in col_offsets],
+            [all_col_coarse[c0:c1] for (c0, c1) in col_offsets],
+            [all_row_fine[r0:r1] for (r0, r1) in row_offsets],
+            [all_row_coarse[r0:r1] for (r0, r1) in row_offsets],
+        )
 
         if is_cuda:
             torch.cuda.synchronize()

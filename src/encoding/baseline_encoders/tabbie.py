@@ -341,72 +341,108 @@ class TabbieTableEncoder(BaseTableEncoder):
         ([(1+n_rows_i)*n_cols_i, D]); shapes[i] is its (n_rows_i,
         n_cols_i). Returns one TableEncoding per input, in the SAME order.
 
-        Tables are grouped by identical (n_rows_total, n_cols) shape so
-        each group stacks into a real [G, ...] batch and runs the
-        row/column transformers ONCE for the whole group, instead of once
-        per table. No padding and no attention masks are involved -- only
-        exactly-same-shape tables share a batch -- so every table sees
-        precisely the computation _forward_from_cls did before (a
-        TransformerEncoderLayer is applied independently per sequence in
-        its batch dimension), just with the per-table Python loop and its
-        hundreds of tiny GPU launches collapsed into a few big ones. The
-        row/col positional-embedding lookup, clamp, CLS-token prepend,
-        row/col averaging, and final row/col-CLS mean pooling are all the
-        identical expressions used in _forward_from_cls; see that method
-        for the architecture rationale.
+        FULLY batched across the whole table batch: every table is padded
+        to the batch-max (n_rows_total, n_cols) grid and the row/column
+        transformers run ONCE per layer for ALL tables together, with a
+        src_key_padding_mask so each table attends only over its own real
+        rows/cols. This replaces both the old per-table Python loop AND the
+        earlier group-by-exact-shape version -- with diverse table shapes,
+        exact-shape grouping degrades to ~one tiny transformer call per
+        table (hundreds of underutilized GPU launches per step, the
+        `network on top` profiler cost). Padding to a common shape lets all
+        of them ride one big, well-utilized call instead.
+
+        Numerically identical to _forward_from_cls on every real position:
+        a TransformerEncoderLayer applies independently per sequence, and
+        masked keys get exactly-zero attention weight, so a padded column
+        or row never contributes to any real cell's / CLS's output;
+        LayerNorm and the FFN are per-position, so padded positions
+        (discarded at the end) can't perturb real ones. Positional-embedding
+        lookup/clamp, CLS-token prepend, row/col averaging, and the final
+        row/col-CLS mean pooling are the same expressions as
+        _forward_from_cls; see it for the architecture rationale.
         """
         D = self.hidden_size
-        results: List[Optional[TableEncoding]] = [None] * len(cls_list)
+        dev = self.device
+        T = len(cls_list)
 
-        # Bucket table indices by (n_rows_total, n_cols) -- only identical
-        # shapes can share a mask-free batch.
-        groups: dict[Tuple[int, int], List[int]] = {}
-        for i, (n_rows, n_cols) in enumerate(shapes):
-            groups.setdefault((n_rows + 1, n_cols), []).append(i)
+        n_rows_total = [r + 1 for (r, _c) in shapes]  # +1 header row, matches _forward_from_cls
+        n_cols_l = [c for (_r, c) in shapes]
+        maxR = max(n_rows_total)
+        maxC = max(n_cols_l)
 
-        for (n_rows_total, n_cols), idxs in groups.items():
-            G = len(idxs)
-            # [G, n_rows_total, n_cols, D]
-            x = torch.stack(
-                [cls_list[i].view(n_rows_total, n_cols, D) for i in idxs], dim=0
-            )
+        # Padded cell grid [T, maxR, maxC, D]; each table placed at [i, :nrt, :nc].
+        x = torch.zeros(T, maxR, maxC, D, device=dev)
+        for i in range(T):
+            nrt, nc = n_rows_total[i], n_cols_l[i]
+            x[i, :nrt, :nc] = cls_list[i].view(nrt, nc, D)
 
-            row_ids = torch.arange(min(n_rows_total, self.row_pos_embed.num_embeddings), device=self.device)
-            col_ids = torch.arange(min(n_cols, self.col_pos_embed.num_embeddings), device=self.device)
-            row_pos = self.row_pos_embed(row_ids.clamp(max=self.row_pos_embed.num_embeddings - 1))
-            col_pos = self.col_pos_embed(col_ids.clamp(max=self.col_pos_embed.num_embeddings - 1))
-            # broadcast over the batch (dim 0) as well as the row/col axes
-            x = x + row_pos.unsqueeze(0).unsqueeze(2) + col_pos.unsqueeze(0).unsqueeze(1)
+        # Positional embeddings added to every position (padded ones are
+        # masked as keys and discarded as outputs, so they don't matter).
+        # Same clamp as _forward_from_cls -- a no-op while shapes stay
+        # within max_rows/max_cols, kept for parity.
+        row_ids = torch.arange(maxR, device=dev).clamp(max=self.row_pos_embed.num_embeddings - 1)
+        col_ids = torch.arange(maxC, device=dev).clamp(max=self.col_pos_embed.num_embeddings - 1)
+        row_pos = self.row_pos_embed(row_ids)  # [maxR, D]
+        col_pos = self.col_pos_embed(col_ids)  # [maxC, D]
+        x = x + row_pos.view(1, maxR, 1, D) + col_pos.view(1, 1, maxC, D)
 
-            row_cls_final = None
-            col_cls_final = None
-            for layer_idx in range(self.num_layers):
-                # --- row transformer: batch = (tables x rows), seq = [CLS_ROW, cell_0..cell_{C-1}]
-                row_input = x.reshape(G * n_rows_total, n_cols, D)
-                row_cls_tok = self.cls_row.view(1, 1, -1).expand(G * n_rows_total, 1, -1)
-                row_input = torch.cat([row_cls_tok, row_input], dim=1)
-                row_out = self.row_layers[layer_idx](row_input)
-                row_cls_final = row_out[:, 0, :].reshape(G, n_rows_total, D)
-                row_ctx_cells = row_out[:, 1:, :].reshape(G, n_rows_total, n_cols, D)
+        # Per-table validity, and a [T, maxR, maxC, 1] gate to keep padded
+        # cells at exactly zero between layers (defensive: masked keys with
+        # a non-finite value could otherwise poison a real output via
+        # 0*inf; zeroing guarantees they stay finite).
+        rows_valid = torch.zeros(T, maxR, dtype=torch.bool, device=dev)
+        cols_valid = torch.zeros(T, maxC, dtype=torch.bool, device=dev)
+        for i in range(T):
+            rows_valid[i, : n_rows_total[i]] = True
+            cols_valid[i, : n_cols_l[i]] = True
+        cell_gate = (rows_valid.unsqueeze(2) & cols_valid.unsqueeze(1)).unsqueeze(-1).float()
+        x = x * cell_gate
 
-                # --- column transformer: batch = (tables x cols), seq = [CLS_COL, cell_0..cell_{R-1}]
-                x_by_col = x.transpose(1, 2)  # [G, C, 1+R, D]
-                col_input = x_by_col.reshape(G * n_cols, n_rows_total, D)
-                col_cls_tok = self.cls_col.view(1, 1, -1).expand(G * n_cols, 1, -1)
-                col_input = torch.cat([col_cls_tok, col_input], dim=1)
-                col_out = self.col_layers[layer_idx](col_input)
-                col_cls_final = col_out[:, 0, :].reshape(G, n_cols, D)
-                col_ctx_cells = col_out[:, 1:, :].reshape(G, n_cols, n_rows_total, D).transpose(1, 2)
+        # key_padding_mask (True == ignore). CLS token (position 0) is never
+        # masked. Row transformer seq = [CLS_ROW, col_0..col_{maxC-1}] ->
+        # mask padded columns; same for every row of a table. Column
+        # transformer seq = [CLS_COL, row_0..row_{maxR-1}] -> mask padded rows.
+        row_key_pad = torch.zeros(T, 1 + maxC, dtype=torch.bool, device=dev)
+        row_key_pad[:, 1:] = ~cols_valid
+        row_key_pad = row_key_pad.unsqueeze(1).expand(T, maxR, 1 + maxC).reshape(T * maxR, 1 + maxC)
 
-                x = (row_ctx_cells + col_ctx_cells) / 2.0
+        col_key_pad = torch.zeros(T, 1 + maxR, dtype=torch.bool, device=dev)
+        col_key_pad[:, 1:] = ~rows_valid
+        col_key_pad = col_key_pad.unsqueeze(1).expand(T, maxC, 1 + maxR).reshape(T * maxC, 1 + maxR)
 
-            for g, i in enumerate(idxs):
-                rcf = row_cls_final[g]  # [1+n_rows, D]
-                ccf = col_cls_final[g]  # [n_cols, D]
-                cell_emb = x[g, 1:]  # [n_rows, n_cols, D]
-                row_emb = rcf[1:]  # [n_rows, D], header row excluded
-                col_emb = ccf  # [n_cols, D]
-                table_emb = torch.cat([rcf, ccf], dim=0).mean(dim=0)
-                results[i] = TableEncoding(cell_emb, row_emb, col_emb, table_emb)
+        row_cls_final = None
+        col_cls_final = None
+        for layer_idx in range(self.num_layers):
+            # --- row transformer: batch = (tables x rows), seq = [CLS_ROW, cells across cols]
+            row_input = x.reshape(T * maxR, maxC, D)
+            row_cls_tok = self.cls_row.view(1, 1, -1).expand(T * maxR, 1, -1)
+            row_input = torch.cat([row_cls_tok, row_input], dim=1)  # [T*maxR, 1+maxC, D]
+            row_out = self.row_layers[layer_idx](row_input, src_key_padding_mask=row_key_pad)
+            row_cls_final = row_out[:, 0, :].reshape(T, maxR, D)
+            row_ctx_cells = row_out[:, 1:, :].reshape(T, maxR, maxC, D)
+
+            # --- column transformer: batch = (tables x cols), seq = [CLS_COL, cells across rows]
+            x_by_col = x.transpose(1, 2)  # [T, maxC, maxR, D]
+            col_input = x_by_col.reshape(T * maxC, maxR, D)
+            col_cls_tok = self.cls_col.view(1, 1, -1).expand(T * maxC, 1, -1)
+            col_input = torch.cat([col_cls_tok, col_input], dim=1)  # [T*maxC, 1+maxR, D]
+            col_out = self.col_layers[layer_idx](col_input, src_key_padding_mask=col_key_pad)
+            col_cls_final = col_out[:, 0, :].reshape(T, maxC, D)
+            col_ctx_cells = col_out[:, 1:, :].reshape(T, maxC, maxR, D).transpose(1, 2)  # [T, maxR, maxC, D]
+
+            x = (row_ctx_cells + col_ctx_cells) / 2.0
+            x = x * cell_gate  # keep padded cells at zero for the next layer
+
+        results: List[Optional[TableEncoding]] = [None] * T
+        for i in range(T):
+            nrt, nc = n_rows_total[i], n_cols_l[i]
+            rcf = row_cls_final[i, :nrt]  # [1+n_rows, D]
+            ccf = col_cls_final[i, :nc]  # [n_cols, D]
+            cell_emb = x[i, 1:nrt, :nc]  # [n_rows, n_cols, D]
+            row_emb = rcf[1:]  # [n_rows, D], header row excluded
+            col_emb = ccf  # [n_cols, D]
+            table_emb = torch.cat([rcf, ccf], dim=0).mean(dim=0)
+            results[i] = TableEncoding(cell_emb, row_emb, col_emb, table_emb)
 
         return results  # type: ignore[return-value]
