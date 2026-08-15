@@ -95,6 +95,40 @@ def latest_checkpoint(checkpoint_dir: str) -> str | None:
     return max(paths, key=epoch_num)
 
 
+def _safe_load_cache(load_fn, path: str, label: str) -> bool:
+    """Wraps a *.load_*cache(path) call so a corrupted cache file can't
+    crash the whole training launch. Root cause seen in practice: a
+    training process killed mid torch.save() (e.g. SIGKILL from a
+    relaunch/restart) leaves a truncated .pt file -- torch.load then
+    raises a RuntimeError ("PytorchStreamReader failed locating file ...
+    internal miniz error") deep inside torch's own unpickler, which
+    previously propagated straight out of this script before training
+    even started (a corrupted CACHE file was blocking an otherwise-fine
+    run). On a load failure: renames the bad file aside to
+    '<path>.corrupted' (so it's not silently lost/inspectable later, and
+    so it stops being picked up as "exists" on the NEXT launch too) and
+    continues with an empty cache -- exactly as if the file had never
+    existed, just slower on the first pass while it rebuilds. Returns
+    True if the load actually succeeded.
+    """
+    try:
+        load_fn(path)
+        return True
+    except Exception as e:
+        corrupted_path = path + ".corrupted"
+        print(
+            f"WARNING: failed to load {label} cache from {path!r} "
+            f"({type(e).__name__}: {e}) -- treating as if it doesn't "
+            f"exist and continuing with an empty cache. Moving the bad "
+            f"file to {corrupted_path!r} so it isn't picked up again."
+        )
+        try:
+            os.replace(path, corrupted_path)
+        except OSError as move_err:
+            print(f"  (also failed to move the corrupted file aside: {move_err})")
+        return False
+
+
 def build_table_model(args):
     if args.encoder == "ours":
         cell_encoder = CellEncoder(
@@ -428,8 +462,8 @@ if __name__ == "__main__":
     # for them -- guard on --encoder ours accordingly.
     if args.encoder == "ours" and os.path.exists(args.text_cache_path):
         print(f"loading cell/header text cache from {args.text_cache_path} ...")
-        model.load_text_cache(args.text_cache_path)
-        print(f"text cache warm-started with {model.cell_encoder.text_embedder.cache_size()} entries")
+        if _safe_load_cache(model.load_text_cache, args.text_cache_path, "text"):
+            print(f"text cache warm-started with {model.cell_encoder.text_embedder.cache_size()} entries")
 
     # Table-embedding cache: only meaningful for the two fully-frozen
     # baselines (bert/tapas -- see adapter.py's _FULLY_FROZEN_ENCODERS /
@@ -442,8 +476,8 @@ if __name__ == "__main__":
     # on scoring_mode at all -- can be reused here directly.
     if args.encoder in ("bert", "tapas") and os.path.exists(args.table_cache_path):
         print(f"loading table-embedding cache from {args.table_cache_path} ...")
-        model.load_table_cache(args.table_cache_path)
-        print(f"table cache warm-started with {len(model._table_cache)} entries")
+        if _safe_load_cache(model.load_table_cache, args.table_cache_path, "table"):
+            print(f"table cache warm-started with {len(model._table_cache)} entries")
 
     # Frozen-substep cache: tabbie/strubert can't cache their FINAL table
     # embedding (see --frozen_cache_path's help text), but the frozen
@@ -453,9 +487,9 @@ if __name__ == "__main__":
     # StruBertTableEncoder instance inside the adapter.
     if args.encoder in ("tabbie", "strubert") and os.path.exists(args.frozen_cache_path):
         print(f"loading frozen-substep cache from {args.frozen_cache_path} ...")
-        model.baseline_encoder.load_frozen_cache(args.frozen_cache_path)
-        cache_attr = "_cell_cache" if args.encoder == "tabbie" else "_seq_cache"
-        print(f"frozen cache warm-started with {len(getattr(model.baseline_encoder, cache_attr))} entries")
+        if _safe_load_cache(model.baseline_encoder.load_frozen_cache, args.frozen_cache_path, "frozen-substep"):
+            cache_attr = "_cell_cache" if args.encoder == "tabbie" else "_seq_cache"
+            print(f"frozen cache warm-started with {len(getattr(model.baseline_encoder, cache_attr))} entries")
 
     # Resume from an existing checkpoint if this encoder's pretrain_dir
     # already has one -- e.g. a previous run of this exact command was
@@ -725,8 +759,8 @@ if __name__ == "__main__":
     # while running a totally different encoder.
     if not args.query_trainable and os.path.exists(args.query_cache_path):
         print(f"loading query cache from {args.query_cache_path} ...")
-        query_encoder.load_frozen_cache(args.query_cache_path)
-        print(f"query cache warm-started with {len(query_encoder._encoder_cache)} entries")
+        if _safe_load_cache(query_encoder.load_frozen_cache, args.query_cache_path, "query"):
+            print(f"query cache warm-started with {len(query_encoder._encoder_cache)} entries")
 
     def save_all_caches() -> None:
         """Called every time val MAP improves (see fit()'s on_checkpoint)
@@ -783,7 +817,30 @@ if __name__ == "__main__":
         print(f"found {finetune_resume_ckpt} but --skip_finetune_resume was passed -- starting finetuning fresh")
         finetune_resume_ckpt = None
     else:
-        print(f"found existing finetune checkpoint, resuming from {finetune_resume_ckpt}")
+        # Validate the file loads BEFORE handing it to finetuner.fit()
+        # (which calls load_checkpoint deep inside its own resume logic)
+        # -- same corrupted-checkpoint concern as _safe_load_cache above
+        # (e.g. a process killed mid torch.save() leaves a truncated
+        # file). A failure here just means "start finetuning fresh",
+        # same as if the file never existed, instead of crashing the
+        # whole launch before any training happens.
+        import torch as _torch
+        try:
+            _torch.load(finetune_resume_ckpt, map_location="cpu")
+            print(f"found existing finetune checkpoint, resuming from {finetune_resume_ckpt}")
+        except Exception as e:
+            corrupted_path = finetune_resume_ckpt + ".corrupted"
+            print(
+                f"WARNING: failed to load finetune checkpoint from "
+                f"{finetune_resume_ckpt!r} ({type(e).__name__}: {e}) -- "
+                f"starting finetuning fresh instead of resuming. Moving "
+                f"the bad file to {corrupted_path!r}."
+            )
+            try:
+                os.replace(finetune_resume_ckpt, corrupted_path)
+            except OSError as move_err:
+                print(f"  (also failed to move the corrupted file aside: {move_err})")
+            finetune_resume_ckpt = None
 
     print(f"\n=== [{args.encoder}] stage 2/2: finetuning on {args.device} (scoring_mode={args.scoring_mode}, patience={args.patience}) ===")
     best_val_map = finetuner.fit(
