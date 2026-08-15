@@ -258,6 +258,19 @@ if __name__ == "__main__":
              "<checkpoint_dir>/<encoder>/text_cache.pt, loaded before "
              "pretraining if it already exists and saved after both stages.",
     )
+    parser.add_argument(
+        "--table_cache_path", default=None,
+        help="only meaningful for --encoder bert/tapas (the two fully-"
+             "frozen baselines, see adapter.py's _FULLY_FROZEN_ENCODERS) "
+             "-- persists BaselineCellwiseAdapter._table_cache (every "
+             "table's raw cell embeddings, deterministic for a frozen "
+             "encoder) to disk, so a table already encoded by ANY past "
+             "run never needs its backbone forward pass re-run again. "
+             "Defaults to <checkpoint_dir>/<encoder>/table_cache.pt, "
+             "loaded before finetuning if it already exists and saved "
+             "after finetuning. Delete it if --model_name or the cell "
+             "serialization convention changes.",
+    )
 
     # model.yaml has no key collisions with anything else, so the
     # generic multi-file merge is fine for it.
@@ -315,6 +328,8 @@ if __name__ == "__main__":
 
     if args.text_cache_path is None:
         args.text_cache_path = os.path.join(encoder_checkpoint_dir, "text_cache.pt")
+    if args.table_cache_path is None:
+        args.table_cache_path = os.path.join(encoder_checkpoint_dir, "table_cache.pt")
 
     rng = random.Random(args.seed)
 
@@ -349,6 +364,20 @@ if __name__ == "__main__":
         print(f"loading cell/header text cache from {args.text_cache_path} ...")
         model.load_text_cache(args.text_cache_path)
         print(f"text cache warm-started with {model.cell_encoder.text_embedder.cache_size()} entries")
+
+    # Table-embedding cache: only meaningful for the two fully-frozen
+    # baselines (bert/tapas -- see adapter.py's _FULLY_FROZEN_ENCODERS /
+    # BaselineCellwiseAdapter.cacheable's docstring for why ONLY these
+    # two are safe to cache across whole runs, not tabbie/strubert/turl/
+    # hytrel). A table's raw cell embeddings are a deterministic
+    # function of frozen weights for these two, so a cache built by any
+    # PAST run -- pretraining, a previous finetuning attempt, even a
+    # different scoring_mode sweep, since table embeddings don't depend
+    # on scoring_mode at all -- can be reused here directly.
+    if args.encoder in ("bert", "tapas") and os.path.exists(args.table_cache_path):
+        print(f"loading table-embedding cache from {args.table_cache_path} ...")
+        model.load_table_cache(args.table_cache_path)
+        print(f"table cache warm-started with {len(model._table_cache)} entries")
 
     # Resume from an existing checkpoint if this encoder's pretrain_dir
     # already has one -- e.g. a previous run of this exact command was
@@ -444,6 +473,13 @@ if __name__ == "__main__":
             print(
                 f"saved text cache ({model.cell_encoder.text_embedder.cache_size()} entries) "
                 f"to {args.text_cache_path} after pretraining"
+            )
+        if args.encoder in ("bert", "tapas"):
+            os.makedirs(os.path.dirname(args.table_cache_path) or ".", exist_ok=True)
+            model.save_table_cache(args.table_cache_path)
+            print(
+                f"saved table cache ({len(model._table_cache)} entries) "
+                f"to {args.table_cache_path} after pretraining"
             )
 
         ckpt = latest_checkpoint(pretrain_dir)
@@ -675,6 +711,14 @@ if __name__ == "__main__":
             f"[{args.encoder}] saved text cache "
             f"({model.cell_encoder.text_embedder.cache_size()} entries) "
             f"to {args.text_cache_path} after finetuning"
+        )
+    if args.encoder in ("bert", "tapas"):
+        os.makedirs(os.path.dirname(args.table_cache_path) or ".", exist_ok=True)
+        model.save_table_cache(args.table_cache_path)
+        print(
+            f"[{args.encoder}] saved table cache "
+            f"({len(model._table_cache)} entries) "
+            f"to {args.table_cache_path} after finetuning"
         )
 
     print(f"\n[{args.encoder}] training complete.")

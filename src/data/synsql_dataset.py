@@ -136,6 +136,7 @@ class SynSQLTableDataset:
         max_rows: int = 50,
         seed: int = 42,
         db_id_key: str = "db_id",
+        schema_cache_path: str | None = None,
     ):
         """
         databases_root: root of the databases/<db_id>/<db_id>.sqlite tree.
@@ -148,10 +149,26 @@ class SynSQLTableDataset:
                         actually required for anything else here (see
                         module docstring for why its column_names field
                         specifically is NOT used).
+        schema_cache_path: where a persisted {db_id: [table_names]} map
+                        (built from real sqlite_master reads) is cached
+                        as JSON, so a later process doesn't have to
+                        open() every single database's SQLite file all
+                        over again just to list its tables -- see
+                        _table_names()/save_schema_cache()'s docstrings
+                        for the full rationale. Especially significant
+                        when databases_root is a network-mounted path
+                        (e.g. NAS): each sqlite3.connect() + schema query
+                        is a real network round trip, and there's one per
+                        UNIQUE db_id (thousands at real dataset scale),
+                        paid again on every fresh process launch unless
+                        this is cached. Defaults to a sibling file next
+                        to databases_root. Delete the cache file if the
+                        underlying databases' schemas ever change.
         """
         self.databases_root = databases_root
         self.max_rows = max_rows
         self._rng = random.Random(seed)
+        self.schema_cache_path = schema_cache_path or f"{databases_root.rstrip('/')}.schema_cache.json"
 
         if tables_json is not None:
             with open(tables_json, "r", encoding="utf-8") as f:
@@ -176,6 +193,15 @@ class SynSQLTableDataset:
 
         self._conn_cache: dict[str, sqlite3.Connection] = {}
         self._table_names_cache: dict[str, list[str]] = {}
+        if os.path.exists(self.schema_cache_path):
+            print(
+                f"[SynSQLTableDataset] loading schema cache from "
+                f"{self.schema_cache_path!r} (skips live sqlite_master "
+                f"reads for every db_id already in it) ..."
+            )
+            with open(self.schema_cache_path, "r", encoding="utf-8") as f:
+                self._table_names_cache = json.load(f)
+            print(f"[SynSQLTableDataset] loaded schema for {len(self._table_names_cache)} database(s) from cache")
         self._column_names_cache: dict[tuple[str, str], list[str]] = {}
         self._foreign_key_columns_cache: dict[tuple[str, str], set[str]] = {}
         # Materialized-table cache (real sampled row DATA, not just
@@ -226,6 +252,27 @@ class SynSQLTableDataset:
             )
             self._table_names_cache[db_id] = [r[0] for r in cur.fetchall()]
         return self._table_names_cache[db_id]
+
+    def save_schema_cache(self) -> None:
+        """Persist self._table_names_cache (db_id -> real table names,
+        each entry populated by a live sqlite_master read the first time
+        that db_id was needed -- see _table_names()) to
+        self.schema_cache_path, so a future process can load it directly
+        in __init__ instead of re-opening every one of those SQLite files
+        again. No-op if nothing's been populated yet (e.g. called before
+        anything triggered a schema lookup). Safe to call repeatedly --
+        e.g. SynSQLQueryDataset calls this once after resolving every
+        example, which is exactly when this cache is most complete."""
+        if not self._table_names_cache:
+            return
+        os.makedirs(os.path.dirname(self.schema_cache_path) or ".", exist_ok=True)
+        with open(self.schema_cache_path, "w", encoding="utf-8") as f:
+            json.dump(self._table_names_cache, f)
+        print(
+            f"[SynSQLTableDataset] cached schema for "
+            f"{len(self._table_names_cache)} database(s) to "
+            f"{self.schema_cache_path} (future runs skip these sqlite_master reads)"
+        )
 
     def _column_names(self, db_id: str, table_name: str) -> list[str]:
         """Real column names, in the table's own declared order, read via
@@ -566,8 +613,42 @@ class SynSQLQueryDataset:
         table_names_key: str = "required_tables",
         style_key: str = "style",
         exclude_styles: set | frozenset | None = DEFAULT_EXCLUDED_STYLES,
+        examples_cache_path: str | None = None,
     ):
+        """
+        examples_cache_path: where the fully-RESOLVED examples list (this
+            class's own output -- question/db_id/valid table_names, after
+            style exclusion and live-schema validation) is cached as
+            JSON. If this file exists, it's loaded directly and NEITHER
+            questions_json is re-parsed NOR table_dataset.has_table() is
+            called at all -- skips the (for SynSQL-2.5M scale) expensive
+            per-record schema validation loop entirely, not just the
+            underlying SQLite reads (see SynSQLTableDataset's
+            schema_cache_path for that separate, lower-level cache).
+            Defaults to questions_json with a ".resolved.json" suffix.
+            Delete the cache file if questions_json, exclude_styles, or
+            the underlying database schemas ever change.
+        """
         self.table_dataset = table_dataset
+        if examples_cache_path is None:
+            base, _ = os.path.splitext(questions_json)
+            examples_cache_path = f"{base}.resolved.json"
+        self.examples_cache_path = examples_cache_path
+
+        if os.path.exists(examples_cache_path):
+            print(
+                f"[SynSQLQueryDataset] loading pre-resolved examples from "
+                f"{examples_cache_path!r} (skips raw JSON parse + "
+                f"has_table validation entirely) ..."
+            )
+            with open(examples_cache_path, "r", encoding="utf-8") as f:
+                cached = json.load(f)
+            self.examples = [
+                QueryTableExample(question=e["question"], db_id=e["db_id"], table_names=e["table_names"])
+                for e in cached
+            ]
+            print(f"[SynSQLQueryDataset] loaded {len(self.examples)} example(s) from cache")
+            return
 
         with open(questions_json, "r", encoding="utf-8") as f:
             raw = json.load(f)
@@ -608,6 +689,22 @@ class SynSQLQueryDataset:
                 f"[SynSQLQueryDataset] skipped {skipped_schema} question(s) whose "
                 f"positive table(s) weren't found in the live database schema"
             )
+
+        # Persist both caches now, while the schema lookups that just
+        # happened (has_table() above, for potentially every record in
+        # questions_json) are still fresh: the resolved examples list
+        # itself, and table_dataset's underlying db_id -> table_names map
+        # (see SynSQLTableDataset.save_schema_cache()) -- together these
+        # mean the NEXT process launch skips the raw JSON parse, every
+        # has_table() call, AND every live sqlite_master read behind them.
+        os.makedirs(os.path.dirname(examples_cache_path) or ".", exist_ok=True)
+        with open(examples_cache_path, "w", encoding="utf-8") as f:
+            json.dump(
+                [{"question": e.question, "db_id": e.db_id, "table_names": e.table_names} for e in self.examples],
+                f,
+            )
+        print(f"[SynSQLQueryDataset] cached {len(self.examples)} resolved example(s) to {examples_cache_path}")
+        table_dataset.save_schema_cache()
 
     def __len__(self) -> int:
         return len(self.examples)

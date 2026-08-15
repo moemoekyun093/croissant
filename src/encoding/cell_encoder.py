@@ -172,12 +172,17 @@ class TextEmbedder(nn.Module):
         Loads a previously-saved cache from disk.
 
         merge=True  -- add to whatever's already in memory (existing
-                        entries kept as-is if there's a key collision)
+                        entries kept as-is if there's a key collision --
+                        note plain dict.update() does the OPPOSITE,
+                        silently letting loaded values win instead, so
+                        this uses setdefault() to actually match this
+                        docstring's contract)
         merge=False -- replace the in-memory cache entirely
         """
         loaded = torch.load(path, map_location="cpu")
         if merge:
-            self._cache.update(loaded)
+            for k, v in loaded.items():
+                self._cache.setdefault(k, v)
         else:
             self._cache = loaded
 

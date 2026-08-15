@@ -81,6 +81,48 @@ class BaselineCellwiseAdapter(nn.Module):
             nn.Linear(native_dim, self.embed_dim) if self.embed_dim != native_dim else nn.Identity()
         )
 
+    def save_table_cache(self, path: str) -> None:
+        """Persists the current in-memory _table_cache to disk -- same
+        rationale and pattern as TextEmbedder.save_cache_to_disk (see
+        cell_encoder.py). Only meaningful when self.cacheable is True
+        (bert/tapas): for a fully-frozen encoder, a table's raw cell
+        embeddings are a deterministic function of its text and the
+        (frozen, never-updated) backbone weights -- they never change
+        across the WHOLE run, or even across separate runs with the same
+        encoder/model_name/tokenization config. Right now that
+        determinism is only exploited within one process's lifetime
+        (this dict dies when the process exits); persisting it means the
+        corpus's embeddings, once computed, never need to be computed
+        again by any future run -- no re-tokenizing, no backbone forward
+        pass, just a dict load. A no-op (empty file) if cacheable=False
+        or nothing has been encoded yet.
+
+        NOTE: keyed only by table_id -- if you ever change --model_name,
+        --max_length, or the cell-serialization convention
+        (_serialize_cell in bert_baseline.py etc.) for the SAME encoder,
+        delete the cache file first, since old entries would otherwise
+        be silently reused despite no longer matching what a fresh
+        encode would produce.
+        """
+        torch.save(self._table_cache, path)
+
+    def load_table_cache(self, path: str, merge: bool = True) -> None:
+        """Loads a previously-saved _table_cache from disk. merge=True
+        adds to whatever's already in memory, keeping any EXISTING
+        in-memory entry on a key collision rather than the loaded one
+        (plain dict.update() would do the opposite -- loaded values
+        silently overwriting in-memory ones -- which doesn't match this
+        docstring's own claim, so this uses setdefault() instead to
+        actually implement "existing wins"). merge=False replaces the
+        in-memory cache entirely. See save_table_cache's docstring for
+        the staleness caveat."""
+        loaded = torch.load(path, map_location="cpu")
+        if merge:
+            for k, v in loaded.items():
+                self._table_cache.setdefault(k, v)
+        else:
+            self._table_cache = loaded
+
     @staticmethod
     def _infer_native_dim(baseline_encoder: BaseTableEncoder) -> int:
         # every current baseline (bert/tabbie/strubert/tapas/turl/hytrel)
