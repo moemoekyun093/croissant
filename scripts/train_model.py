@@ -274,6 +274,15 @@ if __name__ == "__main__":
              "results to report.",
     )
     parser.add_argument(
+        "--skip_finetune_resume", action=argparse.BooleanOptionalAction, default=False,
+        help="ignore an existing <checkpoint_dir>/<encoder>/finetune/best_model.pt "
+             "and start finetuning from scratch (fresh model/optimizer state, "
+             "epoch 0) instead of auto-resuming from it. Auto-resume is the "
+             "default -- pass this to force a clean restart (e.g. after "
+             "changing --scoring_mode or other hyperparameters that make the "
+             "old checkpoint's optimizer state/epoch count meaningless).",
+    )
+    parser.add_argument(
         "--text_cache_path", default=None,
         help="only meaningful for --encoder ours -- see "
              "scripts/pretrain_electra.py's --text_cache_path. Defaults to "
@@ -755,6 +764,27 @@ if __name__ == "__main__":
         profile_every=args.profile_every,
     )
 
+    # Same "auto-resume if a checkpoint already exists" pattern as stage
+    # 1's pretrain_dir handling above -- FinetuneTrainer.fit() already
+    # accepted a resume_from argument (model/query_encoder/scorer/
+    # optimizer state + global_step), this script just never actually
+    # looked for one. Unlike pretrain (one file per epoch, needs
+    # latest_checkpoint's max-epoch search), finetune only ever writes a
+    # single best_model.pt (see save_checkpoint's docstring -- it
+    # overwrites, doesn't accumulate), so finding it is just an
+    # os.path.exists check. This is what makes "restart tabbie, it
+    # already finished an epoch" actually resume from that epoch's
+    # trained weights + optimizer state instead of re-initializing the
+    # trainable row/col-transformer-on-top from scratch every relaunch.
+    finetune_resume_ckpt = os.path.join(finetune_dir, "best_model.pt")
+    if not os.path.exists(finetune_resume_ckpt):
+        finetune_resume_ckpt = None
+    elif args.skip_finetune_resume:
+        print(f"found {finetune_resume_ckpt} but --skip_finetune_resume was passed -- starting finetuning fresh")
+        finetune_resume_ckpt = None
+    else:
+        print(f"found existing finetune checkpoint, resuming from {finetune_resume_ckpt}")
+
     print(f"\n=== [{args.encoder}] stage 2/2: finetuning on {args.device} (scoring_mode={args.scoring_mode}, patience={args.patience}) ===")
     best_val_map = finetuner.fit(
         build_train_batches,
@@ -766,6 +796,7 @@ if __name__ == "__main__":
         log_every=args.log_every,
         val_query_batch_size=args.query_batch_size,
         on_checkpoint=save_all_caches,
+        resume_from=finetune_resume_ckpt,
     )
 
     print(f"\n[{args.encoder}] best validation MAP: {best_val_map:.4f}")
