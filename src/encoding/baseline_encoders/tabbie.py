@@ -233,12 +233,38 @@ class TabbieTableEncoder(BaseTableEncoder):
             per_table_shape.append((n_rows, n_cols))
             offset += len(flat_texts)
 
+        # Timing split for profiling (see adapter.py/trainer.py's
+        # _score_batch): _last_frozen_s is the frozen BERT cell-encoding
+        # pass (cacheable -- 0 on a full cache hit run), _last_network_s
+        # is the row/col transformer stack on top (never cacheable, it's
+        # what's actually being trained). torch.cuda.synchronize() at the
+        # boundary is needed for an accurate split -- otherwise the async
+        # GPU queue lets the frozen pass's real cost bleed into the
+        # network measurement.
+        import time
+        is_cuda = self.device.type == "cuda" if hasattr(self.device, "type") else False
+        if is_cuda:
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+
         all_cls = self._encode_cells_isolated(all_texts)  # [total_cells_across_all_tables, D]
+
+        if is_cuda:
+            torch.cuda.synchronize()
+        t1 = time.perf_counter()
 
         results: List[TableEncoding] = []
         for (start, end), (n_rows, n_cols) in zip(per_table_offsets, per_table_shape):
             cls = all_cls[start:end]
             results.append(self._forward_from_cls(cls, n_rows, n_cols))
+
+        if is_cuda:
+            torch.cuda.synchronize()
+        t2 = time.perf_counter()
+
+        self._last_frozen_s = t1 - t0
+        self._last_network_s = t2 - t1
+
         return results
 
     def _forward_from_cls(self, cls: torch.Tensor, n_rows: int, n_cols: int) -> TableEncoding:

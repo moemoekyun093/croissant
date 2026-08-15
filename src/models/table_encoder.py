@@ -335,10 +335,18 @@ class TableEncoder(nn.Module):
         returns: (X, col_mask, row_mask, cell_mask) -- X: [B,N,M,k]
         """
 
-        if profile:
-            import time
+        # Timing split ALWAYS recorded (not just when profile=True) as
+        # self._last_frozen_s/_last_network_s -- same two attribute names
+        # adapter.py's BaselineCellwiseAdapter exposes, so trainer.py's
+        # _score_batch can read either model type uniformly without
+        # branching on which one it is. profile=True additionally prints
+        # a one-off line here for standalone/manual use.
+        import time
+        device = next(self.parameters()).device
+        is_cuda = device.type == "cuda"
+        if is_cuda:
             torch.cuda.synchronize()
-            t0 = time.time()
+        t0 = time.perf_counter()
 
         # H (per-column header embeddings) is no longer added onto X here --
         # CellEncoder already fuses each cell's own column header into that
@@ -367,24 +375,27 @@ class TableEncoder(nn.Module):
         elif ablation is not None:
             raise ValueError(f"Unknown ablation mode: {ablation}")
 
-        if profile:
+        if is_cuda:
             torch.cuda.synchronize()
-            t1 = time.time()
+        t1 = time.perf_counter()
 
         for layer in self.layers:
             X = layer(X, row_mask, col_mask)
 
-        if profile:
+        if is_cuda:
             torch.cuda.synchronize()
-            t2 = time.time()
-            encode_time = t1 - t0
-            table_layers_time = t2 - t1
-            total = encode_time + table_layers_time
+        t2 = time.perf_counter()
+
+        self._last_frozen_s = t1 - t0
+        self._last_network_s = t2 - t1
+
+        if profile:
+            total = self._last_frozen_s + self._last_network_s
             print(
-                f"[profile] cell encoding (BERT+numeric): {encode_time:.3f}s "
-                f"({100*encode_time/total:.1f}%)  |  "
-                f"table-level layers ({self.num_layers}x): {table_layers_time:.3f}s "
-                f"({100*table_layers_time/total:.1f}%)"
+                f"[profile] cell encoding (BERT+numeric): {self._last_frozen_s:.3f}s "
+                f"({100*self._last_frozen_s/total:.1f}%)  |  "
+                f"table-level layers ({self.num_layers}x): {self._last_network_s:.3f}s "
+                f"({100*self._last_network_s/total:.1f}%)"
             )
 
         return X, col_mask, row_mask, cell_mask

@@ -150,14 +150,20 @@ class BaselineCellwiseAdapter(nn.Module):
         isn't supported here -- baselines don't share our
         concat(cell, header)-then-fuse scheme, so there's nothing
         analogous to isolate. profile is accepted for interface parity
-        but currently a no-op (baselines don't have a comparable
-        cell-encoding-vs-table-layers split to time separately)."""
+        (unused directly here -- see self._last_frozen_s/_last_network_s
+        below, which are ALWAYS recorded, not gated behind profile,
+        mirroring TableEncoder's cell-encoding-vs-table-layers split so
+        trainer.py's _score_batch can read the same two attribute names
+        off either model type)."""
         if ablation is not None:
             raise NotImplementedError(
                 f"ablation={ablation!r} is not supported by baseline encoders"
             )
 
+        import time
+
         device = next(self.parameters()).device
+        is_cuda = device.type == "cuda"
 
         per_table_cell: list = [None] * len(tables)  # each [n_cols_i, n_rows_i, embed_dim]
 
@@ -174,10 +180,19 @@ class BaselineCellwiseAdapter(nn.Module):
         # (pre-projection) form on CPU, same convention as TextEmbedder's
         # cache, so self.projection (trainable, though typically Identity
         # for bert/tapas when embed_dim matches native_dim) is still
-        # re-applied fresh every call.
+        # re-applied fresh every call. Counted as "frozen" time (it's a
+        # cache load + a cheap Linear/Identity, not the backbone) -- ~0 on
+        # a fully-warm cache.
+        if is_cuda:
+            torch.cuda.synchronize()
+        t_hits_0 = time.perf_counter()
         for i in cache_hit_indices:
             raw_cell = self._table_cache[tables[i].table_id].to(device)
             per_table_cell[i] = self.projection(raw_cell)
+        if is_cuda:
+            torch.cuda.synchronize()
+        frozen_s = time.perf_counter() - t_hits_0
+        network_s = 0.0
 
         # Cache misses: use the baseline's forward_batch (ONE backbone
         # forward pass for every miss table at once) when it exposes one
@@ -207,7 +222,28 @@ class BaselineCellwiseAdapter(nn.Module):
                 batch_inputs = [
                     (*self._table_to_headers_rows(tables[i]), None) for i in cache_miss_indices
                 ]
+
+                if is_cuda:
+                    torch.cuda.synchronize()
+                t_fb_0 = time.perf_counter()
                 encodings = self.baseline_encoder.forward_batch(batch_inputs)
+                if is_cuda:
+                    torch.cuda.synchronize()
+                t_fb_1 = time.perf_counter()
+
+                # tabbie/strubert's forward_batch records its own
+                # internal frozen-vs-network split (see their
+                # forward_batch docstrings) -- use that directly, it's
+                # more precise than this call's total. bert/tapas's
+                # forward_batch has no network part at all (no table-
+                # level stack on top of the raw backbone), so its whole
+                # cost is frozen time.
+                if hasattr(self.baseline_encoder, "_last_frozen_s"):
+                    frozen_s += self.baseline_encoder._last_frozen_s
+                    network_s += self.baseline_encoder._last_network_s
+                else:
+                    frozen_s += t_fb_1 - t_fb_0
+
                 for miss_pos, i in enumerate(cache_miss_indices):
                     encoding = encodings[miss_pos]
                     raw_cell = encoding.cell_embeddings.transpose(0, 1)
@@ -215,6 +251,9 @@ class BaselineCellwiseAdapter(nn.Module):
                         self._table_cache[tables[i].table_id] = raw_cell.detach().cpu()
                     per_table_cell[i] = self.projection(raw_cell)
             else:
+                if is_cuda:
+                    torch.cuda.synchronize()
+                t_loop_0 = time.perf_counter()
                 for i in cache_miss_indices:
                     headers, rows = self._table_to_headers_rows(tables[i])
                     encoding = self.baseline_encoder(headers, rows)
@@ -225,6 +264,12 @@ class BaselineCellwiseAdapter(nn.Module):
                     if self.cacheable:
                         self._table_cache[tables[i].table_id] = raw_cell.detach().cpu()
                     per_table_cell[i] = self.projection(raw_cell)
+                if is_cuda:
+                    torch.cuda.synchronize()
+                frozen_s += time.perf_counter() - t_loop_0
+
+        self._last_frozen_s = frozen_s
+        self._last_network_s = network_s
 
         B = len(tables)
         max_n = max((c.shape[0] for c in per_table_cell), default=1)

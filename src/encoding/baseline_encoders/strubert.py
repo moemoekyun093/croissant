@@ -318,8 +318,23 @@ class StruBertTableEncoder(BaseTableEncoder):
         # given via one tokenizer call + one backbone call, so passing it
         # ALL tables' sequences at once (instead of one table's worth at
         # a time, looped) is the entire fix.
+        # Timing split for profiling (see tabbie.py's forward_batch for
+        # the full rationale -- same pattern): _last_frozen_s is the
+        # frozen BERT backbone pass (cacheable), _last_network_s is
+        # vertical_attn/horizontal_attn/fuse_proj on top (never
+        # cacheable -- trainable).
+        import time
+        is_cuda = self.device.type == "cuda" if hasattr(self.device, "type") else False
+        if is_cuda:
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+
         all_col_fine, all_col_coarse = self._cellwise_pool_sequence(all_col_seqs)
         all_row_fine, all_row_coarse = self._cellwise_pool_sequence(all_row_seqs)
+
+        if is_cuda:
+            torch.cuda.synchronize()
+        t1 = time.perf_counter()
 
         results: List[TableEncoding] = []
         for (c_start, c_end), (r_start, r_end) in zip(col_offsets, row_offsets):
@@ -331,4 +346,12 @@ class StruBertTableEncoder(BaseTableEncoder):
                     all_row_coarse[r_start:r_end],
                 )
             )
+
+        if is_cuda:
+            torch.cuda.synchronize()
+        t2 = time.perf_counter()
+
+        self._last_frozen_s = t1 - t0
+        self._last_network_s = t2 - t1
+
         return results

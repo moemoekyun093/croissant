@@ -307,13 +307,17 @@ class FinetuneTrainer:
         self.scorer = MultiScorer().to(device)
         self.device = device
 
-        # Per-stage timing (query encoding vs. table encoding vs. scoring)
-        # inside _score_batch, to expose which part of a training step is
+        # Per-stage timing (query encoding vs. frozen-backbone table
+        # encoding vs. trainable network-on-top vs. scoring) inside
+        # _score_batch, to expose which part of a training step is
         # actually slow -- see _record_profile. Off by default since it
         # adds a few torch.cuda-syncing time.perf_counter() calls per step.
         self.profile = profile
         self.profile_every = profile_every
-        self._profile_accum = {"n": 0, "n_queries": 0, "n_tables": 0, "query_s": 0.0, "table_s": 0.0, "score_s": 0.0}
+        self._profile_accum = {
+            "n": 0, "n_queries": 0, "n_tables": 0,
+            "query_s": 0.0, "frozen_s": 0.0, "network_s": 0.0, "score_s": 0.0,
+        }
 
         self.lr = lr
         self.weight_decay = weight_decay
@@ -426,20 +430,36 @@ class FinetuneTrainer:
         # offending table (or prove it's a batch-composition interaction,
         # not a single bad table) -- modular, isolate first, ask questions
         # later.
+        #
+        # CRITICAL: self._maybe_sync() is called at the END of each try
+        # block, INSIDE it, not after. CUDA errors are asynchronous -- a
+        # bad kernel launched during, say, table encoding here doesn't
+        # necessarily raise a Python exception until the NEXT GPU->CPU
+        # sync point, which could be several unrelated calls (even a
+        # different epoch's VALIDATION pass) later, well outside any of
+        # these try/except blocks. Forcing a sync here, immediately after
+        # each stage's own GPU work, makes a deferred error from THIS
+        # stage surface HERE, inside the matching except clause, instead
+        # of silently erupting downstream where it's much harder to
+        # attribute -- this is exactly what let a training-induced crash
+        # slip past this instrumentation and surface later inside
+        # _corpus_scores instead (see that method's own crash history).
         t_start = time.perf_counter()
         try:
             Q, query_mask = self.query_encoder(queries)  # [Bq, L, k], [Bq, L]
+            Q = Q * query_mask.unsqueeze(-1)  # zero out padding-token vectors
+            self._maybe_sync()
         except Exception:
             print(
                 f"[_score_batch] CRASHED during QUERY encoding "
                 f"({len(queries)} question(s)). first few: {queries[:5]!r}"
             )
             raise
-        Q = Q * query_mask.unsqueeze(-1)  # zero out padding-token vectors
         t_query = time.perf_counter()
 
         try:
             X, col_mask, row_mask, cell_mask = self.model.forward_batch_cellwise(tables)
+            self._maybe_sync()
         except Exception:
             print(
                 f"[_score_batch] CRASHED during TABLE encoding "
@@ -451,6 +471,7 @@ class FinetuneTrainer:
 
         try:
             scores = cross_score_queries_tables(self.scorer, self.scoring_mode, Q, X, row_mask, col_mask)
+            self._maybe_sync()
         except Exception:
             print(
                 f"[_score_batch] CRASHED during SCORING. "
@@ -462,11 +483,27 @@ class FinetuneTrainer:
         t_score = time.perf_counter()
 
         if self.profile:
+            # self.model (either our own TableEncoder or a
+            # BaselineCellwiseAdapter wrapping bert/tapas/tabbie/strubert/
+            # turl/hytrel) always records _last_frozen_s/_last_network_s
+            # on itself during forward_batch_cellwise -- the frozen-
+            # backbone pass (cacheable, ~0 on a warm cache hit) vs the
+            # trainable network on top of it (never cacheable). Falls
+            # back to lumping everything under table_s if a model
+            # somehow doesn't expose the split (shouldn't happen for any
+            # of the 7 current encoders, but keeps this from crashing if
+            # one is added without it).
+            frozen_s = getattr(self.model, "_last_frozen_s", None)
+            network_s = getattr(self.model, "_last_network_s", None)
+            table_s = t_table - t_query
+            if frozen_s is None or network_s is None:
+                frozen_s, network_s = table_s, 0.0
             self._record_profile(
                 n_queries=len(queries),
                 n_tables=len(tables),
                 query_s=t_query - t_start,
-                table_s=t_table - t_query,
+                frozen_s=frozen_s,
+                network_s=network_s,
                 score_s=t_score - t_table,
             )
 
@@ -500,29 +537,56 @@ class FinetuneTrainer:
             f"{[t.table_id for t in tables]}"
         )
 
+    def _maybe_sync(self) -> None:
+        """Force any CUDA error queued by a kernel that just ran to
+        surface HERE, synchronously, instead of deferring to whatever
+        GPU->CPU sync happens to come next -- which can be several
+        unrelated calls later (a different training step, a different
+        epoch's validation pass), making the real cause nearly
+        impossible to attribute. Called at the end of every try block in
+        _score_batch/train_step that just did GPU work. No-op on CPU
+        (torch.cuda.synchronize would raise if no CUDA device exists)."""
+        dev = self.device
+        is_cuda = (isinstance(dev, str) and dev.startswith("cuda")) or (
+            isinstance(dev, torch.device) and dev.type == "cuda"
+        )
+        if is_cuda:
+            torch.cuda.synchronize(dev)
+
     def _record_profile(
-        self, n_queries: int, n_tables: int, query_s: float, table_s: float, score_s: float
+        self, n_queries: int, n_tables: int, query_s: float, frozen_s: float, network_s: float, score_s: float
     ) -> None:
         """Accumulate per-stage timings and print a running average every
         self.profile_every steps, so the printed numbers reflect a stable
-        average rather than one noisy step. Reset after each print."""
+        average rather than one noisy step. Reset after each print.
+
+        frozen_s/network_s split what used to be a single "table encode"
+        bucket: frozen_s is the frozen-backbone pass (BERT/TAPAS -- the
+        part disk caching actually helps), network_s is whatever
+        trainable table-level architecture sits on top of it (our
+        TableLayer stack, tabbie's row/col transformer, strubert's
+        vertical/horizontal attention + fuse_proj, etc.) and is NEVER
+        cacheable regardless of how warm the frozen cache is."""
         acc = self._profile_accum
         acc["n"] += 1
         acc["n_queries"] += n_queries
         acc["n_tables"] += n_tables
         acc["query_s"] += query_s
-        acc["table_s"] += table_s
+        acc["frozen_s"] += frozen_s
+        acc["network_s"] += network_s
         acc["score_s"] += score_s
 
         if acc["n"] >= self.profile_every:
             n = acc["n"]
-            total = acc["query_s"] + acc["table_s"] + acc["score_s"]
+            total = acc["query_s"] + acc["frozen_s"] + acc["network_s"] + acc["score_s"]
             self._log(
                 f"[profile] avg over {n} step(s) -- "
                 f"query encode: {1000 * acc['query_s'] / n:.1f}ms "
                 f"({100 * acc['query_s'] / total:.0f}%, avg {acc['n_queries'] / n:.0f} queries/step) | "
-                f"table encode: {1000 * acc['table_s'] / n:.1f}ms "
-                f"({100 * acc['table_s'] / total:.0f}%, avg {acc['n_tables'] / n:.0f} tables/step) | "
+                f"frozen backbone: {1000 * acc['frozen_s'] / n:.1f}ms "
+                f"({100 * acc['frozen_s'] / total:.0f}%, avg {acc['n_tables'] / n:.0f} tables/step) | "
+                f"network on top: {1000 * acc['network_s'] / n:.1f}ms "
+                f"({100 * acc['network_s'] / total:.0f}%) | "
                 f"scoring: {1000 * acc['score_s'] / n:.1f}ms "
                 f"({100 * acc['score_s'] / total:.0f}%)"
             )
@@ -538,10 +602,26 @@ class FinetuneTrainer:
         cross_scores = self._score_batch(batch)
         loss = query_table_info_nce_loss(cross_scores, temperature=self.temperature)
 
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(self._trainable_params(), self.grad_clip_norm)
+        # Same async-CUDA-deferral concern as _score_batch: a bad kernel
+        # queued during backward() or the optimizer step would otherwise
+        # silently defer to some LATER unrelated sync point (e.g. the next
+        # validation pass's index_copy_) instead of raising here, where we
+        # can actually attribute it to this step/batch. See _score_batch's
+        # comment block for the full rationale.
+        try:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self._trainable_params(), self.grad_clip_norm)
+            self.optimizer.step()
+            self._maybe_sync()
+        except Exception:
+            # Do NOT touch loss.item() here -- after a CUDA device-side
+            # assert, the CUDA context itself is poisoned and ANY further
+            # CUDA call (including a GPU->CPU sync like .item()) just
+            # raises again, masking the real traceback. Print only what's
+            # already on CPU.
+            print(f"[train_step] CRASHED during backward/optimizer step (global_step={self.global_step})")
+            raise
 
-        self.optimizer.step()
         self.scheduler.step()
         self.global_step += 1
 
