@@ -47,6 +47,7 @@ import torch.nn as nn
 from transformers import AutoModel, AutoTokenizer
 
 from .common import BaseTableEncoder, TableEncoding, clean_cell, validate_table
+from src.encoding.cache_utils import downcast_cache, upcast_cache
 
 
 def _infer_column_type(values: Sequence[object]) -> str:
@@ -188,14 +189,14 @@ class StruBertTableEncoder(BaseTableEncoder):
         vertical_attn/horizontal_attn/fuse_proj always run fresh, since
         their output changes every training step and can't be cached the
         way bert/tapas's FULL table embedding can."""
-        torch.save(self._seq_cache, path)
+        torch.save(downcast_cache(self._seq_cache), path)
 
     def load_frozen_cache(self, path: str, merge: bool = True) -> None:
         """Loads a previously-saved col/row-sequence cache. merge=True
         keeps existing in-memory entries on a key collision (see
         adapter.py's load_table_cache for why plain dict.update() would
         get this backwards); merge=False replaces the cache entirely."""
-        loaded = torch.load(path, map_location="cpu")
+        loaded = upcast_cache(torch.load(path, map_location="cpu"))
         if merge:
             for k, v in loaded.items():
                 self._seq_cache.setdefault(k, v)

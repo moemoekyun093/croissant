@@ -38,6 +38,7 @@ import torch.nn as nn
 from transformers import AutoModel, AutoTokenizer
 
 from src.data.table import Column, Table
+from src.encoding.cache_utils import downcast_cache, upcast_cache
 
 
 # ==========================================================
@@ -171,7 +172,7 @@ class TextEmbedder(nn.Module):
         sweeps) can reuse it without ever calling BERT again for a
         string already seen, not just within this one process.
         """
-        torch.save(self._cache, path)
+        torch.save(downcast_cache(self._cache), path)
 
     def load_cache_from_disk(self, path: str, merge: bool = True) -> None:
         """
@@ -185,7 +186,7 @@ class TextEmbedder(nn.Module):
                         docstring's contract)
         merge=False -- replace the in-memory cache entirely
         """
-        loaded = torch.load(path, map_location="cpu")
+        loaded = upcast_cache(torch.load(path, map_location="cpu"))
         if merge:
             for k, v in loaded.items():
                 self._cache.setdefault(k, v)

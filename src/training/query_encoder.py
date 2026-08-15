@@ -17,6 +17,8 @@ import torch
 import torch.nn as nn
 from transformers import AutoModel, AutoTokenizer
 
+from src.encoding.cache_utils import downcast_cache, upcast_cache
+
 
 class QueryEncoder(nn.Module):
     def __init__(
@@ -203,14 +205,14 @@ class QueryEncoder(nn.Module):
         caching is skipped entirely in that case -- a query's encoding
         legitimately changes every step when the query tower itself is
         being finetuned."""
-        torch.save(self._encoder_cache, path)
+        torch.save(downcast_cache(self._encoder_cache), path)
 
     def load_frozen_cache(self, path: str, merge: bool = True) -> None:
         """Loads a previously-saved query cache. merge=True keeps
         existing in-memory entries on a key collision (see adapter.py's
         load_table_cache for why plain dict.update() would get this
         backwards); merge=False replaces the cache entirely."""
-        loaded = torch.load(path, map_location="cpu")
+        loaded = upcast_cache(torch.load(path, map_location="cpu"))
         if merge:
             for k, v in loaded.items():
                 self._encoder_cache.setdefault(k, v)

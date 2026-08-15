@@ -46,6 +46,7 @@ import torch.nn as nn
 from transformers import AutoModel, AutoTokenizer
 
 from .common import BaseTableEncoder, TableEncoding, clean_cell, validate_table
+from src.encoding.cache_utils import downcast_cache, upcast_cache
 
 
 class TabbieTableEncoder(BaseTableEncoder):
@@ -163,14 +164,14 @@ class TabbieTableEncoder(BaseTableEncoder):
         cached. See adapter.py's cacheable docstring for why tabbie's
         FULL table embedding (unlike bert/tapas's) can't be persisted
         the same way."""
-        torch.save(self._cell_cache, path)
+        torch.save(downcast_cache(self._cell_cache), path)
 
     def load_frozen_cache(self, path: str, merge: bool = True) -> None:
         """Loads a previously-saved cell/header text cache. merge=True
         keeps existing in-memory entries on a key collision (see
         adapter.py's load_table_cache for why plain dict.update() would
         get this backwards); merge=False replaces the cache entirely."""
-        loaded = torch.load(path, map_location="cpu")
+        loaded = upcast_cache(torch.load(path, map_location="cpu"))
         if merge:
             for k, v in loaded.items():
                 self._cell_cache.setdefault(k, v)

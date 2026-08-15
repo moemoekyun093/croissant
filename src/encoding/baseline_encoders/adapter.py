@@ -32,6 +32,7 @@ import torch.nn as nn
 
 from src.data.table import Table
 from src.encoding.baseline_encoders.common import BaseTableEncoder
+from src.encoding.cache_utils import downcast_cache, upcast_cache
 
 
 class BaselineCellwiseAdapter(nn.Module):
@@ -104,7 +105,7 @@ class BaselineCellwiseAdapter(nn.Module):
         be silently reused despite no longer matching what a fresh
         encode would produce.
         """
-        torch.save(self._table_cache, path)
+        torch.save(downcast_cache(self._table_cache), path)
 
     def load_table_cache(self, path: str, merge: bool = True) -> None:
         """Loads a previously-saved _table_cache from disk. merge=True
@@ -116,7 +117,7 @@ class BaselineCellwiseAdapter(nn.Module):
         actually implement "existing wins"). merge=False replaces the
         in-memory cache entirely. See save_table_cache's docstring for
         the staleness caveat."""
-        loaded = torch.load(path, map_location="cpu")
+        loaded = upcast_cache(torch.load(path, map_location="cpu"))
         if merge:
             for k, v in loaded.items():
                 self._table_cache.setdefault(k, v)
