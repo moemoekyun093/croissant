@@ -89,6 +89,25 @@ class StruBertTableEncoder(BaseTableEncoder):
         self.hidden_size = self.backbone.config.hidden_size
         self.seq_max_length = seq_max_length
 
+        # Frozen feature extractor -- see bert_baseline.py's comment for
+        # the full rationale. This backbone gets called TWICE per table
+        # (once for the row-view sequences, once for the column-view
+        # sequences via _cellwise_pool_sequence), both fully trainable
+        # graphs retained until backward previously -- this is exactly
+        # what caused the real OOM on cuda:3 (94.96/94.97 GiB used).
+        # Freezing removes both graphs entirely; only vertical_attn/
+        # horizontal_attn/fuse_proj below stay trainable.
+        self.backbone.eval()
+        for p in self.backbone.parameters():
+            p.requires_grad = False
+
+    def train(self, mode: bool = True):
+        """Keep the frozen backbone permanently in eval mode -- see
+        bert_baseline.py's train() override for the full rationale."""
+        super().train(mode)
+        self.backbone.eval()
+        return self
+
         def make_stack():
             layer = nn.TransformerEncoderLayer(
                 d_model=self.hidden_size,
@@ -118,7 +137,8 @@ class StruBertTableEncoder(BaseTableEncoder):
             max_length=self.seq_max_length,
             return_tensors="pt",
         ).to(self.device)
-        out = self.backbone(**enc)
+        with torch.no_grad():
+            out = self.backbone(**enc)
         hidden = out.last_hidden_state  # [N, L, D]
         mask = enc["attention_mask"].unsqueeze(-1).float()
         # zero out CLS/SEP contribution to the fine-grained mean by using a

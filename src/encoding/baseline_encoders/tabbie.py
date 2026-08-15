@@ -65,6 +65,25 @@ class TabbieTableEncoder(BaseTableEncoder):
         self.hidden_size = self.cell_encoder.config.hidden_size
         self.cell_max_length = cell_max_length
 
+        # Frozen feature extractor -- see bert_baseline.py's comment for
+        # the full rationale. Every cell in the table goes through this
+        # backbone independently as one batched call (n_rows*n_cols
+        # sequences per table), so this is the single most memory-hungry
+        # backbone call in the whole baseline suite; freezing it removes
+        # that entire activation graph from backward, leaving only the
+        # row/column transformer layers below (self.row_layers/col_layers)
+        # trainable, same "train only the layers on top" pattern.
+        self.cell_encoder.eval()
+        for p in self.cell_encoder.parameters():
+            p.requires_grad = False
+
+    def train(self, mode: bool = True):
+        """Keep the frozen cell_encoder permanently in eval mode -- see
+        bert_baseline.py's train() override for the full rationale."""
+        super().train(mode)
+        self.cell_encoder.eval()
+        return self
+
         self.row_pos_embed = nn.Embedding(max_rows, self.hidden_size).to(self.device)
         self.col_pos_embed = nn.Embedding(max_cols, self.hidden_size).to(self.device)
         self.cls_row = nn.Parameter(torch.randn(self.hidden_size) * 0.02).to(self.device)
@@ -95,7 +114,8 @@ class TabbieTableEncoder(BaseTableEncoder):
             max_length=self.cell_max_length,
             return_tensors="pt",
         ).to(self.device)
-        out = self.cell_encoder(**enc)
+        with torch.no_grad():
+            out = self.cell_encoder(**enc)
         return out.last_hidden_state[:, 0, :]  # [N, D]
 
     def forward(

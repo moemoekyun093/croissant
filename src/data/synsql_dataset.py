@@ -77,6 +77,21 @@ def get_sqlite_path(db_root: str, db_id: str) -> str:
     return f"{db_root}/{db_id}/{db_id}.sqlite"
 
 
+def _drop_empty_tables(tables: list[Table]) -> tuple[list[Table], int]:
+    """Filters out any table with 0 rows or 0 columns -- a handful of
+    real SynSQL tables are genuinely empty in their source SQLite
+    database (get_table() faithfully returns them as-is), and there's
+    no content for any encoder to learn from an empty table. Most
+    encoders happen to tolerate this silently, but
+    src/encoding/baseline_encoders/common.py::validate_table (used by
+    e.g. turl.py) explicitly raises on it, crashing the whole run the
+    first time a batch or eval pass happens to touch one. Shared helper
+    so every call site that hands tables to an encoder filters the same
+    way. Returns (filtered_tables, n_dropped)."""
+    filtered = [t for t in tables if t.num_rows > 0 and t.num_columns > 0]
+    return filtered, len(tables) - len(filtered)
+
+
 def _select_columns_by_name(
     cur: sqlite3.Cursor, table_name: str, column_names: list[str], rowids: list[int]
 ) -> list[tuple]:
@@ -430,6 +445,13 @@ class SynSQLTableDataset:
                 db_id, _, table_name = t["table_id"].partition("#sep#")
                 self._materialized_table_cache[(db_id, table_name)] = table
             print(f"[load_corpus] loaded {len(tables)} table(s) from cache")
+            tables, n_empty = _drop_empty_tables(tables)
+            if n_empty:
+                print(
+                    f"[load_corpus] dropped {n_empty} empty table(s) (0 rows or 0 "
+                    f"columns) from the cache -- these were included in an older "
+                    f"materialized_cache_path written before this filter existed"
+                )
             return tables
 
         with open(corpus_json_path, "r", encoding="utf-8") as f:
@@ -462,6 +484,15 @@ class SynSQLTableDataset:
                 f"[load_corpus] {missing} table(s) from {corpus_json_path!r} "
                 f"weren't found in the live schema (databases_root may differ "
                 f"from when the corpus was built)"
+            )
+
+        tables, n_empty = _drop_empty_tables(tables)
+        if n_empty:
+            print(
+                f"[load_corpus] dropped {n_empty} empty table(s) (0 rows or 0 "
+                f"columns) -- genuinely empty in the source SQLite database, "
+                f"nothing for any encoder to learn from, and some baselines "
+                f"(e.g. turl.py's validate_table) raise on them"
             )
 
         print(f"[load_corpus] caching materialized corpus to {materialized_cache_path!r} for future runs ...")

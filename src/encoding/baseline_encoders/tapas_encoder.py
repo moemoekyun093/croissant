@@ -43,6 +43,24 @@ class TapasTableEncoder(BaseTableEncoder):
         self.hidden_size = self.backbone.config.hidden_size
         self.max_length = max_length
 
+        # Frozen feature extractor -- see bert_baseline.py's comment for
+        # the full rationale. Like plain BERT, TAPAS has no separate
+        # on-top layer of its own (the pretrained backbone IS the whole
+        # model for this baseline too -- see adapter.py's
+        # _NUM_LAYERS_KWARG comment), so this leaves the encoder itself
+        # with zero trainable parameters; DiscriminatorHead/QueryEncoder/
+        # MultiScorer remain the trainable parts for this baseline.
+        self.backbone.eval()
+        for p in self.backbone.parameters():
+            p.requires_grad = False
+
+    def train(self, mode: bool = True):
+        """Keep the frozen backbone permanently in eval mode -- see
+        bert_baseline.py's train() override for the full rationale."""
+        super().train(mode)
+        self.backbone.eval()
+        return self
+
     def forward(
         self,
         headers: Sequence[str],
@@ -67,7 +85,8 @@ class TapasTableEncoder(BaseTableEncoder):
             return_tensors="pt",
         ).to(self.device)
 
-        out = self.backbone(**enc)
+        with torch.no_grad():
+            out = self.backbone(**enc)
         hidden = out.last_hidden_state[0]  # [seq_len, D]
 
         token_type_ids = enc["token_type_ids"][0]  # [seq_len, 7]: TAPAS's 7 structural channels

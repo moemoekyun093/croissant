@@ -17,7 +17,7 @@
 defaults:
   # -- query encoder (src/training/query_encoder.py::QueryEncoder) --
   query_model_name: bert-base-uncased     # [default] same backbone as CellEncoder, never compared against alternatives
-  query_trainable: true                   # [deliberate] unlike CellEncoder's frozen BERT, the query tower trains from the start -- finetuning is exactly the stage with real query supervision
+  query_trainable: false                  # [changed from true] freeze BERT, train only self.proj (QueryEncoder's final linear layer) -- same "frozen backbone, train the layer(s) on top" pattern now applied to every baseline table encoder AND the query tower, for a consistent methodology end-to-end and much lower finetune memory/compute (no backward through BERT for every query in the batch). Tradeoff: the query tower can no longer adapt its language understanding to this domain's queries, only how it projects/weights BERT's fixed last-layer features -- likely weaker than full finetuning, but consistent with every other encoder's now-frozen-backbone design. Set back to true to fully finetune the query tower instead.
   query_max_length: 32                    # [default] carried over from CellEncoder's cell/header max_length, not re-checked for query length distribution
   exclude_special_tokens: false           # [deliberate] keeps [CLS]/[SEP] as ordinary query vectors, matching ColBERT's own convention
 

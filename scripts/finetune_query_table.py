@@ -88,8 +88,21 @@ def sample_hard_negatives(
     if not candidates:
         return []
     rng.shuffle(candidates)
-    chosen_names = candidates[:n]
-    return [cap_columns(table_dataset.get_table(db_id, name), max_columns) for name in chosen_names]
+    # Over-sample the shuffled candidate list before materializing --
+    # some same-db tables are genuinely empty (0 rows/columns, see
+    # SynSQLTableDataset._drop_empty_tables' docstring) and get skipped
+    # below, so taking exactly the first n names up front could leave us
+    # short of n negatives. get_table() is cheap for anything already
+    # cached (e.g. corpus tables), so this costs little in practice.
+    chosen: list[Table] = []
+    for name in candidates:
+        if len(chosen) >= n:
+            break
+        table = table_dataset.get_table(db_id, name)
+        if table.num_rows == 0 or table.num_columns == 0:
+            continue
+        chosen.append(cap_columns(table, max_columns))
+    return chosen
 
 
 def resolve_train_batches(
@@ -128,7 +141,15 @@ def resolve_train_batches(
         hard_negatives = []
         for idx in idx_batch:
             question, tables = query_dataset[idx]
-            table = cap_columns(rng.choice(tables), max_columns)
+            non_empty = [t for t in tables if t.num_rows > 0 and t.num_columns > 0]
+            if not non_empty:
+                # This query's only positive table(s) are genuinely empty
+                # (0 rows/columns) -- see SynSQLTableDataset's
+                # _drop_empty_tables docstring. Nothing valid to train on
+                # for this query; skip it rather than handing an encoder
+                # a table it can't encode (some baselines raise on this).
+                continue
+            table = cap_columns(rng.choice(non_empty), max_columns)
             pairs.append((question, table))
 
             if n_hard_negatives > 0:

@@ -46,14 +46,33 @@ from src.training.trainer import PretrainTrainer
 
 def make_batches(tables, batch_size, rng, max_columns=20):
     """Same bucket-by-size + truncate-wide-tables strategy as
-    scripts/real_data_check.py::bucket_tables -- keeps padding cost down."""
+    scripts/real_data_check.py::bucket_tables -- keeps padding cost down.
+
+    Also drops any table with zero rows or zero columns before batching
+    -- a handful of real SynSQL tables are genuinely empty in their
+    source SQLite database (SynSQLTableDataset.get_table() faithfully
+    returns them as a Table with 0-length columns), and there's nothing
+    for ANY encoder to learn from an empty table. Most baselines happen
+    to tolerate this silently, but src/encoding/baseline_encoders/
+    common.py::validate_table (used by e.g. turl.py) explicitly raises
+    on it, which crashes the whole run the first time a batch happens to
+    contain one. Filtering here is the shared choke point every
+    encoder's pretrain batches pass through, so it's a fix for all of
+    them at once, not a turl-specific patch."""
     from src.data.table import Table
 
     capped = []
+    skipped = 0
     for t in tables:
+        if t.num_columns == 0 or t.num_rows == 0:
+            skipped += 1
+            continue
         if len(t.columns) > max_columns:
             t = Table(table_id=t.table_id, table_name=t.table_name, columns=t.columns[:max_columns])
         capped.append(t)
+
+    if skipped:
+        print(f"[make_batches] skipped {skipped} empty table(s) (0 rows or 0 columns)")
 
     capped.sort(key=lambda t: (t.num_columns, t.num_rows))
     batches = [capped[i : i + batch_size] for i in range(0, len(capped), batch_size)]

@@ -81,6 +81,15 @@ class TurlTableEncoder(BaseTableEncoder):
         self.hidden_size = bert.config.hidden_size
         self.cell_max_tokens = cell_max_tokens
 
+        # Frozen, same as every other baseline's backbone -- see
+        # bert_baseline.py's comment. This is just BERT's word-embedding
+        # LOOKUP table (not a full backbone forward pass, already cheap),
+        # but freezing it keeps "only the layers on top train" consistent
+        # across every baseline. self.layers (the visibility-masked
+        # attention stack) remains fully trainable.
+        for p in self.token_embed.parameters():
+            p.requires_grad = False
+
         self.layers = nn.ModuleList(
             [
                 _MaskedEncoderLayer(self.hidden_size, num_heads, self.hidden_size * 4).to(self.device)

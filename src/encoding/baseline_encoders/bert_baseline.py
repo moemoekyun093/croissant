@@ -47,6 +47,35 @@ class BertTableEncoder(BaseTableEncoder):
         self.max_length = max_length
         self.hidden_size = self.backbone.config.hidden_size
 
+        # Frozen feature extractor, per-professor's guidance: use BERT's
+        # last-layer output as a fixed input feature, never backprop
+        # through BERT itself. Matches CellEncoder's own default
+        # (text_trainable=False) for a fair, consistent comparison, and
+        # avoids retaining BERT's activation graph for backward -- the
+        # single biggest memory cost in these baselines (see strubert.py's
+        # OOM). Note: plain BERT has no separate on-top layer of its own
+        # (see adapter.py::_NUM_LAYERS_KWARG's comment -- "the pretrained
+        # backbone IS the whole model" for this baseline), so freezing it
+        # leaves this encoder itself with zero trainable parameters; the
+        # trainable parts of pretraining/finetuning for this baseline are
+        # entirely the shared DiscriminatorHead / QueryEncoder / MultiScorer
+        # that sit on top of it, not anything inside this file.
+        self.backbone.eval()
+        for p in self.backbone.parameters():
+            p.requires_grad = False
+
+    def train(self, mode: bool = True):
+        """Keep the frozen backbone permanently in eval mode (no dropout)
+        even though Trainer.fit() calls model.train() every epoch, which
+        would otherwise recursively flip it back to train mode -- the
+        no_grad() wrapper around its forward call already prevents any
+        gradient flow regardless of mode, but eval mode also keeps its
+        output features deterministic/stable across repeated calls on the
+        same input, which matters for caching/consistency."""
+        super().train(mode)
+        self.backbone.eval()
+        return self
+
     def _build_sequence(
         self,
         headers: Sequence[str],
@@ -103,7 +132,8 @@ class BertTableEncoder(BaseTableEncoder):
         ids_t = torch.tensor([input_ids], device=self.device)
         attn_mask = torch.ones_like(ids_t)
 
-        out = self.backbone(input_ids=ids_t, attention_mask=attn_mask)
+        with torch.no_grad():
+            out = self.backbone(input_ids=ids_t, attention_mask=attn_mask)
         hidden = out.last_hidden_state[0]  # [seq_len, dim]
         cls = hidden[0]
 

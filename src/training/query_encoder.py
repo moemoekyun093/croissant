@@ -35,16 +35,19 @@ class QueryEncoder(nn.Module):
         output_dim:  FULL embed_dim (matches TableEncoder's per-cell
                      width directly -- no halving, unlike CellEncoder's
                      text_dim).
-        trainable:   unlike CellEncoder's frozen-BERT default, the query
-                     tower defaults to trainable -- finetuning is exactly
-                     the stage where the query side has real supervision
-                     (query -> positive table) to learn from, whereas
-                     CellEncoder's BERT stays frozen throughout to avoid
-                     confounding a novel, unvalidated table architecture
-                     with a drifting text backbone (see
-                     src/training/training_config.md). Set False to keep
-                     it frozen too, if that confound is a concern here
-                     as well.
+        trainable:   when False, self.encoder (BERT) is frozen -- same
+                     "last-layer feature in, train only the layer(s) on
+                     top" pattern applied to every baseline table encoder
+                     (see src/encoding/baseline_encoders/*.py). Here
+                     "the layer on top" is self.proj, a single Linear
+                     from BERT's last_hidden_state to output_dim -- that
+                     stays trainable regardless of this flag, since it's
+                     never part of self.encoder. When True (the old
+                     default), the query tower fully finetunes instead,
+                     on the reasoning that finetuning is the one stage
+                     with real query supervision to learn from -- see
+                     configs/finetune.yaml's query_trainable comment for
+                     the current tradeoff/choice between the two.
         exclude_special_tokens: if True, [CLS]/[SEP] are masked out of
                      the returned query_mask (only real word-piece
                      tokens count as query vectors). Off by default --
@@ -58,13 +61,27 @@ class QueryEncoder(nn.Module):
         self.max_length = max_length
         self.output_dim = output_dim
         self.exclude_special_tokens = exclude_special_tokens
+        self.trainable = trainable
 
         if not trainable:
+            self.encoder.eval()
             for p in self.encoder.parameters():
                 p.requires_grad = False
 
         hidden_size = self.encoder.config.hidden_size
         self.proj = nn.Linear(hidden_size, output_dim, bias=False)
+
+    def train(self, mode: bool = True):
+        """When frozen, keep self.encoder permanently in eval mode (no
+        dropout) even though Trainer.fit() calls model.train() every
+        epoch, which recursively flips every submodule -- same pattern as
+        the baseline table encoders' train() overrides. self.proj (the
+        only trainable part when frozen) still switches train/eval
+        normally via the super().train(mode) call."""
+        super().train(mode)
+        if not self.trainable:
+            self.encoder.eval()
+        return self
 
     def forward(self, queries: list[str]) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -92,8 +109,17 @@ class QueryEncoder(nn.Module):
             return_tensors="pt",
         ).to(device)
 
-        outputs = self.encoder(**encoded)
-        Q = self.proj(outputs.last_hidden_state)  # [B, L, output_dim]
+        if self.trainable:
+            outputs = self.encoder(**encoded)
+        else:
+            # No gradient tracking at all through the frozen backbone --
+            # requires_grad=False on its params already stops it from
+            # accumulating grads, but wrapping in no_grad() also avoids
+            # building/retaining the intermediate activation graph in the
+            # first place, same as every frozen baseline table encoder.
+            with torch.no_grad():
+                outputs = self.encoder(**encoded)
+        Q = self.proj(outputs.last_hidden_state)  # [B, L, output_dim] -- self.proj always trainable
 
         query_mask = encoded["attention_mask"].float()  # [B, L]
 

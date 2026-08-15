@@ -102,6 +102,14 @@ class HyTrelTableEncoder(BaseTableEncoder):
         self.hidden_size = bert.config.hidden_size
         self.cell_max_tokens = cell_max_tokens
 
+        # Frozen, same as every other baseline's backbone -- see
+        # bert_baseline.py's comment. Just BERT's word-embedding lookup
+        # table (already cheap), frozen for consistency with the other
+        # baselines; self.v2e/e2v/fuse (the hypergraph message-passing
+        # layers) remain fully trainable.
+        for p in self.token_embed.parameters():
+            p.requires_grad = False
+
         self.v2e = nn.ModuleList(
             [_SetAttentionPool(self.hidden_size, num_heads).to(self.device) for _ in range(num_layers)]
         )
