@@ -137,7 +137,6 @@ def build_table_model(args):
             text_max_length=args.text_max_length,
             text_trainable=args.text_trainable,
             text_max_batch_size=args.text_max_batch_size,
-            header_mode=args.header_mode,
         )
         return TableEncoder(
             cell_encoder,
@@ -145,6 +144,7 @@ def build_table_model(args):
             num_layers=args.num_layers,
             nonlinearity=args.nonlinearity,
             channel_mix_hidden_dim=args.channel_mix_hidden_dim,
+            num_heads=args.num_heads,
         )
     return build_baseline_model(
         args.encoder,
@@ -177,16 +177,8 @@ if __name__ == "__main__":
              "see src/encoding/baseline_encoders/adapter.py::_NUM_LAYERS_KWARG.",
     )
     parser.add_argument("--nonlinearity", choices=["sigmoid", "tanh", "relu"], help="only used when --encoder ours")
-    parser.add_argument(
-        "--header_mode", choices=["concat", "film"], default="concat",
-        help="only used when --encoder ours: how each cell's column header is "
-             "combined with its content. 'concat' (default) = raw concat of a "
-             "cell-text half and a header half (original behavior). 'film' = "
-             "the header produces a per-channel (gamma, beta) that modulates "
-             "full-width content (FiLM), so content isn't sharing its budget "
-             "with a replicated header constant.",
-    )
     parser.add_argument("--channel_mix_hidden_dim", type=int, help="only used when --encoder ours")
+    parser.add_argument("--num_heads", type=int, default=8, help="ours cross-column attention heads (embed_dim must be divisible by it); default 8 matches the transformer baselines")
     parser.add_argument("--model_name", default=None, help="override the encoder's own default backbone checkpoint (leave unset for TAPAS -- see adapter.py::build_baseline_model)")
     parser.add_argument("--text_model_name")
     parser.add_argument("--text_max_length", type=int)

@@ -79,10 +79,17 @@ _NONLINEARITIES = {
 # the layer stack.
 
 class ColumnAggregator(nn.Module):
-    def __init__(self, input_dim: int, nonlinearity: str = "sigmoid"):
+    def __init__(self, input_dim: int, nonlinearity: str = "sigmoid", num_heads: int = 8):
         super().__init__()
 
         self.input_dim = input_dim
+
+        if input_dim % num_heads != 0:
+            raise ValueError(
+                f"input_dim ({input_dim}) must be divisible by num_heads ({num_heads})"
+            )
+        self.num_heads = num_heads
+        self.head_dim = input_dim // num_heads
 
         if nonlinearity not in _NONLINEARITIES:
             raise ValueError(f"Unknown nonlinearity: {nonlinearity}")
@@ -103,8 +110,10 @@ class ColumnAggregator(nn.Module):
         self.mean_bias_Q = nn.Parameter(torch.zeros(input_dim))
         self.mean_scale_K = nn.Parameter(torch.ones(input_dim))
         self.mean_bias_K = nn.Parameter(torch.zeros(input_dim))
-        self.mean_scale_V = nn.Parameter(torch.ones(input_dim))
-        self.mean_bias_V = nn.Parameter(torch.zeros(input_dim))
+        # value branch: plain channel-mixed projection, NO row-attention
+        # (gated-Gram) -- removed. Rows must stay atomic on the value path
+        # so cross-column attention combines row-matched cells, not
+        # row-blends; also drops a third of the [B,N,M,M,k] Gram cost.
 
     def _row_attention(
         self,
@@ -114,8 +123,14 @@ class ColumnAggregator(nn.Module):
         mean_bias: torch.Tensor,
     ) -> torch.Tensor:
         """
-        The ORIGINAL per-channel formula, unchanged, applied to a
-        channel-mixed representation Xp instead of raw input.
+        Multi-head row aggregation. The original per-channel formula is
+        the H = k special case (head_dim = 1): each head groups d = k/H
+        channels and builds ONE M x M gated Gram Z Zᵀ over the head's d
+        channels (a d-dimensional inner product between rows), instead of
+        one scalar-Gram per channel. That single M x M matrix is shared
+        across the head's d channels in the matvec back. This shrinks the
+        Gram from [B,N,M,M,k] to [B,N,M,M,H] -- the term that otherwise
+        blocks high embed_dim.
 
         Xp: [B, N, M, k]
         row_mask: [B, M]
@@ -123,23 +138,31 @@ class ColumnAggregator(nn.Module):
         """
 
         B, N, M, k = Xp.shape
+        H, d = self.num_heads, self.head_dim
 
         denom = row_mask.sum(dim=-1).clamp(min=1.0)  # [B]
         channel_means = (
             Xp * row_mask.view(B, 1, M, 1)
         ).sum(dim=2) / denom.view(B, 1, 1)  # [B, N, k]
 
+        # per-channel learnable gate, then one scalar per head (mean over
+        # the head's d channels) so it multiplies the head's M x M Gram.
         gate = mean_scale * channel_means + mean_bias  # [B, N, k]
+        gate_h = gate.view(B, N, H, d).mean(dim=-1)  # [B, N, H]
 
-        A = torch.einsum("bnic,bnjc->bnijc", Xp, Xp)  # [B, N, M, M, k]
-        A = self.sigma(A * gate.view(B, N, 1, 1, k))
+        Xph = Xp.reshape(B, N, M, H, d)
+
+        # Z Zᵀ per head: row-row similarity is now a d-dim inner product
+        A = torch.einsum("bnihd,bnjhd->bnijh", Xph, Xph)  # [B, N, M, M, H]
+        A = self.sigma(A * gate_h.view(B, N, 1, 1, H))
 
         row_mask_i = row_mask.view(B, 1, M, 1)
         row_mask_j = row_mask.view(B, 1, 1, M)
         pair_mask = row_mask_i * row_mask_j  # [B, 1, M, M]
-        A = A * pair_mask.unsqueeze(-1)
+        A = A * pair_mask.unsqueeze(-1)  # [B,1,M,M,1] broadcast over heads
 
-        return torch.einsum("bnijc,bnjc->bnic", A, Xp)  # [B, N, M, k]
+        out = torch.einsum("bnijh,bnjhd->bnihd", A, Xph)  # [B, N, M, H, d]
+        return out.reshape(B, N, M, k)
 
     def forward(
         self, X: torch.Tensor, row_mask: torch.Tensor
@@ -159,7 +182,7 @@ class ColumnAggregator(nn.Module):
 
         Q = X_Q + self._row_attention(X_Q, row_mask, self.mean_scale_Q, self.mean_bias_Q)
         K = X_K + self._row_attention(X_K, row_mask, self.mean_scale_K, self.mean_bias_K)
-        V = X_V + self._row_attention(X_V, row_mask, self.mean_scale_V, self.mean_bias_V)
+        V = X_V  # plain projection -- value net (gated-Gram) removed
 
         return Q, K, V
 
@@ -175,8 +198,15 @@ class ColumnAggregator(nn.Module):
 # mixed-channel information from ColumnAggregator.
 
 class CrossColumnAttention(nn.Module):
-    def __init__(self, input_dim: int):
+    def __init__(self, input_dim: int, num_heads: int = 8):
         super().__init__()
+
+        if input_dim % num_heads != 0:
+            raise ValueError(
+                f"input_dim ({input_dim}) must be divisible by num_heads ({num_heads})"
+            )
+        self.num_heads = num_heads
+        self.head_dim = input_dim // num_heads
 
         self.norm_q = nn.LayerNorm(input_dim)
         self.norm_k = nn.LayerNorm(input_dim)
@@ -200,22 +230,31 @@ class CrossColumnAttention(nn.Module):
         """
 
         B, N, M, k = Q.shape
+        H, d = self.num_heads, self.head_dim
 
         real_m = row_mask.sum(dim=-1).clamp(min=1.0)  # [B]
-        scale = (real_m.view(B, 1, 1) * k) ** 0.5
+        # per-head scale: each head sums over rows AND its own d channels
+        scale = (real_m.view(B, 1, 1, 1) * d) ** 0.5  # [B,1,1,1] -> (i,j,h)
 
-        # row-matched (row m of column i vs row m of column j), summed
-        # jointly over rows AND all k channels.
-        scores = torch.einsum("bimc,bjmc->bij", Q, K) / scale  # [B, N, N]
+        Qh = Q.reshape(B, N, M, H, d)
+        Kh = K.reshape(B, N, M, H, d)
+        Vh = V.reshape(B, N, M, H, d)
 
-        doc_mask = col_mask.view(B, 1, N)
+        # per-head row-matched score: Frobenius inner product of the two
+        # [M, d] blocks (row m of column i vs row m of column j), summed
+        # jointly over rows AND the head's d channels -- one N x N map per
+        # head instead of a single map collapsing all k channels.
+        scores = torch.einsum("bimhd,bjmhd->bijh", Qh, Kh) / scale  # [B, N, N, H]
+
+        doc_mask = col_mask.view(B, 1, N, 1)  # mask key columns j, all heads
         scores = scores.masked_fill(doc_mask == 0, float("-inf"))
 
-        attn = torch.softmax(scores, dim=-1)  # softmax over j
+        attn = torch.softmax(scores, dim=2)  # softmax over key columns j, per head
 
-        out = torch.einsum("bij,bjmc->bimc", attn, V)  # [B, N, M, k]
+        out = torch.einsum("bijh,bjmhd->bimhd", attn, Vh)  # [B, N, M, H, d]
+        out = out.reshape(B, N, M, k)
 
-        return self.W_O(out)
+        return self.W_O(out)  # W_O mixes the heads (kept for uniformity)
 
     def forward(
         self,
@@ -265,11 +304,12 @@ class TableLayer(nn.Module):
         input_dim: int,
         nonlinearity: str = "sigmoid",
         channel_mix_hidden_dim: int | None = None,
+        num_heads: int = 8,
     ):
         super().__init__()
 
-        self.column_aggregator = ColumnAggregator(input_dim, nonlinearity=nonlinearity)
-        self.cross_column_attention = CrossColumnAttention(input_dim)
+        self.column_aggregator = ColumnAggregator(input_dim, nonlinearity=nonlinearity, num_heads=num_heads)
+        self.cross_column_attention = CrossColumnAttention(input_dim, num_heads=num_heads)
         self.channel_mix = ChannelMix(input_dim, channel_mix_hidden_dim)
 
     def forward(
@@ -278,18 +318,8 @@ class TableLayer(nn.Module):
         row_mask: torch.Tensor,
         col_mask: torch.Tensor,
     ) -> torch.Tensor:
-        # Two residual sub-layers, matching a standard transformer block:
-        #   1) residual around the attention (column_aggregator +
-        #      cross_column_attention). This path used to REPLACE X outright
-        #      (no skip), so across the stacked TableLayers the attention
-        #      output had no identity path -- a prime cause of signal
-        #      washing out / representation collapse with depth. The
-        #      attention sub-modules already LayerNorm their inputs
-        #      internally, so `X + attn(X)` is a clean pre-norm residual.
-        #   2) residual around the MLP -- already present INSIDE ChannelMix
-        #      (`post_norm(columns + mixed)`), so it's not repeated here.
         Q, K, V = self.column_aggregator(X, row_mask)
-        X = X + self.cross_column_attention(Q, K, V, row_mask, col_mask)
+        X = self.cross_column_attention(Q, K, V, row_mask, col_mask)
         X = self.channel_mix(X)
         return X
 
@@ -306,6 +336,7 @@ class TableEncoder(nn.Module):
         num_layers: int = 1,
         nonlinearity: str = "sigmoid",
         channel_mix_hidden_dim: int | None = None,
+        num_heads: int = 8,
     ):
         super().__init__()
 
@@ -315,7 +346,7 @@ class TableEncoder(nn.Module):
 
         self.layers = nn.ModuleList(
             [
-                TableLayer(embed_dim, nonlinearity, channel_mix_hidden_dim)
+                TableLayer(embed_dim, nonlinearity, channel_mix_hidden_dim, num_heads=num_heads)
                 for _ in range(num_layers)
             ]
         )

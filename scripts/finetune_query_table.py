@@ -224,6 +224,11 @@ if __name__ == "__main__":
         "--channel_mix_hidden_dim", type=int,
         help="defaults to embed_dim * 2 when omitted",
     )
+    parser.add_argument(
+        "--num_heads", type=int, default=8,
+        help="ours cross-column attention heads (embed_dim must be divisible by it); "
+             "default 8 matches the transformer baselines",
+    )
     parser.add_argument("--query_model_name")
     parser.add_argument(
         "--query_trainable", action=argparse.BooleanOptionalAction,
@@ -547,6 +552,7 @@ if __name__ == "__main__":
         num_layers=args.num_layers,
         nonlinearity=args.nonlinearity,
         channel_mix_hidden_dim=args.channel_mix_hidden_dim,
+        num_heads=args.num_heads,
     )
     load_pretrained_encoder(model, args.pretrained_checkpoint, device=args.device)
 
