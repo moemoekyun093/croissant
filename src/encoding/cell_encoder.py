@@ -206,6 +206,7 @@ class CellEncoder(nn.Module):
         text_max_length: int = 32,
         text_trainable: bool = False,
         text_max_batch_size: int = 2048,
+        header_mode: str = "concat",
     ):
         super().__init__()
 
@@ -214,14 +215,18 @@ class CellEncoder(nn.Module):
                 f"output_dim must be even (cell half + header half "
                 f"concatenated, no projection): got {output_dim}"
             )
+        if header_mode not in ("concat", "film"):
+            raise ValueError(f"header_mode must be 'concat' or 'film', got {header_mode!r}")
 
-        self.output_dim = output_dim  # final, post-concatenation width
+        self.output_dim = output_dim  # final width
         self.text_dim = output_dim // 2  # BERT projection width, per half
+        self.header_mode = header_mode
 
         # single shared BERT + projection, used for BOTH cell text and
-        # header text -- same pathway, same weights. Projects to
-        # text_dim (half of output_dim), since a cell's final embedding
-        # is the two halves concatenated, unprojected.
+        # header text -- same pathway, same weights, projected to text_dim.
+        # Kept at text_dim (= output_dim // 2) in BOTH modes so the text
+        # cache is identical whether you run concat or film -- FiLM just
+        # consumes those same text vectors differently below.
         self.text_embedder = TextEmbedder(
             model_name=text_model_name,
             output_dim=self.text_dim,
@@ -229,6 +234,19 @@ class CellEncoder(nn.Module):
             trainable=text_trainable,
             max_batch_size=text_max_batch_size,
         )
+
+        # -- header_mode="film": Feature-wise Linear Modulation --
+        # Instead of concat(cell_half, header_half), give the cell CONTENT
+        # the full output_dim and let the header (once per column) produce
+        # a per-channel (gamma, beta) that modulates it:
+        #     cell = (1 + gamma(header)) * content + beta(header)
+        # Content no longer shares its budget with a replicated header
+        # constant, and the header interacts multiplicatively rather than
+        # as a fixed stacked half. Both heads are small and trainable; the
+        # frozen BERT text_embedder (and its cache) are untouched.
+        if header_mode == "film":
+            self.film_content = nn.Linear(self.text_dim, self.output_dim)   # content: text_dim -> k
+            self.film_gen = nn.Linear(self.text_dim, 2 * self.output_dim)   # header  -> (gamma, beta)
 
     def save_text_cache(self, path: str) -> None:
         """Persists the shared cell/header BERT-embedding cache to disk
@@ -271,7 +289,11 @@ class CellEncoder(nn.Module):
         header_embed = self.text_embedder([column.header]).to(device)    # [1, text_dim]
         header_embeds = header_embed.expand(n, -1)                       # [N, text_dim]
 
-        return torch.cat([cell_embeds, header_embeds], dim=-1)  # [N, output_dim] -- raw concat, no projection
+        if self.header_mode == "film":
+            content = self.film_content(cell_embeds)  # [N, output_dim]
+            gamma, beta = self.film_gen(header_embeds).chunk(2, dim=-1)  # each [N, output_dim]
+            return (1.0 + gamma) * content + beta  # [N, output_dim] -- FiLM
+        return torch.cat([cell_embeds, header_embeds], dim=-1)  # [N, output_dim] -- raw concat
 
     def encode_tables_batched(
         self, tables: list[Table]
@@ -394,7 +416,12 @@ class CellEncoder(nn.Module):
             # fully populated at this point -- vectorized gather.
             header_for_cell = H[ct, cc]  # [N, half_k]
 
-            fused = torch.cat([raw_cell_embeds, header_for_cell], dim=-1)  # [N, k] -- concat only
+            if self.header_mode == "film":
+                content = self.film_content(raw_cell_embeds)  # [N, k]
+                gamma, beta = self.film_gen(header_for_cell).chunk(2, dim=-1)  # each [N, k]
+                fused = (1.0 + gamma) * content + beta  # [N, k] -- FiLM
+            else:
+                fused = torch.cat([raw_cell_embeds, header_for_cell], dim=-1)  # [N, k] -- concat
 
             X[ct, cc, cr] = fused
 

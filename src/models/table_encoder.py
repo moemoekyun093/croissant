@@ -278,8 +278,18 @@ class TableLayer(nn.Module):
         row_mask: torch.Tensor,
         col_mask: torch.Tensor,
     ) -> torch.Tensor:
+        # Two residual sub-layers, matching a standard transformer block:
+        #   1) residual around the attention (column_aggregator +
+        #      cross_column_attention). This path used to REPLACE X outright
+        #      (no skip), so across the stacked TableLayers the attention
+        #      output had no identity path -- a prime cause of signal
+        #      washing out / representation collapse with depth. The
+        #      attention sub-modules already LayerNorm their inputs
+        #      internally, so `X + attn(X)` is a clean pre-norm residual.
+        #   2) residual around the MLP -- already present INSIDE ChannelMix
+        #      (`post_norm(columns + mixed)`), so it's not repeated here.
         Q, K, V = self.column_aggregator(X, row_mask)
-        X = self.cross_column_attention(Q, K, V, row_mask, col_mask)
+        X = X + self.cross_column_attention(Q, K, V, row_mask, col_mask)
         X = self.channel_mix(X)
         return X
 
