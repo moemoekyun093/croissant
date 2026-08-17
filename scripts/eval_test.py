@@ -172,10 +172,12 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     # query tower -- must match training so the state_dict loads and
     # scoring behaves identically
-    ap.add_argument("--query_model_name", default=None)
-    ap.add_argument("--query_max_length", type=int, default=None)
-    ap.add_argument("--query_trainable", action=argparse.BooleanOptionalAction, default=True)
-    ap.add_argument("--exclude_special_tokens", action=argparse.BooleanOptionalAction, default=True)
+    # Defaults MUST match configs/finetune.yaml so the query tower matches
+    # the checkpoints and scoring is identical to training.
+    ap.add_argument("--query_model_name", default="bert-base-uncased")
+    ap.add_argument("--query_max_length", type=int, default=32)
+    ap.add_argument("--query_trainable", action=argparse.BooleanOptionalAction, default=False)
+    ap.add_argument("--exclude_special_tokens", action=argparse.BooleanOptionalAction, default=False)
     # 'ours' cell encoder -- match training defaults
     ap.add_argument("--text_model_name", default="bert-base-uncased")
     ap.add_argument("--text_max_length", type=int, default=32)
