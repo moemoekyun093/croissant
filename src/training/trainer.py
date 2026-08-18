@@ -301,6 +301,7 @@ class FinetuneTrainer:
         seed: int = 42,
         profile: bool = False,
         profile_every: int = 20,
+        score_table_chunk_size: int | None = None,
     ):
         self.model = model.to(device)
         self.query_encoder = query_encoder.to(device)
@@ -314,8 +315,12 @@ class FinetuneTrainer:
         # adds a few torch.cuda-syncing time.perf_counter() calls per step.
         self.profile = profile
         self.profile_every = profile_every
+        if score_table_chunk_size is not None and score_table_chunk_size <= 0:
+            raise ValueError("score_table_chunk_size must be positive or None")
+        self.score_table_chunk_size = score_table_chunk_size
         self._profile_accum = {
             "n": 0, "n_queries": 0, "n_tables": 0,
+            "table_microbatches": 0,
             "query_s": 0.0, "frozen_s": 0.0, "network_s": 0.0, "score_s": 0.0,
         }
 
@@ -484,7 +489,31 @@ class FinetuneTrainer:
         t_table = time.perf_counter()
 
         try:
-            scores = cross_score_queries_tables(self.scorer, self.scoring_mode, Q, X, row_mask, col_mask)
+            chunk_size = self.score_table_chunk_size
+            if chunk_size is None or X.shape[0] <= chunk_size:
+                scores = cross_score_queries_tables(
+                    self.scorer, self.scoring_mode, Q, X, row_mask, col_mask
+                )
+            else:
+                # Candidate chunking changes only peak materialization of
+                # the [Bq, Bt, L, N, M] similarity tensor. Concatenating
+                # every chunk before InfoNCE restores the same complete
+                # [Bq, Bt] score matrix and preserves gradients to every
+                # query/table embedding.
+                scores = torch.cat(
+                    [
+                        cross_score_queries_tables(
+                            self.scorer,
+                            self.scoring_mode,
+                            Q,
+                            X[start : start + chunk_size],
+                            row_mask[start : start + chunk_size],
+                            col_mask[start : start + chunk_size],
+                        )
+                        for start in range(0, X.shape[0], chunk_size)
+                    ],
+                    dim=1,
+                )
             self._maybe_sync()
         except Exception:
             print(
@@ -515,6 +544,7 @@ class FinetuneTrainer:
             self._record_profile(
                 n_queries=len(queries),
                 n_tables=len(tables),
+                table_microbatches=getattr(self.model, "_last_table_microbatches", 1),
                 query_s=t_query - t_start,
                 frozen_s=frozen_s,
                 network_s=network_s,
@@ -568,7 +598,8 @@ class FinetuneTrainer:
             torch.cuda.synchronize(dev)
 
     def _record_profile(
-        self, n_queries: int, n_tables: int, query_s: float, frozen_s: float, network_s: float, score_s: float
+        self, n_queries: int, n_tables: int, table_microbatches: int,
+        query_s: float, frozen_s: float, network_s: float, score_s: float
     ) -> None:
         """Accumulate per-stage timings and print a running average every
         self.profile_every steps, so the printed numbers reflect a stable
@@ -585,6 +616,7 @@ class FinetuneTrainer:
         acc["n"] += 1
         acc["n_queries"] += n_queries
         acc["n_tables"] += n_tables
+        acc["table_microbatches"] += table_microbatches
         acc["query_s"] += query_s
         acc["frozen_s"] += frozen_s
         acc["network_s"] += network_s
@@ -598,7 +630,8 @@ class FinetuneTrainer:
                 f"query encode: {1000 * acc['query_s'] / n:.1f}ms "
                 f"({100 * acc['query_s'] / total:.0f}%, avg {acc['n_queries'] / n:.0f} queries/step) | "
                 f"frozen backbone: {1000 * acc['frozen_s'] / n:.1f}ms "
-                f"({100 * acc['frozen_s'] / total:.0f}%, avg {acc['n_tables'] / n:.0f} tables/step) | "
+                f"({100 * acc['frozen_s'] / total:.0f}%, avg {acc['n_tables'] / n:.0f} tables/step, "
+                f"{acc['table_microbatches'] / n:.1f} microbatches) | "
                 f"network on top: {1000 * acc['network_s'] / n:.1f}ms "
                 f"({100 * acc['network_s'] / total:.0f}%) | "
                 f"scoring: {1000 * acc['score_s'] / n:.1f}ms "

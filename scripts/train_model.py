@@ -146,6 +146,8 @@ def build_table_model(args):
             nonlinearity=args.nonlinearity,
             channel_mix_hidden_dim=args.channel_mix_hidden_dim,
             num_heads=args.num_heads,
+            table_microbatch_cell_budget=getattr(args, "table_microbatch_cell_budget", None),
+            table_microbatch_max_tables=getattr(args, "table_microbatch_max_tables", None),
         )
     return build_baseline_model(
         args.encoder,
@@ -153,7 +155,9 @@ def build_table_model(args):
         model_name=args.model_name,
         num_layers=args.num_layers,
         tabbie_ffn_hidden_dim=args.tabbie_ffn_hidden_dim,
-        turl_attention_budget=args.turl_attention_budget,
+        turl_attention_budget=getattr(args, "turl_attention_budget", None),
+        table_microbatch_cell_budget=getattr(args, "table_microbatch_cell_budget", None),
+        table_microbatch_max_tables=getattr(args, "table_microbatch_max_tables", None),
         device=args.device,
     )
 
@@ -192,6 +196,22 @@ if __name__ == "__main__":
     parser.add_argument(
         "--channel_mix_hidden_dim", type=int,
         help="ours only: hidden width of each pointwise ChannelMix MLP (default: 2 * embed_dim)",
+    )
+    parser.add_argument(
+        "--table_microbatch_cell_budget",
+        type=_int_or_none,
+        default=None,
+        help="all encoders: maximum padded cell slots B*N_max*M_max per "
+             "shape-aware candidate-table microbatch; preserves full-pool "
+             "InfoNCE and candidate order (default None disables)",
+    )
+    parser.add_argument(
+        "--table_microbatch_max_tables",
+        type=_int_or_none,
+        default=None,
+        help="all baseline encoders: maximum tables per encoder forward "
+             "microbatch, useful when token sequence cost is not captured "
+             "well by cell count (default None disables)",
     )
     parser.add_argument(
         "--tabbie_ffn_hidden_dim", type=int,
@@ -323,6 +343,14 @@ if __name__ == "__main__":
              "printed every --profile_every steps",
     )
     parser.add_argument("--profile_every", type=int, default=20)
+    parser.add_argument(
+        "--score_table_chunk_size",
+        type=_int_or_none,
+        default=None,
+        help="all encoders: score this many candidate tables at a time, "
+             "then concatenate the complete score matrix before InfoNCE; "
+             "reduces peak similarity-tensor memory without changing the loss",
+    )
     parser.add_argument("--checkpoint_dir", default="eval/report_runs")
     parser.add_argument("--log_every", type=int, default=50)
     parser.add_argument("--seed", type=int, default=42)
@@ -825,6 +853,7 @@ if __name__ == "__main__":
         seed=args.seed,
         profile=args.profile,
         profile_every=args.profile_every,
+        score_table_chunk_size=args.score_table_chunk_size,
     )
 
     # Same "auto-resume if a checkpoint already exists" pattern as stage
@@ -921,6 +950,9 @@ if __name__ == "__main__":
         "scoring_mode": args.scoring_mode,
         "embed_dim": args.embed_dim,
         "num_layers": args.num_layers,
+        "table_microbatch_cell_budget": args.table_microbatch_cell_budget,
+        "table_microbatch_max_tables": args.table_microbatch_max_tables,
+        "score_table_chunk_size": args.score_table_chunk_size,
         "turl_attention_budget": args.turl_attention_budget if args.encoder == "turl" else None,
         "n_hard_negatives": args.n_hard_negatives,
         "patience": args.patience,

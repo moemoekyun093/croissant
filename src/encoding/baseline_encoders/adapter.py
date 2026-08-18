@@ -41,6 +41,8 @@ class BaselineCellwiseAdapter(nn.Module):
         baseline_encoder: BaseTableEncoder,
         embed_dim: int | None = None,
         cacheable: bool = False,
+        table_microbatch_cell_budget: int | None = None,
+        table_microbatch_max_tables: int | None = None,
     ):
         """
         baseline_encoder: any BaseTableEncoder subclass instance
@@ -76,6 +78,14 @@ class BaselineCellwiseAdapter(nn.Module):
         native_dim = self._infer_native_dim(baseline_encoder)
         self.embed_dim = embed_dim if embed_dim is not None else native_dim
         self.cacheable = cacheable
+        for name, value in (
+            ("table_microbatch_cell_budget", table_microbatch_cell_budget),
+            ("table_microbatch_max_tables", table_microbatch_max_tables),
+        ):
+            if value is not None and value <= 0:
+                raise ValueError(f"{name} must be positive or None")
+        self.table_microbatch_cell_budget = table_microbatch_cell_budget
+        self.table_microbatch_max_tables = table_microbatch_max_tables
         self._table_cache: dict[str, torch.Tensor] = {}  # table_id -> raw [n_cols, n_rows, native_dim], CPU
 
         self.projection = (
@@ -176,6 +186,47 @@ class BaselineCellwiseAdapter(nn.Module):
         """
         return f"{table.table_id}#c{len(table.columns)}#r{table.num_rows}"
 
+    def _shape_microbatches(self, indices: list[int], tables: list[Table]) -> list[list[int]]:
+        """Group candidate indices by padded table shape under memory caps.
+
+        This is shared by every baseline exposing ``forward_batch``. It
+        changes only how candidate tables ride GPU kernels; adapter outputs
+        are written back to their original indices before global scoring.
+        """
+        if not indices:
+            return []
+        cell_budget = self.table_microbatch_cell_budget
+        max_tables = self.table_microbatch_max_tables
+        if cell_budget is None and max_tables is None:
+            return [indices]
+
+        def ceil_power_of_two(value: int) -> int:
+            return 1 << (max(1, value) - 1).bit_length()
+
+        bins: dict[tuple[int, int], list[int]] = {}
+        for i in indices:
+            table = tables[i]
+            key = (
+                ceil_power_of_two(table.num_columns),
+                ceil_power_of_two(table.num_rows),
+            )
+            bins.setdefault(key, []).append(i)
+
+        groups: list[list[int]] = []
+        for (col_bin, row_bin), bin_indices in sorted(
+            bins.items(), key=lambda item: (item[0][0] * item[0][1], item[0])
+        ):
+            group_size = len(bin_indices)
+            if cell_budget is not None:
+                group_size = min(group_size, max(1, cell_budget // (col_bin * row_bin)))
+            if max_tables is not None:
+                group_size = min(group_size, max_tables)
+            groups.extend(
+                bin_indices[start : start + group_size]
+                for start in range(0, len(bin_indices), group_size)
+            )
+        return groups
+
     def forward_batch_cellwise(
         self, tables: list[Table], ablation: str | None = None, profile: bool = False
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -197,6 +248,7 @@ class BaselineCellwiseAdapter(nn.Module):
 
         device = next(self.parameters()).device
         is_cuda = device.type == "cuda"
+        self._last_table_microbatches = 1
 
         per_table_cell: list = [None] * len(tables)  # each [n_cols_i, n_rows_i, embed_dim]
 
@@ -245,38 +297,38 @@ class BaselineCellwiseAdapter(nn.Module):
         # separate batching representation.
         if cache_miss_indices:
             if hasattr(self.baseline_encoder, "forward_batch"):
-                batch_inputs = [
-                    (*self._table_to_headers_rows(tables[i]), None) for i in cache_miss_indices
-                ]
+                groups = self._shape_microbatches(cache_miss_indices, tables)
+                for group in groups:
+                    batch_inputs = [
+                        (*self._table_to_headers_rows(tables[i]), None) for i in group
+                    ]
 
-                if is_cuda:
-                    torch.cuda.synchronize()
-                t_fb_0 = time.perf_counter()
-                encodings = self.baseline_encoder.forward_batch(batch_inputs)
-                if is_cuda:
-                    torch.cuda.synchronize()
-                t_fb_1 = time.perf_counter()
+                    if is_cuda:
+                        torch.cuda.synchronize()
+                    t_fb_0 = time.perf_counter()
+                    encodings = self.baseline_encoder.forward_batch(batch_inputs)
+                    if is_cuda:
+                        torch.cuda.synchronize()
+                    t_fb_1 = time.perf_counter()
 
-                # tabbie/strubert's forward_batch records its own
-                # internal frozen-vs-network split (see their
-                # forward_batch docstrings) -- use that directly, it's
-                # more precise than this call's total. bert/tapas's
-                # forward_batch has no network part at all (no table-
-                # level stack on top of the raw backbone), so its whole
-                # cost is frozen time.
-                if hasattr(self.baseline_encoder, "_last_frozen_s"):
-                    frozen_s += self.baseline_encoder._last_frozen_s
-                    network_s += self.baseline_encoder._last_network_s
-                else:
-                    frozen_s += t_fb_1 - t_fb_0
+                    # TABBIE/StruBERT/TURL record their own internal
+                    # frozen-vs-network split. BERT/TAPAS have no trainable
+                    # table stack, so their whole group call is frozen time.
+                    if hasattr(self.baseline_encoder, "_last_frozen_s"):
+                        frozen_s += self.baseline_encoder._last_frozen_s
+                        network_s += self.baseline_encoder._last_network_s
+                    else:
+                        frozen_s += t_fb_1 - t_fb_0
 
-                for miss_pos, i in enumerate(cache_miss_indices):
-                    encoding = encodings[miss_pos]
-                    raw_cell = encoding.cell_embeddings.transpose(0, 1)
-                    if self.cacheable:
-                        self._table_cache[self._cache_key(tables[i])] = raw_cell.detach().cpu()
-                    per_table_cell[i] = self.projection(raw_cell)
+                    for group_pos, i in enumerate(group):
+                        encoding = encodings[group_pos]
+                        raw_cell = encoding.cell_embeddings.transpose(0, 1)
+                        if self.cacheable:
+                            self._table_cache[self._cache_key(tables[i])] = raw_cell.detach().cpu()
+                        per_table_cell[i] = self.projection(raw_cell)
+                self._last_table_microbatches = len(groups)
             else:
+                self._last_table_microbatches = max(1, len(cache_miss_indices))
                 if is_cuda:
                     torch.cuda.synchronize()
                 t_loop_0 = time.perf_counter()
@@ -406,6 +458,8 @@ def build_baseline_model(
     num_layers: int | None = None,
     tabbie_ffn_hidden_dim: int | None = None,
     turl_attention_budget: int | None = None,
+    table_microbatch_cell_budget: int | None = None,
+    table_microbatch_max_tables: int | None = None,
     device: str | None = None,
 ) -> BaselineCellwiseAdapter:
     """Convenience factory -- build any registered baseline by name
@@ -463,6 +517,8 @@ def build_baseline_model(
         baseline_encoder,
         embed_dim=embed_dim,
         cacheable=encoder_name in _FULLY_FROZEN_ENCODERS,
+        table_microbatch_cell_budget=table_microbatch_cell_budget,
+        table_microbatch_max_tables=table_microbatch_max_tables,
     )
     if device is not None:
         adapter = adapter.to(device)

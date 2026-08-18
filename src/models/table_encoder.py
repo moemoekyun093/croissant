@@ -40,6 +40,7 @@ speed ever needs addressing.
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from src.data.table import Table
 
@@ -337,12 +338,24 @@ class TableEncoder(nn.Module):
         nonlinearity: str = "sigmoid",
         channel_mix_hidden_dim: int | None = None,
         num_heads: int = 8,
+        table_microbatch_cell_budget: int | None = None,
+        table_microbatch_max_tables: int | None = None,
     ):
         super().__init__()
 
         self.cell_encoder = cell_encoder
         self.embed_dim = embed_dim
         self.num_layers = num_layers
+        if table_microbatch_cell_budget is not None and table_microbatch_cell_budget <= 0:
+            raise ValueError("table_microbatch_cell_budget must be positive or None")
+        if table_microbatch_max_tables is not None and table_microbatch_max_tables <= 0:
+            raise ValueError("table_microbatch_max_tables must be positive or None")
+        # Maximum padded cell slots (B * N_max * M_max) contextualized in
+        # one table microbatch. This changes execution grouping only; all
+        # candidate embeddings are restored to their original order before
+        # the global query-table loss is formed.
+        self.table_microbatch_cell_budget = table_microbatch_cell_budget
+        self.table_microbatch_max_tables = table_microbatch_max_tables
 
         self.layers = nn.ModuleList(
             [
@@ -455,9 +468,128 @@ class TableEncoder(nn.Module):
         PretrainTrainer/FinetuneTrainer ever exercised them (see git
         history if that table-table retrieval path is ever needed again).
 
+        When table_microbatch_cell_budget is set, candidates are grouped by
+        power-of-two row/column shape bins, contextualized group-by-group,
+        and padded/restored to the original candidate order here. Attention,
+        normalization, and the pointwise MLP never mix different tables in
+        the batch dimension, so this is mathematically the same model and
+        leaves the subsequent full-query-pool InfoNCE loss unchanged.
+
         returns: (X, col_mask, row_mask, cell_mask) -- X: [B, N, M, k]
         """
-        return self._encode_cellwise(tables, ablation=ablation, profile=profile)
+        budget = self.table_microbatch_cell_budget
+        max_tables_per_group = self.table_microbatch_max_tables
+        if (budget is None and max_tables_per_group is None) or len(tables) <= 1:
+            self._last_table_microbatches = 1
+            return self._encode_cellwise(tables, ablation=ablation, profile=profile)
+
+        # Bucketing both axes independently avoids combining a tall/narrow
+        # table with a short/wide one and paying padding for the large empty
+        # rectangle their unrelated maxima would create. Within a bin, each
+        # axis is at most 2x its smallest member.
+        def ceil_power_of_two(value: int) -> int:
+            return 1 << (max(1, value) - 1).bit_length()
+
+        bins: dict[tuple[int, int], list[int]] = {}
+        for i, table in enumerate(tables):
+            shape_bin = (
+                ceil_power_of_two(table.num_columns),
+                ceil_power_of_two(table.num_rows),
+            )
+            bins.setdefault(shape_bin, []).append(i)
+
+        groups: list[list[int]] = []
+        for (col_bin, row_bin), indices in sorted(
+            bins.items(), key=lambda item: (item[0][0] * item[0][1], item[0])
+        ):
+            tables_per_group = len(indices)
+            if budget is not None:
+                tables_per_group = min(
+                    tables_per_group, max(1, budget // (col_bin * row_bin))
+                )
+            if max_tables_per_group is not None:
+                tables_per_group = min(tables_per_group, max_tables_per_group)
+            groups.extend(
+                indices[start : start + tables_per_group]
+                for start in range(0, len(indices), tables_per_group)
+            )
+
+        # If all candidates already form one safe group in input order,
+        # retain the original fast path and avoid padding/scatter overhead.
+        if len(groups) == 1 and groups[0] == list(range(len(tables))):
+            self._last_table_microbatches = 1
+            return self._encode_cellwise(tables, ablation=ablation, profile=profile)
+
+        per_table_x: list[torch.Tensor | None] = [None] * len(tables)
+        per_table_col: list[torch.Tensor | None] = [None] * len(tables)
+        per_table_row: list[torch.Tensor | None] = [None] * len(tables)
+        per_table_cell: list[torch.Tensor | None] = [None] * len(tables)
+        frozen_s = 0.0
+        network_s = 0.0
+
+        for group in groups:
+            group_tables = [tables[i] for i in group]
+            group_x, group_col, group_row, group_cell = self._encode_cellwise(
+                group_tables, ablation=ablation, profile=False
+            )
+            frozen_s += self._last_frozen_s
+            network_s += self._last_network_s
+
+            for local_i, original_i in enumerate(group):
+                n_cols = tables[original_i].num_columns
+                n_rows = tables[original_i].num_rows
+                per_table_x[original_i] = group_x[local_i, :n_cols, :n_rows]
+                per_table_col[original_i] = group_col[local_i, :n_cols]
+                per_table_row[original_i] = group_row[local_i, :n_rows]
+                per_table_cell[original_i] = group_cell[local_i, :n_cols, :n_rows]
+
+        if any(value is None for value in per_table_x):
+            raise RuntimeError("internal error: table microbatching failed to restore every candidate")
+
+        max_cols = max(table.num_columns for table in tables)
+        max_rows = max(table.num_rows for table in tables)
+
+        # F.pad + stack preserves each group's autograd graph, unlike
+        # detaching/caching contextualized outputs, while presenting the
+        # scorer with the exact same globally padded tensors as before.
+        X = torch.stack(
+            [
+                F.pad(value, (0, 0, 0, max_rows - value.shape[1], 0, max_cols - value.shape[0]))
+                for value in per_table_x
+                if value is not None
+            ],
+            dim=0,
+        )
+        col_mask = torch.stack(
+            [F.pad(value, (0, max_cols - value.shape[0])) for value in per_table_col if value is not None],
+            dim=0,
+        )
+        row_mask = torch.stack(
+            [F.pad(value, (0, max_rows - value.shape[0])) for value in per_table_row if value is not None],
+            dim=0,
+        )
+        cell_mask = torch.stack(
+            [
+                F.pad(value, (0, max_rows - value.shape[1], 0, max_cols - value.shape[0]))
+                for value in per_table_cell
+                if value is not None
+            ],
+            dim=0,
+        )
+
+        self._last_frozen_s = frozen_s
+        self._last_network_s = network_s
+        self._last_table_microbatches = len(groups)
+
+        if profile:
+            total = frozen_s + network_s
+            print(
+                f"[profile] {len(tables)} tables -> {len(groups)} shape-aware microbatches | "
+                f"cell encoding: {frozen_s:.3f}s ({100*frozen_s/max(total, 1e-12):.1f}%) | "
+                f"table layers: {network_s:.3f}s ({100*network_s/max(total, 1e-12):.1f}%)"
+            )
+
+        return X, col_mask, row_mask, cell_mask
 
 
 # ==========================================================
