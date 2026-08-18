@@ -153,6 +153,7 @@ def build_table_model(args):
         model_name=args.model_name,
         num_layers=args.num_layers,
         tabbie_ffn_hidden_dim=args.tabbie_ffn_hidden_dim,
+        turl_attention_budget=args.turl_attention_budget,
         device=args.device,
     )
 
@@ -195,6 +196,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--tabbie_ffn_hidden_dim", type=int,
         help="TABBIE only: hidden width of each row/column Transformer FFN (default: 4 * native hidden size)",
+    )
+    parser.add_argument(
+        "--turl_attention_budget",
+        type=int,
+        default=2_000_000,
+        help="TURL only: dynamic microbatch budget B*S_max^2 for padded "
+             "visibility attention (default: 2000000); outlier tables whose "
+             "own S^2 exceeds the budget run alone",
     )
     parser.add_argument("--num_heads", type=int, default=8, help="ours cross-column attention heads (embed_dim must be divisible by it); default 8 matches the transformer baselines")
     parser.add_argument("--model_name", default=None, help="override the encoder's own default backbone checkpoint (leave unset for TAPAS -- see adapter.py::build_baseline_model)")
@@ -912,6 +921,7 @@ if __name__ == "__main__":
         "scoring_mode": args.scoring_mode,
         "embed_dim": args.embed_dim,
         "num_layers": args.num_layers,
+        "turl_attention_budget": args.turl_attention_budget if args.encoder == "turl" else None,
         "n_hard_negatives": args.n_hard_negatives,
         "patience": args.patience,
         "skip_pretrain": args.skip_pretrain,

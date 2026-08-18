@@ -52,7 +52,13 @@ class _MaskedEncoderLayer(nn.Module):
 
     def forward(self, x: torch.Tensor, attn_bias: torch.Tensor) -> torch.Tensor:
         # x: [1, seq, D], attn_bias: [seq, seq] additive mask
-        attn_out, _ = self.self_attn(x, x, x, attn_mask=attn_bias)
+        # Attention weights are never consumed by TURL. Leaving
+        # need_weights=True (PyTorch's default) materializes the dense
+        # attention-weight tensor solely to discard it, and also prevents
+        # MultiheadAttention from taking its optimized SDPA path.
+        attn_out, _ = self.self_attn(
+            x, x, x, attn_mask=attn_bias, need_weights=False
+        )
         x = self.norm1(x + self.dropout(attn_out))
         ff = self.linear2(F.gelu(self.linear1(x)))
         x = self.norm2(x + self.dropout(ff))
@@ -66,6 +72,7 @@ class TurlTableEncoder(BaseTableEncoder):
         num_layers: int = 4,
         num_heads: int = 8,
         cell_max_tokens: int = 8,
+        max_attention_elements: int = 2_000_000,
         device: Optional[str] = None,
     ):
         super().__init__(model_name, device)
@@ -77,6 +84,15 @@ class TurlTableEncoder(BaseTableEncoder):
         self.token_embed = bert.embeddings.word_embeddings.to(self.device)
         self.hidden_size = bert.config.hidden_size
         self.cell_max_tokens = cell_max_tokens
+        self.num_heads = num_heads
+        if max_attention_elements <= 0:
+            raise ValueError("max_attention_elements must be positive")
+        # Dynamic batching budget measured as B * S_max^2, where B is a
+        # TURL microbatch's table count and S_max its padded node length.
+        # This is architecture-independent and directly tracks the dense
+        # visibility-attention term. A table whose own S^2 exceeds the
+        # budget is still valid; it simply runs alone.
+        self.max_attention_elements = max_attention_elements
 
         # Frozen, same as every other baseline's backbone -- see
         # bert_baseline.py's comment. This is just BERT's word-embedding
@@ -127,9 +143,14 @@ class TurlTableEncoder(BaseTableEncoder):
             for j in range(n_cols):
                 all_texts.append(clean_cell(rows[i][j]))
 
-        batch_ids = self.tokenizer(all_texts, add_special_tokens=False)["input_ids"] if all_texts else []
+        batch_ids = self.tokenizer(
+            all_texts,
+            add_special_tokens=False,
+            truncation=True,
+            max_length=self.cell_max_tokens,
+        )["input_ids"] if all_texts else []
         tok_lists = [
-            ids[: self.cell_max_tokens] if ids else [self.tokenizer.unk_token_id]
+            ids if ids else [self.tokenizer.unk_token_id]
             for ids in batch_ids
         ]
         ptr = 0
@@ -185,12 +206,19 @@ class TurlTableEncoder(BaseTableEncoder):
 
         return attn_bias, metadata_ids, cell_token_ids
 
-    def forward(
+    def _prepare_table(
         self,
         headers: Sequence[str],
         rows: Sequence[Sequence[object]],
         caption: Optional[str] = None,
-    ) -> TableEncoding:
+    ) -> Tuple[torch.Tensor, torch.Tensor, int, int, int]:
+        """Build one table's pre-contextualization node sequence.
+
+        Returns ``(x, attn_bias, n_metadata, n_rows, n_cols)``. ``x`` is
+        [S, D], with cell mentions already pooled to one node each; the
+        trainable masked Transformer is deliberately not run here so many
+        independently masked tables can subsequently share one GPU call.
+        """
         validate_table(headers, rows)
         n_rows, n_cols = len(rows), len(headers)
 
@@ -219,18 +247,146 @@ class TurlTableEncoder(BaseTableEncoder):
         ).unsqueeze(-1)
 
         n_metadata = metadata_x.shape[0]
-        x = torch.cat([metadata_x, cell_x], dim=0).unsqueeze(0)  # [1, metadata + cells, D]
+        x = torch.cat([metadata_x, cell_x], dim=0)  # [metadata + cells, D]
 
-        for layer in self.layers:
-            x = layer(x, attn_bias)
-        hidden = x.squeeze(0)  # [seq, D]
+        return x, attn_bias, n_metadata, n_rows, n_cols
 
-        # Cell nodes are already pooled before contextualization, so their
-        # contextualized vectors can be reshaped directly back to the table.
-        cell_emb = hidden[n_metadata:].reshape(n_rows, n_cols, self.hidden_size)
-
+    @staticmethod
+    def _encoding_from_hidden(
+        hidden: torch.Tensor,
+        n_metadata: int,
+        n_rows: int,
+        n_cols: int,
+    ) -> TableEncoding:
+        """Restore one real (unpadded) TURL sequence to table tensors."""
+        cell_emb = hidden[n_metadata:].reshape(n_rows, n_cols, hidden.shape[-1])
         row_emb = cell_emb.mean(dim=1)
         col_emb = cell_emb.mean(dim=0)
-        table_emb = hidden[0]  # CLS, globally visible to (and from) every cell
-
+        table_emb = hidden[0]
         return TableEncoding(cell_emb, row_emb, col_emb, table_emb)
+
+    def _forward_microbatch(
+        self,
+        tables: Sequence[Tuple[Sequence[str], Sequence[Sequence[object]], Optional[str]]],
+    ) -> List[TableEncoding]:
+        """Run a padded group of tables with independent visibility masks."""
+        prepared = [self._prepare_table(headers, rows, caption) for headers, rows, caption in tables]
+        batch_size = len(prepared)
+        max_seq = max(item[0].shape[0] for item in prepared)
+        device = self.token_embed.weight.device
+        dtype = prepared[0][0].dtype
+
+        # Each table is an independent batch element. Real queries can see
+        # exactly their original visibility set; padded keys remain blocked.
+        # A padded query is allowed to see only itself to avoid an all-masked
+        # softmax row (NaN), and all padded outputs are discarded afterward.
+        x = torch.zeros(batch_size, max_seq, self.hidden_size, device=device, dtype=dtype)
+        blocked = torch.ones(batch_size, max_seq, max_seq, device=device, dtype=torch.bool)
+        real_lengths: List[int] = []
+        for b, (table_x, table_bias, _n_metadata, _n_rows, _n_cols) in enumerate(prepared):
+            seq_len = table_x.shape[0]
+            real_lengths.append(seq_len)
+            x[b, :seq_len] = table_x
+            blocked[b, :seq_len, :seq_len] = torch.isneginf(table_bias)
+            if seq_len < max_seq:
+                pad = torch.arange(seq_len, max_seq, device=device)
+                blocked[b, pad, pad] = False
+
+        # MultiheadAttention accepts a distinct mask per sample only in
+        # [B * num_heads, S, S] form. For a singleton, the cheaper 2-D mask
+        # is equivalent and avoids an unnecessary per-head copy.
+        if batch_size == 1:
+            batched_mask = blocked[0]
+        else:
+            batched_mask = blocked.repeat_interleave(self.num_heads, dim=0)
+
+        for layer in self.layers:
+            x = layer(x, batched_mask)
+
+        results: List[TableEncoding] = []
+        for b, (_table_x, _bias, n_metadata, n_rows, n_cols) in enumerate(prepared):
+            hidden = x[b, : real_lengths[b]]
+            results.append(self._encoding_from_hidden(hidden, n_metadata, n_rows, n_cols))
+        return results
+
+    def forward(
+        self,
+        headers: Sequence[str],
+        rows: Sequence[Sequence[object]],
+        caption: Optional[str] = None,
+    ) -> TableEncoding:
+        x, attn_bias, n_metadata, n_rows, n_cols = self._prepare_table(headers, rows, caption)
+
+        for layer in self.layers:
+            x = layer(x.unsqueeze(0), attn_bias).squeeze(0)
+        return self._encoding_from_hidden(x, n_metadata, n_rows, n_cols)
+
+    def forward_batch(
+        self,
+        tables: Sequence[Tuple[Sequence[str], Sequence[Sequence[object]], Optional[str]]],
+    ) -> List[TableEncoding]:
+        """Encode a candidate pool in order-preserving dynamic microbatches.
+
+        Candidate selection, hard negatives, deduplication, and the
+        query-by-candidate positive mask have already been resolved before
+        this method is called. We may therefore reorder tables solely for
+        efficient encoding, then scatter their encodings back to the exact
+        input order before scoring.
+
+        Tables are sorted by an upper bound on their TURL node count and
+        greedily grouped while ``B * S_max^2`` stays below
+        ``max_attention_elements``. Different row/column shapes are safe:
+        padding plus a per-table visibility mask prevents any cross-table or
+        padded-node interaction. Outlier tables automatically run alone.
+        """
+        if not tables:
+            return []
+
+        estimates: List[int] = []
+        for headers, rows, caption in tables:
+            validate_table(headers, rows)
+            metadata_texts = len(headers) + (1 if caption else 0)
+            estimates.append(
+                1 + len(rows) * len(headers) + self.cell_max_tokens * metadata_texts
+            )
+
+        order = sorted(range(len(tables)), key=estimates.__getitem__)
+        groups: List[List[int]] = []
+        current: List[int] = []
+        current_max = 0
+        for idx in order:
+            proposed_max = max(current_max, estimates[idx])
+            proposed_cost = (len(current) + 1) * proposed_max * proposed_max
+            if current and proposed_cost > self.max_attention_elements:
+                groups.append(current)
+                current = []
+                current_max = 0
+            current.append(idx)
+            current_max = max(current_max, estimates[idx])
+        if current:
+            groups.append(current)
+
+        import time
+
+        is_cuda = self.token_embed.weight.device.type == "cuda"
+        if is_cuda:
+            torch.cuda.synchronize()
+        started = time.perf_counter()
+
+        results: List[Optional[TableEncoding]] = [None] * len(tables)
+        for group in groups:
+            group_results = self._forward_microbatch([tables[i] for i in group])
+            for original_idx, encoding in zip(group, group_results):
+                results[original_idx] = encoding
+
+        if is_cuda:
+            torch.cuda.synchronize()
+        # TURL's frozen lookup/tokenization is tiny compared with its
+        # trainable masked stack. Attribute the combined batched call to the
+        # network bucket rather than repeating the adapter's old and highly
+        # misleading "97% frozen backbone / 0% network" report.
+        self._last_frozen_s = 0.0
+        self._last_network_s = time.perf_counter() - started
+
+        assert all(result is not None for result in results)
+        return [result for result in results if result is not None]

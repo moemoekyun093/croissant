@@ -80,7 +80,15 @@ class _SetAttentionPool(nn.Module):
 
     def forward(self, seeds: torch.Tensor, members: torch.Tensor, key_padding_mask: torch.Tensor) -> torch.Tensor:
         # seeds: [N, 1, D] (query per set), members: [N, S, D], key_padding_mask: [N, S] (True = pad)
-        attn_out, _ = self.mha(seeds, members, members, key_padding_mask=key_padding_mask)
+        # The pooling weights are never used. Avoid materializing them and
+        # allow PyTorch to select its optimized scaled-dot-product path.
+        attn_out, _ = self.mha(
+            seeds,
+            members,
+            members,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )
         x = self.norm1(seeds + attn_out)
         x = self.norm2(x + self.ffn(x))
         return x.squeeze(1)  # [N, D]

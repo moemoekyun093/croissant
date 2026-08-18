@@ -50,6 +50,27 @@ def run_one(name: str, cls) -> None:
         assert torch.isneginf(attn_bias[header0_idx, other_column_cell_idx]).item()
         assert attn_bias[header0_idx, first_cell_idx].item() == 0.0
 
+        # Batched TURL must preserve the exact per-table visibility result
+        # and input order even when it internally sorts differently-sized
+        # tables into dynamic microbatches. eval() disables dropout so the
+        # single-table and batched paths are directly comparable.
+        encoder.eval()
+        small_headers = ["City", "Country"]
+        small_rows = [["Helsinki", "Finland"]]
+        batch_inputs = [
+            (HEADERS, ROWS, CAPTION),
+            (small_headers, small_rows, "Cities"),
+        ]
+        with torch.no_grad():
+            singles = [encoder(*table) for table in batch_inputs]
+            batched = encoder.forward_batch(batch_inputs)
+        assert len(batched) == len(singles)
+        for single, combined in zip(singles, batched):
+            assert torch.allclose(single.cell_embeddings, combined.cell_embeddings, atol=1e-5)
+            assert torch.allclose(single.row_embeddings, combined.row_embeddings, atol=1e-5)
+            assert torch.allclose(single.col_embeddings, combined.col_embeddings, atol=1e-5)
+            assert torch.allclose(single.table_embedding, combined.table_embedding, atol=1e-5)
+
     out = encoder.encode(HEADERS, ROWS, caption=CAPTION)
     dt = time.time() - t0
 

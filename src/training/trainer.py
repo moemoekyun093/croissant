@@ -930,17 +930,21 @@ class FinetuneTrainer:
         self.optimizer = AdamW(self._trainable_params(), lr=self.lr, weight_decay=self.weight_decay)
 
         start_epoch = 0
+        best_map = -1.0
         if resume_from is not None:
-            self.load_checkpoint(resume_from)
+            resumed = self.load_checkpoint(resume_from)
             start_epoch = self.global_step // steps_per_epoch
-            self._log(f"resumed from {resume_from}: global_step={self.global_step}, starting at epoch {start_epoch}")
+            best_map = float(resumed.get("val_map", -1.0))
+            self._log(
+                f"resumed from {resume_from}: global_step={self.global_step}, "
+                f"starting at epoch {start_epoch}, best val MAP={best_map:.4f}"
+            )
 
         self.scheduler = build_scheduler(
             self.optimizer, warmup_steps, total_steps, last_epoch=self.global_step - 1
         )
 
         run_start = time.time()
-        best_map = -1.0
         epochs_without_improvement = 0
 
         for epoch in range(start_epoch, num_epochs):
@@ -1049,7 +1053,7 @@ class FinetuneTrainer:
         torch.save(payload, path)
         self._log(f"saved new best checkpoint: {path}")
 
-    def load_checkpoint(self, path: str) -> None:
+    def load_checkpoint(self, path: str) -> dict:
         checkpoint = torch.load(path, map_location=self.device)
         self.model.load_state_dict(checkpoint["model_state_dict"])
         self.query_encoder.load_state_dict(checkpoint["query_encoder_state_dict"])
@@ -1057,3 +1061,4 @@ class FinetuneTrainer:
         if self.optimizer is not None:
             self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         self.global_step = checkpoint["global_step"]
+        return checkpoint

@@ -229,27 +229,20 @@ class BaselineCellwiseAdapter(nn.Module):
 
         # Cache misses: use the baseline's forward_batch (ONE backbone
         # forward pass for every miss table at once) when it exposes one
-        # -- currently bert_baseline.py, tapas_encoder.py, tabbie.py, and
-        # strubert.py, see their forward_batch docstrings for the full
+        # -- currently bert_baseline.py, tapas_encoder.py, tabbie.py,
+        # strubert.py, and turl.py; see their forward_batch docstrings for
+        # the full
         # "why this matters" rationale (this used to call
         # self.baseline_encoder(headers, rows) once PER TABLE here, i.e.
         # one batch-of-1 (or, for strubert, batch-of-1 TWICE) backbone
         # forward pass per table -- the single biggest reason those
         # baselines were slower than 'ours', which always batches every
-        # cell across the whole table batch into one call). turl.py and
-        # hytrel.py deliberately do NOT implement forward_batch: their
-        # expensive part isn't a frozen-backbone forward call at all
-        # (self.token_embed is a cheap nn.Embedding lookup for both) --
-        # it's their OWN trainable per-table architecture (turl's
-        # visibility-masked attention stack, sized by that table's own
-        # n_rows*n_cols visibility matrix; hytrel's hypergraph message
-        # passing, sized by that table's own row/column/table hyperedges)
-        # that's inherently table-shape-dependent, not something a
-        # "concatenate + one combined call + slice back out" fix like the
-        # other four applies to without a much larger restructuring
-        # (padding every table's structure to a shared max shape and
-        # batching the whole trainable stack itself). They fall back to
-        # the original per-table forward() loop, unchanged.
+        # cell across the whole table batch into one call). TURL now uses
+        # size-sorted, visibility-masked dynamic microbatches: differently
+        # shaped tables are padded, independently masked, and restored to
+        # candidate order afterward. HyTrel is the remaining per-table
+        # fallback because its node/hyperedge incidence structure needs a
+        # separate batching representation.
         if cache_miss_indices:
             if hasattr(self.baseline_encoder, "forward_batch"):
                 batch_inputs = [
@@ -412,6 +405,7 @@ def build_baseline_model(
     model_name: str | None = None,
     num_layers: int | None = None,
     tabbie_ffn_hidden_dim: int | None = None,
+    turl_attention_budget: int | None = None,
     device: str | None = None,
 ) -> BaselineCellwiseAdapter:
     """Convenience factory -- build any registered baseline by name
@@ -438,6 +432,10 @@ def build_baseline_model(
     tapas, which have no such stack. Pass the SAME value used for
     --encoder ours to keep that one architectural axis consistent across
     every model that actually has it.
+
+    turl_attention_budget: TURL-only dynamic batching cap measured as
+    B*S_max^2 dense attention elements. It changes execution grouping, not
+    the visibility graph or learned architecture.
     """
     from src.encoding.baseline_encoders import ENCODER_REGISTRY
 
@@ -457,6 +455,8 @@ def build_baseline_model(
             kwargs[layer_kwarg] = num_layers
     if tabbie_ffn_hidden_dim is not None and encoder_name == "tabbie":
         kwargs["ffn_hidden_dim"] = tabbie_ffn_hidden_dim
+    if turl_attention_budget is not None and encoder_name == "turl":
+        kwargs["max_attention_elements"] = turl_attention_budget
     baseline_encoder = encoder_cls(**kwargs)
 
     adapter = BaselineCellwiseAdapter(
