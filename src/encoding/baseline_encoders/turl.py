@@ -10,22 +10,19 @@ matrix** used as an additive attention mask, so that a token can only
 attend to tokens/entities that are "structurally visible" to it, instead
 of full (BERT) or row/column-alternating (TABBIE) attention.
 
-Visibility rule (Sec 4.3-4.4 of the paper): caption and header tokens are
-globally visible to everything (they provide shared context); a cell is
-visible to every other cell in the *same row* and every other cell in the
-*same column*; a cell is NOT visible to a cell in neither the same row nor
-same column. This is strictly sparser than TABBIE's alternating full
-row/column attention (TABBIE contextualizes a cell against *every* other
-cell in its row AND *every* cell in its column at every layer; TURL applies
-one single joint mask per layer, which is a cheaper, single-pass version of
-the same locality bias, but does not average two separate row/column
-representations).
+Visibility rule (Sec. 4.2-4.3 of the paper): caption/topic elements are
+globally visible; header tokens and entity cells are visible only to elements
+in their *same row* or *same column*. Thus, a header conditions cells in its
+column but does not become a table-wide shortcut. This is strictly sparser
+than TABBIE's alternating full row/column attention.
 
-We build token embeddings from BERT's embedding table (so vocabulary /
-subword behavior matches BERT) but the contextualization itself is done by
-a small stack of masked Transformer encoder layers using the visibility
-matrix as an additive attention bias -- this is what TURL calls its
-"structure-aware Transformer encoder".
+TURL's input is a mixed sequence: metadata stays as individual tokens,
+whereas each entity cell is ONE input item.  The original model combines a
+learned entity embedding with a mean-pooled entity-mention embedding before
+contextualization.  This text-only retrieval adaptation has no linked entity
+IDs, so each cell item is its mean-pooled word embedding.  Those already
+grouped cell vectors -- not their individual word pieces -- then enter the
+visibility-masked Transformer alongside caption/header tokens.
 """
 from __future__ import annotations
 
@@ -97,20 +94,19 @@ class TurlTableEncoder(BaseTableEncoder):
             ]
         )
 
-    def _tokenize_cell(self, text: str) -> List[int]:
-        ids = self.tokenizer.encode(text, add_special_tokens=False)
-        return ids[: self.cell_max_tokens] if ids else [self.tokenizer.unk_token_id]
-
     def _build_visibility(
         self,
         headers: Sequence[str],
         rows: Sequence[Sequence[object]],
         caption: Optional[str],
-    ) -> Tuple[torch.Tensor, List[int], List[List[Tuple[int, int]]], Tuple[int, int]]:
+    ) -> Tuple[torch.Tensor, List[int], List[List[List[int]]]]:
         """Returns:
-        input_ids: flat list of token ids
-        cell_spans[i][j] = (start, end) token span for cell (i, j)
-        cls_span: token span of the [CLS]/caption/header block (globally visible)
+        attn_bias: additive visibility mask over metadata-token and cell nodes
+        metadata_ids: [CLS], caption-token, and header-token ids; caption
+            tokens are globally-visible nodes, while header tokens are
+            column-local nodes
+        cell_token_ids[i][j]: word-piece ids for cell (i, j), to be pooled
+            into ONE cell node *before* the Transformer
         """
         n_rows, n_cols = len(rows), len(headers)
 
@@ -138,53 +134,56 @@ class TurlTableEncoder(BaseTableEncoder):
         ]
         ptr = 0
 
-        input_ids: List[int] = [self.tokenizer.cls_token_id]
-        token_row = [-1]  # -1 = globally visible (CLS/caption/headers)
+        metadata_ids: List[int] = [self.tokenizer.cls_token_id]
+        # -1 is globally visible ([CLS] / caption). Headers get unique
+        # negative rows below so same_row never makes headers from different
+        # columns visible to one another.
+        token_row = [-1]
         token_col = [-1]
 
         if caption:
             ids = tok_lists[ptr]
             ptr += 1
-            input_ids += ids
+            metadata_ids += ids
             token_row += [-1] * len(ids)
             token_col += [-1] * len(ids)
 
-        header_spans = []
         for j, h in enumerate(headers):
             ids = tok_lists[ptr]
             ptr += 1
-            start = len(input_ids)
-            input_ids += ids
-            token_row += [-1] * len(ids)  # headers are globally visible, but tagged with their column too
+            metadata_ids += ids
+            token_row += [-(j + 2)] * len(ids)
             token_col += [j] * len(ids)
-            header_spans.append((start, len(input_ids)))
 
-        cell_spans: List[List[Tuple[int, int]]] = [[(0, 0)] * n_cols for _ in range(n_rows)]
+        # Each cell becomes exactly ONE node in the structure-aware encoder.
+        # Its word pieces are pooled into a mention embedding in forward(),
+        # before any row/column contextualization.  This mirrors TURL's
+        # entity-cell input representation (minus unavailable entity IDs).
+        cell_token_ids: List[List[List[int]]] = [[[] for _ in range(n_cols)] for _ in range(n_rows)]
         for i in range(n_rows):
             for j in range(n_cols):
                 ids = tok_lists[ptr]
                 ptr += 1
-                start = len(input_ids)
-                input_ids += ids
-                token_row += [i] * len(ids)
-                token_col += [j] * len(ids)
-                cell_spans[i][j] = (start, len(input_ids))
+                cell_token_ids[i][j] = ids
+                token_row.append(i)
+                token_col.append(j)
 
-        seq_len = len(input_ids)
-        row_t = torch.tensor(token_row)
-        col_t = torch.tensor(token_col)
+        seq_len = len(token_row)
+        device = self.token_embed.weight.device
+        row_t = torch.tensor(token_row, device=device)
+        col_t = torch.tensor(token_col, device=device)
 
         # visibility[a, b] = True if token b is visible from token a
         same_row = row_t.unsqueeze(0) == row_t.unsqueeze(1)
         same_col = col_t.unsqueeze(0) == col_t.unsqueeze(1)
         globally_visible = (row_t == -1).unsqueeze(0) | (row_t == -1).unsqueeze(1)
-        self_visible = torch.eye(seq_len, dtype=torch.bool)
+        self_visible = torch.eye(seq_len, dtype=torch.bool, device=device)
         visible = same_row | same_col | globally_visible | self_visible
 
-        attn_bias = torch.zeros(seq_len, seq_len)
+        attn_bias = torch.zeros(seq_len, seq_len, device=device)
         attn_bias.masked_fill_(~visible, float("-inf"))
 
-        return attn_bias.to(self.device), input_ids, cell_spans, (0, len(input_ids))
+        return attn_bias, metadata_ids, cell_token_ids
 
     def forward(
         self,
@@ -195,33 +194,40 @@ class TurlTableEncoder(BaseTableEncoder):
         validate_table(headers, rows)
         n_rows, n_cols = len(rows), len(headers)
 
-        attn_bias, input_ids, cell_spans, _ = self._build_visibility(headers, rows, caption)
-        ids_t = torch.tensor(input_ids, device=self.device)
-        x = self.token_embed(ids_t).unsqueeze(0)  # [1, seq, D]
+        attn_bias, metadata_ids, cell_token_ids = self._build_visibility(headers, rows, caption)
+
+        # Metadata is token-level in TURL, but table cells are entity-level.
+        # Pool each cell mention's word embeddings NOW, before the masked
+        # Transformer, rather than contextualizing its word pieces and
+        # pooling afterward (the previous, non-TURL-faithful behavior).
+        device = self.token_embed.weight.device
+        metadata_x = self.token_embed(
+            torch.tensor(metadata_ids, device=device)
+        )  # [n_metadata_tokens, D]
+        flat_cell_ids = [token_id for row in cell_token_ids for cell in row for token_id in cell]
+        cell_lengths = [len(cell) for row in cell_token_ids for cell in row]
+        cell_word_x = self.token_embed(
+            torch.tensor(flat_cell_ids, device=device)
+        )  # [sum(cell_lengths), D]
+        cell_lengths_t = torch.tensor(cell_lengths, device=device)
+        zero = torch.zeros(1, self.hidden_size, device=device, dtype=cell_word_x.dtype)
+        cell_csum = torch.cat([zero, cell_word_x.cumsum(dim=0)], dim=0)
+        cell_ends = cell_lengths_t.cumsum(dim=0)
+        cell_starts = cell_ends - cell_lengths_t
+        cell_x = (cell_csum[cell_ends] - cell_csum[cell_starts]) / cell_lengths_t.to(
+            dtype=cell_word_x.dtype
+        ).unsqueeze(-1)
+
+        n_metadata = metadata_x.shape[0]
+        x = torch.cat([metadata_x, cell_x], dim=0).unsqueeze(0)  # [1, metadata + cells, D]
 
         for layer in self.layers:
             x = layer(x, attn_bias)
         hidden = x.squeeze(0)  # [seq, D]
 
-        # Vectorized mean-pool over every cell's token span at once via a
-        # prefix-sum trick, instead of one mean_pool_span (small GPU op)
-        # call per cell in a Python double loop -- same fix as
-        # bert_baseline.py, see that file's comment for the full
-        # rationale. Every cell span here is guaranteed non-empty
-        # (_tokenize_cell always returns at least [unk_token_id]), so no
-        # empty-span fallback branch is needed, unlike bert_baseline.py.
-        zero_row = torch.zeros(1, self.hidden_size, device=self.device, dtype=hidden.dtype)
-        csum = torch.cat([zero_row, hidden.cumsum(dim=0)], dim=0)  # [seq_len+1, dim]
-        starts = torch.tensor(
-            [[cell_spans[i][j][0] for j in range(n_cols)] for i in range(n_rows)],
-            device=self.device,
-        )
-        ends = torch.tensor(
-            [[cell_spans[i][j][1] for j in range(n_cols)] for i in range(n_rows)],
-            device=self.device,
-        )
-        lengths = (ends - starts).clamp(min=1).unsqueeze(-1).to(hidden.dtype)
-        cell_emb = (csum[ends] - csum[starts]) / lengths
+        # Cell nodes are already pooled before contextualization, so their
+        # contextualized vectors can be reshaped directly back to the table.
+        cell_emb = hidden[n_metadata:].reshape(n_rows, n_cols, self.hidden_size)
 
         row_emb = cell_emb.mean(dim=1)
         col_emb = cell_emb.mean(dim=0)

@@ -10,6 +10,8 @@ Usage:
 import sys
 import time
 
+import torch
+
 from src.encoding.baseline_encoders import ENCODER_REGISTRY
 
 HEADERS = ["Player", "Team", "Points"]
@@ -25,6 +27,29 @@ def run_one(name: str, cls) -> None:
     print(f"\n=== {name} ===")
     t0 = time.time()
     encoder = cls()
+
+    if name == "turl":
+        # TURL contextualizes one already-pooled entity/cell node per cell,
+        # not every word piece inside a cell.  Metadata remains token-level.
+        # This catches a regression to the old token-level cell attention
+        # implementation without depending on any model output values.
+        attn_bias, metadata_ids, cell_token_ids = encoder._build_visibility(
+            HEADERS, ROWS, CAPTION
+        )
+        n_cells = len(ROWS) * len(HEADERS)
+        assert attn_bias.shape == (len(metadata_ids) + n_cells,) * 2
+        assert sum(len(row) for row in cell_token_ids) == len(ROWS)
+        assert all(len(cell) >= 1 for row in cell_token_ids for cell in row)
+
+        caption_tokens = encoder.tokenizer(CAPTION, add_special_tokens=False)["input_ids"]
+        header0_idx = 1 + len(caption_tokens)
+        first_cell_idx = len(metadata_ids)
+        other_column_cell_idx = first_cell_idx + 1
+        # Caption/[CLS] is global, while header 0 only sees column 0.
+        assert attn_bias[0, other_column_cell_idx].item() == 0.0
+        assert torch.isneginf(attn_bias[header0_idx, other_column_cell_idx]).item()
+        assert attn_bias[header0_idx, first_cell_idx].item() == 0.0
+
     out = encoder.encode(HEADERS, ROWS, caption=CAPTION)
     dt = time.time() - t0
 

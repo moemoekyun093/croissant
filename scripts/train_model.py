@@ -152,6 +152,7 @@ def build_table_model(args):
         embed_dim=args.embed_dim,
         model_name=args.model_name,
         num_layers=args.num_layers,
+        tabbie_ffn_hidden_dim=args.tabbie_ffn_hidden_dim,
         device=args.device,
     )
 
@@ -187,7 +188,14 @@ if __name__ == "__main__":
              "full-width content (FiLM), so content isn't sharing its budget "
              "with a replicated header constant.",
     )
-    parser.add_argument("--channel_mix_hidden_dim", type=int, help="only used when --encoder ours")
+    parser.add_argument(
+        "--channel_mix_hidden_dim", type=int,
+        help="ours only: hidden width of each pointwise ChannelMix MLP (default: 2 * embed_dim)",
+    )
+    parser.add_argument(
+        "--tabbie_ffn_hidden_dim", type=int,
+        help="TABBIE only: hidden width of each row/column Transformer FFN (default: 4 * native hidden size)",
+    )
     parser.add_argument("--num_heads", type=int, default=8, help="ours cross-column attention heads (embed_dim must be divisible by it); default 8 matches the transformer baselines")
     parser.add_argument("--model_name", default=None, help="override the encoder's own default backbone checkpoint (leave unset for TAPAS -- see adapter.py::build_baseline_model)")
     parser.add_argument("--text_model_name")

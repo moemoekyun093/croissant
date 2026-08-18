@@ -411,6 +411,7 @@ def build_baseline_model(
     embed_dim: int,
     model_name: str | None = None,
     num_layers: int | None = None,
+    tabbie_ffn_hidden_dim: int | None = None,
     device: str | None = None,
 ) -> BaselineCellwiseAdapter:
     """Convenience factory -- build any registered baseline by name
@@ -454,6 +455,8 @@ def build_baseline_model(
         layer_kwarg = _NUM_LAYERS_KWARG.get(encoder_name)
         if layer_kwarg is not None:
             kwargs[layer_kwarg] = num_layers
+    if tabbie_ffn_hidden_dim is not None and encoder_name == "tabbie":
+        kwargs["ffn_hidden_dim"] = tabbie_ffn_hidden_dim
     baseline_encoder = encoder_cls(**kwargs)
 
     adapter = BaselineCellwiseAdapter(

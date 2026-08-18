@@ -35,12 +35,14 @@ from scripts.train_model import build_table_model
 
 MODELS = [
     dict(encoder="ours", embed_dim=768, num_layers=3, num_heads=8, header_mode="film",
-         checkpoint="/mnt/nas/ayane/croissant/eval/report_runs/ours768mh/finetune/best_model.pt",
+         channel_mix_hidden_dim=3072,
+         checkpoint="/mnt/nas/ayane/croissant/eval/report_runs/ours768mlp4x/ours/finetune/best_model.pt",
          text_cache="/tmp/ayane/caches768mh/ours768mh_text_cache.pt"),
-    dict(encoder="turl", embed_dim=64, num_layers=3, num_heads=8, header_mode="concat",
-         checkpoint="/mnt/nas/ayane/croissant/eval/report_runs/turl/finetune/best_model.pt"),
-    dict(encoder="tabbie", embed_dim=64, num_layers=3, num_heads=8, header_mode="concat",
-         checkpoint="/mnt/nas/ayane/croissant/eval/report_runs/tabbie/finetune/best_model.pt"),
+    dict(encoder="tabbie", embed_dim=64, num_layers=2, num_heads=8, header_mode="concat",
+         tabbie_ffn_hidden_dim=2048,
+         checkpoint="/mnt/nas/ayane/croissant/eval/report_runs/tabbie_param22m/tabbie/finetune/best_model.pt"),
+    dict(encoder="tapas", embed_dim=64, num_layers=0, num_heads=8, header_mode="concat",
+         checkpoint="/mnt/nas/ayane/croissant/eval/report_runs/tapas/tapas/finetune/best_model.pt"),
 ]
 
 
@@ -152,6 +154,7 @@ def main():
     ap.add_argument("--text_trainable", action=argparse.BooleanOptionalAction, default=False)
     ap.add_argument("--nonlinearity", default="sigmoid")
     ap.add_argument("--channel_mix_hidden_dim", type=int, default=None)
+    ap.add_argument("--tabbie_ffn_hidden_dim", type=int, default=None)
     ap.add_argument("--model_name", default=None)
     args = ap.parse_args()
 
@@ -196,7 +199,9 @@ def main():
         margs = types.SimpleNamespace(
             encoder=enc, embed_dim=spec["embed_dim"], num_layers=spec["num_layers"],
             num_heads=spec.get("num_heads", 8), header_mode=spec.get("header_mode", "concat"),
-            nonlinearity=args.nonlinearity, channel_mix_hidden_dim=args.channel_mix_hidden_dim,
+            nonlinearity=args.nonlinearity,
+            channel_mix_hidden_dim=spec.get("channel_mix_hidden_dim", args.channel_mix_hidden_dim),
+            tabbie_ffn_hidden_dim=spec.get("tabbie_ffn_hidden_dim", args.tabbie_ffn_hidden_dim),
             text_model_name=args.text_model_name, text_max_length=args.text_max_length,
             text_trainable=args.text_trainable, text_max_batch_size=args.text_max_batch_size,
             model_name=args.model_name, device=args.device)

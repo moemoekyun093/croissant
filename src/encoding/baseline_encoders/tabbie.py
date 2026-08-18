@@ -55,6 +55,7 @@ class TabbieTableEncoder(BaseTableEncoder):
         model_name: str = "bert-base-uncased",
         num_layers: int = 2,
         num_heads: int = 8,
+        ffn_hidden_dim: int | None = None,
         max_rows: int = 129,  # +1 to leave room for the header row
         max_cols: int = 64,
         cell_max_length: int = 32,
@@ -65,6 +66,11 @@ class TabbieTableEncoder(BaseTableEncoder):
         self.cell_encoder = AutoModel.from_pretrained(model_name).to(self.device)
         self.hidden_size = self.cell_encoder.config.hidden_size
         self.cell_max_length = cell_max_length
+        # Preserve the paper/default Transformer expansion (4D) unless an
+        # explicit width is requested for a parameter-matched experiment.
+        self.ffn_hidden_dim = ffn_hidden_dim or self.hidden_size * 4
+        if self.ffn_hidden_dim <= 0:
+            raise ValueError("ffn_hidden_dim must be positive")
 
         # Frozen feature extractor -- see bert_baseline.py's comment for
         # the full rationale. Every cell in the table goes through this
@@ -95,7 +101,7 @@ class TabbieTableEncoder(BaseTableEncoder):
             enc_layer = nn.TransformerEncoderLayer(
                 d_model=self.hidden_size,
                 nhead=num_heads,
-                dim_feedforward=self.hidden_size * 4,
+                dim_feedforward=self.ffn_hidden_dim,
                 batch_first=True,
             )
             return enc_layer.to(self.device)
