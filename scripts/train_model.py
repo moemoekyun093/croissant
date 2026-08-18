@@ -175,6 +175,15 @@ if __name__ == "__main__":
     # shared architecture knobs -- applied identically across every --encoder
     parser.add_argument("--embed_dim", type=int, help="shared across every encoder, incl. baselines (via projection)")
     parser.add_argument(
+        "--scoring_embed_dim",
+        type=int,
+        default=None,
+        help="retrieval width after table contextualization (default: embed_dim). "
+             "For example, --embed_dim 768 --scoring_embed_dim 64 keeps a "
+             "768-wide table network and learns a 768->64 projection before "
+             "query-table scoring; the query tower also outputs 64 dimensions.",
+    )
+    parser.add_argument(
         "--num_layers", type=int,
         help="depth of the table-level stack built on top of frozen BERT cell/token "
              "encoding -- applies to ours (RCPE layers), tabbie (row/col transformer "
@@ -481,6 +490,10 @@ if __name__ == "__main__":
     parser.set_defaults(checkpoint_dir="eval/report_runs")
 
     args = parser.parse_args()
+    if args.scoring_embed_dim is None:
+        args.scoring_embed_dim = args.embed_dim
+    if args.scoring_embed_dim <= 0:
+        parser.error("--scoring_embed_dim must be positive")
 
     encoder_checkpoint_dir = os.path.join(args.checkpoint_dir, args.encoder)
     pretrain_dir = os.path.join(encoder_checkpoint_dir, "pretrain")
@@ -811,7 +824,7 @@ if __name__ == "__main__":
 
     query_encoder = QueryEncoder(
         model_name=args.query_model_name,
-        output_dim=args.embed_dim,
+        output_dim=args.scoring_embed_dim,
         max_length=args.query_max_length,
         trainable=args.query_trainable,
         exclude_special_tokens=args.exclude_special_tokens,
@@ -956,6 +969,7 @@ if __name__ == "__main__":
         "seed": args.seed,
         "scoring_mode": args.scoring_mode,
         "embed_dim": args.embed_dim,
+        "scoring_embed_dim": args.scoring_embed_dim,
         "num_layers": args.num_layers,
         "table_microbatch_cell_budget": args.table_microbatch_cell_budget,
         "table_microbatch_max_tables": args.table_microbatch_max_tables,

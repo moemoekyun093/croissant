@@ -17,6 +17,7 @@ import time
 from typing import Callable, Iterable
 
 import torch
+from torch import nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 
@@ -306,6 +307,24 @@ class FinetuneTrainer:
         self.model = model.to(device)
         self.query_encoder = query_encoder.to(device)
         self.scorer = MultiScorer().to(device)
+        table_dim = getattr(model, "embed_dim", None)
+        retrieval_dim = getattr(query_encoder, "output_dim", None)
+        if table_dim is None or retrieval_dim is None:
+            raise AttributeError(
+                "FinetuneTrainer needs model.embed_dim and "
+                "query_encoder.output_dim to align table/query retrieval widths"
+            )
+        # Keep contextualization at the table model's full internal width,
+        # then map every contextualized cell into the query tower's retrieval
+        # width.  This is deliberately owned by the finetuning trainer rather
+        # than forward_batch_cellwise(): ELECTRA pretraining still consumes
+        # the unprojected table representation.  When the widths already
+        # match this is an exact no-op, preserving all existing runs.
+        self.table_projection = (
+            nn.Linear(table_dim, retrieval_dim)
+            if table_dim != retrieval_dim
+            else nn.Identity()
+        ).to(device)
         self.device = device
 
         # Per-stage timing (query encoding vs. frozen-backbone table
@@ -355,7 +374,9 @@ class FinetuneTrainer:
     def _trainable_params(self):
         return [
             p
-            for module in (self.model, self.query_encoder, self.scorer)
+            for module in (
+                self.model, self.query_encoder, self.table_projection, self.scorer
+            )
             for p in module.parameters()
             if p.requires_grad
         ]
@@ -478,6 +499,7 @@ class FinetuneTrainer:
 
         try:
             X, col_mask, row_mask, cell_mask = self.model.forward_batch_cellwise(tables)
+            X = self.table_projection(X)
             self._maybe_sync()
         except Exception:
             print(
@@ -643,6 +665,7 @@ class FinetuneTrainer:
     def train_step(self, batch: tuple[list[tuple[str, Table]], list[Table], list[set[str]]]) -> float:
         self.model.train()
         self.query_encoder.train()
+        self.table_projection.train()
         self.scorer.train()
         self.optimizer.zero_grad()
 
@@ -734,6 +757,7 @@ class FinetuneTrainer:
         """
         self.model.eval()
         self.query_encoder.eval()
+        self.table_projection.eval()
         self.scorer.eval()
 
         # Defensive re-check: corpus_tables SHOULD already be filtered by
@@ -826,6 +850,7 @@ class FinetuneTrainer:
 
                 try:
                     X, col_mask, row_mask, cell_mask = self.model.forward_batch_cellwise(c_chunk)
+                    X = self.table_projection(X)
                     self._maybe_sync()
                 except Exception:
                     print(
@@ -1054,6 +1079,7 @@ class FinetuneTrainer:
         selection -- see evaluate_map for that."""
         self.model.eval()
         self.query_encoder.eval()
+        self.table_projection.eval()
         self.scorer.eval()
         losses = []
 
@@ -1078,6 +1104,7 @@ class FinetuneTrainer:
             "global_step": self.global_step,
             "model_state_dict": self.model.state_dict(),
             "query_encoder_state_dict": self.query_encoder.state_dict(),
+            "table_projection_state_dict": self.table_projection.state_dict(),
             "scorer_state_dict": self.scorer.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
         }
@@ -1090,6 +1117,14 @@ class FinetuneTrainer:
         checkpoint = torch.load(path, map_location=self.device)
         self.model.load_state_dict(checkpoint["model_state_dict"])
         self.query_encoder.load_state_dict(checkpoint["query_encoder_state_dict"])
+        projection_state = checkpoint.get("table_projection_state_dict")
+        if projection_state is not None:
+            self.table_projection.load_state_dict(projection_state)
+        elif any(True for _ in self.table_projection.parameters()):
+            raise KeyError(
+                "checkpoint has no table_projection_state_dict, but this run "
+                "requests different contextualization and retrieval widths"
+            )
         self.scorer.load_state_dict(checkpoint["scorer_state_dict"])
         if self.optimizer is not None:
             self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])

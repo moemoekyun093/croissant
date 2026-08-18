@@ -206,8 +206,13 @@ def main():
             text_trainable=args.text_trainable, text_max_batch_size=args.text_max_batch_size,
             model_name=args.model_name, device=args.device)
         model = build_table_model(margs)
+        # The contextualizer width (spec["embed_dim"]) and retrieval
+        # width can differ.  Infer the latter from the saved query tower,
+        # which is authoritative and works for both old equal-width and
+        # new 768->64 checkpoints.
+        retrieval_dim = raw["query_encoder_state_dict"]["proj.weight"].shape[0]
         query_encoder = QueryEncoder(
-            model_name=args.query_model_name, output_dim=spec["embed_dim"],
+            model_name=args.query_model_name, output_dim=retrieval_dim,
             max_length=args.query_max_length, trainable=args.query_trainable,
             exclude_special_tokens=args.exclude_special_tokens)
         if not args.query_trainable:
