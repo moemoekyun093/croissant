@@ -85,17 +85,17 @@ def cross_score_queries_tables(
 def query_table_info_nce_loss(
     cross_scores: torch.Tensor,
     positive_indices: torch.Tensor | None = None,
+    positive_mask: torch.Tensor | None = None,
     temperature: float = 0.07,
 ) -> torch.Tensor:
     """
     Real query -> positive-table contrastive loss (finetuning), given a
     [Bq, Bt] cross-score matrix (cross_score_queries_tables' output).
-    Every OTHER column for a given query's row is a negative -- ordinary
-    in-batch negatives when Bt == Bq (other queries' positive tables),
-    PLUS any extra hard-negative tables appended past column Bq - 1 when
-    Bt > Bq (see scripts/finetune_query_table.py's resolve_train_batches,
-    which appends same-database, non-gold tables as harder negatives
-    than a random other query's positive table).
+    With ``positive_mask`` omitted, every non-target column is a negative
+    and this is ordinary one-positive cross-entropy.  With a mask, every
+    ``True`` entry in row i is a valid answer for query i and the loss is
+    multi-positive InfoNCE.  This prevents a table that is valid for two
+    queries in one batch from becoming a false negative for either one.
 
     positive_indices: [Bq] int64, the column index of query i's true
         positive table. Defaults to arange(Bq) -- positive for query i
@@ -104,6 +104,9 @@ def query_table_info_nce_loss(
         0..Bq-1, one per query, in order), any hard negatives appended
         afterward. Pass this explicitly only if a caller ever needs a
         different positive layout.
+    positive_mask: optional bool [Bq, Bt] matrix whose true entries mark
+        every candidate table valid for each query.  Mutually exclusive
+        with ``positive_indices``.
 
     One-directional (query -> table) softmax cross-entropy, NOT
     symmetric like info_nce_loss's table-table version: retrieval here
@@ -115,6 +118,25 @@ def query_table_info_nce_loss(
     returns: scalar loss
     """
     Bq, Bt = cross_scores.shape
+
+    if positive_mask is not None:
+        if positive_indices is not None:
+            raise ValueError("pass either positive_indices or positive_mask, not both")
+        if positive_mask.shape != cross_scores.shape:
+            raise ValueError(
+                "positive_mask must have the same shape as cross_scores: "
+                f"got {tuple(positive_mask.shape)} vs {tuple(cross_scores.shape)}"
+            )
+        positive_mask = positive_mask.to(device=cross_scores.device, dtype=torch.bool)
+        if not torch.all(positive_mask.any(dim=1)):
+            missing = (~positive_mask.any(dim=1)).nonzero(as_tuple=False).flatten().tolist()
+            raise ValueError(f"multi-positive loss received queries with no candidate positive: {missing[:10]}")
+
+        scaled = cross_scores / temperature
+        positive_logsumexp = torch.logsumexp(
+            scaled.masked_fill(~positive_mask, float("-inf")), dim=1
+        )
+        return (torch.logsumexp(scaled, dim=1) - positive_logsumexp).mean()
 
     if positive_indices is None:
         assert Bq <= Bt, (

@@ -356,34 +356,28 @@ class FinetuneTrainer:
         ]
 
     def _score_batch(
-        self, batch: tuple[list[tuple[str, Table]], list[Table]]
-    ) -> torch.Tensor:
-        """batch: (pairs, hard_negatives).
+        self, batch: tuple[list[tuple[str, Table]], list[Table], list[set[str]]]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """batch: (pairs, hard_negatives, gold_table_ids).
 
         pairs: list of Bq (question, positive_table) pairs, ALREADY
-            resolved to exactly one positive table per query (if a
-            query has multiple valid positives in your dataset, pick
-            one -- e.g. randomly -- before calling this; this trainer
-            stays agnostic to how that resolution happened, same as
-            it's agnostic to the data source). Every OTHER query's
-            positive table in `pairs` doubles as an in-batch negative
-            for this query, so avoid two queries in the same batch
-            sharing an identical positive table unless that's
-            intentional.
-        hard_negatives: extra candidate tables with no query of their
-            own, appended as columns Bq..Bq+len(hard_negatives)-1 --
-            e.g. same-database, non-gold tables (see
-            scripts/finetune_query_table.py's resolve_train_batches),
-            which are harder negatives than a random other query's
-            positive table since they share schema/domain vocabulary.
-            Pass an empty list to disable (plain in-batch negatives
-            only, previous behavior).
+            resolved to one sampled positive table per query, which
+            guarantees every query has a positive candidate.
+        hard_negatives: extra same-database, non-gold candidates.
+        gold_table_ids: complete gold-table ID set for each query.  A
+            candidate valid for more than one query becomes an additional
+            positive for every matching query, rather than a false negative.
 
-        returns: [Bq, Bq + len(hard_negatives)] cross-score matrix
-            (query i vs. table j); query i's positive is always at
-            column i (see query_table_info_nce_loss's docstring).
+        returns: ``(cross_scores, positive_mask)``.  Candidate columns
+            are deduplicated by table ID before encoding, so their count
+            need not equal the number of queries.
         """
-        pairs, hard_negatives = batch
+        pairs, hard_negatives, gold_table_ids = batch
+        if len(pairs) != len(gold_table_ids):
+            raise ValueError(
+                "_score_batch requires one complete gold-table-ID set per pair: "
+                f"got {len(pairs)} pairs and {len(gold_table_ids)} sets"
+            )
 
         # Same empty-table guard _corpus_scores applies to the validation
         # corpus -- a table with 0 rows or 0 columns reaching
@@ -420,7 +414,27 @@ class FinetuneTrainer:
             hard_negatives = [t for t in hard_negatives if t.num_rows > 0 and t.num_columns > 0]
 
         queries = [q for q, _ in pairs]
-        tables = [t for _, t in pairs] + list(hard_negatives)
+        # The same table may be selected by multiple queries or sampled
+        # more than once as a hard negative.  Encode it once; the
+        # row-wise mask below retains all of its multi-query supervision.
+        tables = []
+        seen_table_ids = set()
+        for table in [t for _, t in pairs] + list(hard_negatives):
+            if table.table_id not in seen_table_ids:
+                seen_table_ids.add(table.table_id)
+                tables.append(table)
+        candidate_ids = [table.table_id for table in tables]
+        positive_mask = torch.tensor(
+            [[table_id in gold_ids for table_id in candidate_ids] for gold_ids in gold_table_ids],
+            dtype=torch.bool,
+            device=self.device,
+        )
+        if not torch.all(positive_mask.any(dim=1)):
+            missing = (~positive_mask.any(dim=1)).nonzero(as_tuple=False).flatten().tolist()
+            raise ValueError(
+                "_score_batch lost every positive candidate for query row(s) "
+                f"{missing[:10]}; sampled tables and gold sets are inconsistent"
+            )
 
         # Each stage wrapped separately so a crash's traceback -- and any
         # printed diagnostic -- clearly names WHICH stage (query encoding
@@ -507,7 +521,7 @@ class FinetuneTrainer:
                 score_s=t_score - t_table,
             )
 
-        return scores
+        return scores, positive_mask
 
     def _isolate_table_encoding_failure(self, tables: list[Table]) -> None:
         """Retry table encoding ONE TABLE AT A TIME to pinpoint exactly
@@ -593,14 +607,16 @@ class FinetuneTrainer:
             for k in acc:
                 acc[k] = 0
 
-    def train_step(self, batch: tuple[list[tuple[str, Table]], list[Table]]) -> float:
+    def train_step(self, batch: tuple[list[tuple[str, Table]], list[Table], list[set[str]]]) -> float:
         self.model.train()
         self.query_encoder.train()
         self.scorer.train()
         self.optimizer.zero_grad()
 
-        cross_scores = self._score_batch(batch)
-        loss = query_table_info_nce_loss(cross_scores, temperature=self.temperature)
+        cross_scores, positive_mask = self._score_batch(batch)
+        loss = query_table_info_nce_loss(
+            cross_scores, positive_mask=positive_mask, temperature=self.temperature
+        )
 
         # Same async-CUDA-deferral concern as _score_batch: a bad kernel
         # queued during backward() or the optimizer step would otherwise
@@ -994,7 +1010,7 @@ class FinetuneTrainer:
         self._log(f"[finetune] training complete. best validation MAP: {best_map:.4f}")
         return best_map
 
-    def evaluate(self, val_batches: list[tuple[list[tuple[str, Table]], list[Table]]]) -> float:
+    def evaluate(self, val_batches: list[tuple[list[tuple[str, Table]], list[Table], list[set[str]]]]) -> float:
         """In-batch-negative InfoNCE loss over pre-built batches --
         diagnostic only (e.g. to sanity-check training is proceeding
         sensibly step to step). NOT used for early stopping or model
@@ -1006,8 +1022,10 @@ class FinetuneTrainer:
 
         with torch.no_grad():
             for batch in val_batches:
-                cross_scores = self._score_batch(batch)
-                loss = query_table_info_nce_loss(cross_scores, temperature=self.temperature)
+                cross_scores, positive_mask = self._score_batch(batch)
+                loss = query_table_info_nce_loss(
+                    cross_scores, positive_mask=positive_mask, temperature=self.temperature
+                )
                 losses.append(loss.item())
 
         return sum(losses) / max(1, len(losses))

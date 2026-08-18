@@ -114,18 +114,20 @@ def resolve_train_batches(
     rng: random.Random,
     n_hard_negatives: int = 0,
 ):
-    """Yields (pairs, hard_negatives) batches from the given TRAIN
+    """Yields (pairs, hard_negatives, gold_table_ids) batches from the given TRAIN
     indices only.
 
     pairs: exactly one (question, positive_table) per query, randomly
         chosen when a query has more than one valid positive (see
         FinetuneTrainer._score_batch's docstring for why exactly one is
-        required: the cross-score matrix assumes query i's positive is
-        at column i).
+        retained: it guarantees a positive candidate for every query.)
     hard_negatives: n_hard_negatives extra tables per query in this
         batch, sampled from that query's OWN database but excluding its
         gold table(s) -- see sample_hard_negatives. Empty list when
         n_hard_negatives=0 (plain in-batch negatives only).
+    gold_table_ids: complete set of valid, database-namespaced table IDs
+        for each query, aligned with ``pairs``.  This allows the loss to
+        recognize another query's candidate as an additional positive.
 
     Call this fresh each epoch (see FinetuneTrainer.fit's batch_fn
     docstring) -- it uses `rng` to shuffle query order, pick a positive
@@ -139,6 +141,7 @@ def resolve_train_batches(
         idx_batch = order[i : i + batch_size]
         pairs = []
         hard_negatives = []
+        gold_table_ids = []
         for idx in idx_batch:
             question, tables = query_dataset[idx]
             non_empty = [t for t in tables if t.num_rows > 0 and t.num_columns > 0]
@@ -151,9 +154,10 @@ def resolve_train_batches(
                 continue
             table = cap_columns(rng.choice(non_empty), max_columns)
             pairs.append((question, table))
+            ex = query_dataset.examples[idx]
+            gold_table_ids.append({f"{ex.db_id}#sep#{name}" for name in ex.table_names})
 
             if n_hard_negatives > 0:
-                ex = query_dataset.examples[idx]
                 hard_negatives.extend(
                     sample_hard_negatives(
                         table_dataset,
@@ -165,7 +169,7 @@ def resolve_train_batches(
                     )
                 )
         if len(pairs) >= 2:
-            yield pairs, hard_negatives
+            yield pairs, hard_negatives, gold_table_ids
 
 
 def count_batches(n_examples: int, batch_size: int) -> int:
