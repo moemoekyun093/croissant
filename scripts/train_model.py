@@ -155,6 +155,7 @@ def build_table_model(args):
         model_name=args.model_name,
         num_layers=args.num_layers,
         tabbie_ffn_hidden_dim=args.tabbie_ffn_hidden_dim,
+        strubert_ffn_hidden_dim=getattr(args, "strubert_ffn_hidden_dim", None),
         turl_attention_budget=getattr(args, "turl_attention_budget", None),
         table_microbatch_cell_budget=getattr(args, "table_microbatch_cell_budget", None),
         table_microbatch_max_tables=getattr(args, "table_microbatch_max_tables", None),
@@ -216,6 +217,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--tabbie_ffn_hidden_dim", type=int,
         help="TABBIE only: hidden width of each row/column Transformer FFN (default: 4 * native hidden size)",
+    )
+    parser.add_argument(
+        "--strubert_ffn_hidden_dim",
+        type=int,
+        help="StruBERT only: hidden width of each vertical/horizontal "
+             "Transformer FFN (default: 4 * native hidden size)",
     )
     parser.add_argument(
         "--turl_attention_budget",
@@ -953,6 +960,9 @@ if __name__ == "__main__":
         "table_microbatch_cell_budget": args.table_microbatch_cell_budget,
         "table_microbatch_max_tables": args.table_microbatch_max_tables,
         "score_table_chunk_size": args.score_table_chunk_size,
+        "strubert_ffn_hidden_dim": (
+            args.strubert_ffn_hidden_dim if args.encoder == "strubert" else None
+        ),
         "turl_attention_budget": args.turl_attention_budget if args.encoder == "turl" else None,
         "n_hard_negatives": args.n_hard_negatives,
         "patience": args.patience,

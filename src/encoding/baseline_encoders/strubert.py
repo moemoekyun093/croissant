@@ -81,6 +81,7 @@ class StruBertTableEncoder(BaseTableEncoder):
         model_name: str = "bert-base-uncased",
         num_attn_layers: int = 3,
         num_heads: int = 8,
+        ffn_hidden_dim: int | None = None,
         seq_max_length: int = 256,
         device: Optional[str] = None,
     ):
@@ -89,6 +90,9 @@ class StruBertTableEncoder(BaseTableEncoder):
         self.backbone = AutoModel.from_pretrained(model_name).to(self.device)
         self.hidden_size = self.backbone.config.hidden_size
         self.seq_max_length = seq_max_length
+        self.ffn_hidden_dim = ffn_hidden_dim or self.hidden_size * 4
+        if self.ffn_hidden_dim <= 0:
+            raise ValueError("ffn_hidden_dim must be positive")
 
         # Frozen feature extractor -- see bert_baseline.py's comment for
         # the full rationale. This backbone gets called TWICE per table
@@ -106,7 +110,7 @@ class StruBertTableEncoder(BaseTableEncoder):
             layer = nn.TransformerEncoderLayer(
                 d_model=self.hidden_size,
                 nhead=num_heads,
-                dim_feedforward=self.hidden_size * 4,
+                dim_feedforward=self.ffn_hidden_dim,
                 batch_first=True,
             )
             return nn.TransformerEncoder(layer, num_layers=num_attn_layers).to(self.device)

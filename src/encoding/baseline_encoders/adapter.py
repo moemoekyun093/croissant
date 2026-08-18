@@ -457,6 +457,7 @@ def build_baseline_model(
     model_name: str | None = None,
     num_layers: int | None = None,
     tabbie_ffn_hidden_dim: int | None = None,
+    strubert_ffn_hidden_dim: int | None = None,
     turl_attention_budget: int | None = None,
     table_microbatch_cell_budget: int | None = None,
     table_microbatch_max_tables: int | None = None,
@@ -509,6 +510,8 @@ def build_baseline_model(
             kwargs[layer_kwarg] = num_layers
     if tabbie_ffn_hidden_dim is not None and encoder_name == "tabbie":
         kwargs["ffn_hidden_dim"] = tabbie_ffn_hidden_dim
+    if strubert_ffn_hidden_dim is not None and encoder_name == "strubert":
+        kwargs["ffn_hidden_dim"] = strubert_ffn_hidden_dim
     if turl_attention_budget is not None and encoder_name == "turl":
         kwargs["max_attention_elements"] = turl_attention_budget
     baseline_encoder = encoder_cls(**kwargs)
