@@ -13,9 +13,16 @@ from src.data.prepared_batches import (
     iter_prepared_batches,
     read_prepared_metadata,
 )
+from src.data.prepared_eval import (
+    PreparedEvalQueries,
+    PreparedEvalTables,
+    read_eval_shard,
+    write_eval_shard,
+)
 from src.models.prepared_table_encoder import PreparedQueryEncoder, PreparedTableEncoder
 from src.scoring.multi_score import MultiScorer
 from src.training.losses import cross_score_queries_tables, query_table_info_nce_loss
+from src.training.prepared_evaluator import _ranking_metrics
 
 
 def main() -> None:
@@ -52,6 +59,40 @@ def main() -> None:
         assert len(restored) == 1
         assert torch.equal(restored[0].positive_mask, batch.positive_mask)
         assert torch.equal(restored[0].query_features, batch.query_features)
+
+        query_path = os.path.join(directory, "queries_00000.pkl")
+        eval_queries = PreparedEvalQueries(
+            query_texts=("q0", "q1"),
+            gold_table_ids=(("t0", "t2"), ("t2",)),
+            features=torch.randn(2, 5, 8).half(),
+            mask=torch.ones(2, 5, dtype=torch.bool),
+        )
+        write_eval_shard(query_path, {"projection_dim": 8}, eval_queries)
+        _metadata, restored_queries = read_eval_shard(query_path)
+        assert torch.equal(restored_queries.features, eval_queries.features)
+
+        table_path = os.path.join(directory, "tables_00000.pkl")
+        eval_tables = PreparedEvalTables(
+            table_ids=("t0", "t1", "t2"),
+            cell_features=torch.randn(3 * 4 * 6, 8).half(),
+            cell_scatter=torch.arange(3 * 4 * 6, dtype=torch.int32),
+            header_features=torch.randn(3 * 4, 8).half(),
+            header_scatter=torch.arange(3 * 4, dtype=torch.int32),
+            row_mask=torch.ones(3, 6, dtype=torch.bool),
+            col_mask=torch.ones(3, 4, dtype=torch.bool),
+            cell_mask=torch.ones(3, 4, 6, dtype=torch.bool),
+        )
+        write_eval_shard(table_path, {"projection_dim": 8}, eval_tables)
+        _metadata, restored_tables = read_eval_shard(table_path)
+        assert restored_tables.table_ids == eval_tables.table_ids
+
+    ap_sum, rr_sum = _ranking_metrics(
+        torch.tensor([[0.9, 0.1, 0.8], [0.2, 0.3, 0.1]]),
+        (("t0", "t2"), ("t2",)),
+        ["t0", "t1", "t2"],
+    )
+    assert abs(ap_sum / 2 - 2 / 3) < 1e-6
+    assert abs(rr_sum / 2 - 2 / 3) < 1e-6
 
     prepared = batch.materialize("cpu")
     query_model = PreparedQueryEncoder(8, 8)

@@ -19,6 +19,7 @@ from src.models.prepared_table_encoder import (
 )
 from src.scoring.multi_score import MultiScorer
 from src.training.losses import cross_score_queries_tables, query_table_info_nce_loss
+from src.training.prepared_evaluator import evaluate_prepared
 
 
 def main() -> None:
@@ -51,6 +52,15 @@ def main() -> None:
     parser.add_argument("--log_every", type=int, default=10)
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--profile_every", type=int, default=20)
+    parser.add_argument("--val_prepared_dir", default=None)
+    parser.add_argument("--eval_query_batch_size", type=int, default=32)
+    parser.add_argument("--patience", type=int, default=15)
+    parser.add_argument(
+        "--keep_epoch_checkpoints",
+        action="store_true",
+        help="retain checkpoint_epochN.pt snapshots; default keeps only "
+        "overwritten latest and best checkpoints to avoid disk bloat",
+    )
     parser.add_argument("--table_microbatch_cell_budget", type=int, default=None)
     parser.add_argument("--table_microbatch_max_tables", type=int, default=None)
     parser.add_argument(
@@ -66,6 +76,8 @@ def main() -> None:
         parser.error("--score_table_chunk_size must be positive or omitted")
     if args.profile_every <= 0:
         parser.error("--profile_every must be positive")
+    if args.eval_query_batch_size <= 0 or args.patience <= 0:
+        parser.error("--eval_query_batch_size and --patience must be positive")
     if args.skip_resume and args.resume_checkpoint is not None:
         parser.error("--skip_resume and --resume_checkpoint are mutually exclusive")
 
@@ -181,6 +193,15 @@ def main() -> None:
         epoch_steps: dict[int, int] = dict(
             resume_state.get("epoch_steps", {}) if resume_state else {}
         )
+        best_val_map = (
+            float(resume_state.get("best_val_map", float("-inf")))
+            if resume_state
+            else float("-inf")
+        )
+        best_epoch = resume_state.get("best_epoch") if resume_state else None
+        epochs_without_improvement = int(
+            resume_state.get("epochs_without_improvement", 0)
+        ) if resume_state else 0
 
         # Checkpoints written before processed_shards was added still carry
         # an exact (epoch, shard) boundary. Infer the completed prefix once;
@@ -201,6 +222,13 @@ def main() -> None:
             if boundary[0] not in epoch_steps:
                 batches_per_shard = int(metadata.get("batches_per_shard", 20))
                 epoch_steps[boundary[0]] = (boundary[1] + 1) * batches_per_shard
+            if boundary[0] not in epoch_losses and "epoch_loss" in resume_state:
+                # Older checkpoints retained only the running average. Fill
+                # an equivalent weighted prefix so the eventual full-epoch
+                # average remains correct after appending resumed steps.
+                epoch_losses[boundary[0]] = [float(resume_state["epoch_loss"])] * int(
+                    epoch_steps[boundary[0]]
+                )
 
         if resume_state is not None:
             resume_message = (
@@ -219,6 +247,10 @@ def main() -> None:
             "backward + optimizer": 0.0,
         }
         profile_steps = 0
+
+        def report(message: str) -> None:
+            print(message, flush=True)
+            log.write(message + "\n")
 
         def profile_sync() -> None:
             if args.profile and device.type == "cuda":
@@ -241,6 +273,18 @@ def main() -> None:
                 "finalized_epochs": sorted(finalized_epochs),
                 "epoch_losses": epoch_losses,
                 "epoch_steps": epoch_steps,
+                "best_val_map": best_val_map,
+                "best_epoch": best_epoch,
+                "epochs_without_improvement": epochs_without_improvement,
+                "model_config": {
+                    "encoder": args.encoder,
+                    "num_layers": args.num_layers,
+                    "num_heads": args.num_heads,
+                    "channel_mix_hidden_dim": args.channel_mix_hidden_dim,
+                    "nonlinearity": args.nonlinearity,
+                    "turl_ffn_hidden_dim": args.turl_ffn_hidden_dim,
+                    "turl_attention_budget": args.turl_attention_budget,
+                },
             }
             partial = path + ".partial"
             torch.save(
@@ -249,6 +293,7 @@ def main() -> None:
             )
             os.replace(partial, path)
 
+        stop_training = False
         while True:
             paths = sorted(
                 glob.glob(os.path.join(args.prepared_dir, "epoch_*_shard_*.pkl"))
@@ -256,6 +301,12 @@ def main() -> None:
             new_paths = [
                 path for path in paths if os.path.basename(path) not in processed
             ]
+            # Consume one shard per outer pass so an epoch-completion marker
+            # is handled immediately after that epoch's final shard. If an
+            # existing backlog spans many epochs, processing the whole list
+            # first would validate every old epoch using the same newest
+            # model state, making best-checkpoint selection meaningless.
+            new_paths = new_paths[:1]
             for path in new_paths:
                 current = read_prepared_metadata(path)
                 for key in (
@@ -441,11 +492,6 @@ def main() -> None:
                 )
                 if epoch not in finalized_epochs and consumed_shards >= expected_shards:
                     finalized_epochs.add(epoch)
-                    save_checkpoint(
-                        os.path.join(args.checkpoint_dir, f"checkpoint_epoch{epoch}.pt"),
-                        epoch,
-                        expected_shards - 1,
-                    )
                     losses = epoch_losses.get(epoch, [])
                     message = (
                         f"[prepared] epoch {epoch} complete: "
@@ -454,13 +500,91 @@ def main() -> None:
                     print(message, flush=True)
                     log.write(message + "\n")
 
+                    if args.val_prepared_dir is not None:
+                        metrics = evaluate_prepared(
+                            args.val_prepared_dir,
+                            table_model,
+                            query_model,
+                            scorer,
+                            device,
+                            metadata,
+                            query_batch_size=args.eval_query_batch_size,
+                            progress=report,
+                        )
+                        metric_message = (
+                            f"[prepared-val] epoch {epoch}: MAP {metrics['map']:.4f} "
+                            f"MRR {metrics['mrr']:.4f} "
+                            f"({int(metrics['n_queries'])} queries, "
+                            f"{int(metrics['n_tables'])} tables)"
+                        )
+                        print(metric_message, flush=True)
+                        log.write(metric_message + "\n")
+                        if metrics["map"] > best_val_map:
+                            best_val_map = metrics["map"]
+                            best_epoch = epoch
+                            epochs_without_improvement = 0
+                            save_checkpoint(
+                                os.path.join(args.checkpoint_dir, "best_model.pt"),
+                                epoch,
+                                expected_shards - 1,
+                            )
+                            best_message = (
+                                f"[prepared-val] NEW BEST epoch {epoch}: "
+                                f"MAP {best_val_map:.4f}; saved best_model.pt"
+                            )
+                            print(best_message, flush=True)
+                            log.write(best_message + "\n")
+                        else:
+                            epochs_without_improvement += 1
+                            if epochs_without_improvement >= args.patience:
+                                stop_training = True
+                                stop_message = (
+                                    f"[prepared-val] early stopping after "
+                                    f"{epochs_without_improvement} epoch(s) without "
+                                    f"MAP improvement; best epoch={best_epoch}, "
+                                    f"best MAP={best_val_map:.4f}"
+                                )
+                                print(stop_message, flush=True)
+                                log.write(stop_message + "\n")
+
+                    if args.keep_epoch_checkpoints:
+                        save_checkpoint(
+                            os.path.join(args.checkpoint_dir, f"checkpoint_epoch{epoch}.pt"),
+                            epoch,
+                            expected_shards - 1,
+                        )
+                    # Persist validation/best/patience state by overwriting
+                    # the sole rolling checkpoint rather than accumulating
+                    # one optimizer-sized file per epoch.
+                    save_checkpoint(
+                        os.path.join(args.checkpoint_dir, "checkpoint_latest.pt"),
+                        epoch,
+                        expected_shards - 1,
+                    )
+
+            if stop_training:
+                break
+
             producer_done = os.path.exists(
                 os.path.join(args.prepared_dir, "PREPARATION_COMPLETE")
             )
-            if producer_done and not [
-                path for path in paths if os.path.basename(path) not in processed
-            ]:
-                break
+            if producer_done:
+                # ``paths`` was captured before processing ``new_paths`` and
+                # can be hours old for a large backlog. The producer may have
+                # published many more shards (and PREPARATION_COMPLETE) while
+                # this pass was training. Always rescan before deciding that
+                # every shard has been consumed; using the stale snapshot can
+                # silently exit with later epochs untouched.
+                final_paths = sorted(
+                    glob.glob(os.path.join(args.prepared_dir, "epoch_*_shard_*.pkl"))
+                )
+                remaining = [
+                    path
+                    for path in final_paths
+                    if os.path.basename(path) not in processed
+                ]
+                if not remaining:
+                    break
             if not new_paths:
                 time.sleep(args.poll_seconds)
 
