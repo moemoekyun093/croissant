@@ -12,7 +12,11 @@ import torch
 from torch.optim import AdamW
 
 from src.data.prepared_batches import iter_prepared_batches, read_prepared_metadata
-from src.models.prepared_table_encoder import PreparedQueryEncoder, PreparedTableEncoder
+from src.models.prepared_table_encoder import (
+    PreparedQueryEncoder,
+    PreparedTableEncoder,
+    PreparedTurlEncoder,
+)
 from src.scoring.multi_score import MultiScorer
 from src.training.losses import cross_score_queries_tables, query_table_info_nce_loss
 
@@ -22,9 +26,12 @@ def main() -> None:
     parser.add_argument("--prepared_dir", required=True)
     parser.add_argument("--checkpoint_dir", required=True)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--encoder", choices=("ours", "turl"), default="ours")
     parser.add_argument("--num_layers", type=int, default=3)
     parser.add_argument("--num_heads", type=int, default=8)
     parser.add_argument("--channel_mix_hidden_dim", type=int, default=512)
+    parser.add_argument("--turl_ffn_hidden_dim", type=int, default=512)
+    parser.add_argument("--turl_attention_budget", type=int, default=2_000_000)
     parser.add_argument("--nonlinearity", default="sigmoid")
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
@@ -53,15 +60,24 @@ def main() -> None:
     dim = int(metadata["projection_dim"])
     device = torch.device(args.device)
 
-    table_model = PreparedTableEncoder(
-        embed_dim=dim,
-        num_layers=args.num_layers,
-        num_heads=args.num_heads,
-        channel_mix_hidden_dim=args.channel_mix_hidden_dim,
-        nonlinearity=args.nonlinearity,
-        table_microbatch_cell_budget=args.table_microbatch_cell_budget,
-        table_microbatch_max_tables=args.table_microbatch_max_tables,
-    ).to(device)
+    if args.encoder == "ours":
+        table_model = PreparedTableEncoder(
+            embed_dim=dim,
+            num_layers=args.num_layers,
+            num_heads=args.num_heads,
+            channel_mix_hidden_dim=args.channel_mix_hidden_dim,
+            nonlinearity=args.nonlinearity,
+            table_microbatch_cell_budget=args.table_microbatch_cell_budget,
+            table_microbatch_max_tables=args.table_microbatch_max_tables,
+        ).to(device)
+    else:
+        table_model = PreparedTurlEncoder(
+            embed_dim=dim,
+            num_layers=args.num_layers,
+            num_heads=args.num_heads,
+            ffn_hidden_dim=args.turl_ffn_hidden_dim,
+            attention_budget=args.turl_attention_budget,
+        ).to(device)
     query_model = PreparedQueryEncoder(dim, dim).to(device)
     scorer = MultiScorer().to(device)
     parameters = [
@@ -75,6 +91,13 @@ def main() -> None:
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     log_path = os.path.join(args.checkpoint_dir, "train.log")
     with open(log_path, "a", buffering=1) as log:
+        trainable_parameters = sum(parameter.numel() for parameter in parameters)
+        startup = (
+            f"[prepared] encoder={args.encoder} projection_dim={dim} "
+            f"trainable_parameters={trainable_parameters:,}"
+        )
+        print(startup, flush=True)
+        log.write(startup + "\n")
         global_step = 0
         start_time = time.time()
         processed = set()
@@ -90,6 +113,7 @@ def main() -> None:
                     "shard": shard,
                     "global_step": global_step,
                     "metadata": metadata,
+                    "encoder": args.encoder,
                     "table_model_state_dict": table_model.state_dict(),
                     "query_model_state_dict": query_model.state_dict(),
                     "scorer_state_dict": scorer.state_dict(),
