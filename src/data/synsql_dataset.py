@@ -54,6 +54,7 @@ import json
 import os
 import random
 import sqlite3
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Iterator
 
@@ -122,11 +123,10 @@ class SynSQLTableDataset:
     (or iterate the whole dataset via iter_tables()) whenever the data
     is actually needed.
 
-    One sqlite3 connection is opened per db_id, cached for the lifetime
-    of this object (databases are commonly reused across many tables and
-    many queries in the same epoch -- reopening per table would be pure
-    waste). Table/column names are also cached per db_id / (db_id,
-    table_name) after their first PRAGMA lookup.
+    SQLite connections use a bounded LRU cache.  This retains reuse for
+    nearby accesses without leaving thousands of NFS-backed database files
+    open for the lifetime of a large run.  Materialized tables and schema
+    information remain cached independently after a connection is evicted.
     """
 
     def __init__(
@@ -137,6 +137,7 @@ class SynSQLTableDataset:
         seed: int = 42,
         db_id_key: str = "db_id",
         schema_cache_path: str | None = None,
+        max_open_connections: int = 64,
     ):
         """
         databases_root: root of the databases/<db_id>/<db_id>.sqlite tree.
@@ -164,9 +165,16 @@ class SynSQLTableDataset:
                         this is cached. Defaults to a sibling file next
                         to databases_root. Delete the cache file if the
                         underlying databases' schemas ever change.
+        max_open_connections: maximum number of live SQLite connections.
+                        Least-recently-used connections are closed before
+                        opening more.  A small bounded cache is especially
+                        important when the databases live on NFS/NAS.
         """
+        if max_open_connections <= 0:
+            raise ValueError("max_open_connections must be positive")
         self.databases_root = databases_root
         self.max_rows = max_rows
+        self.max_open_connections = max_open_connections
         self._rng = random.Random(seed)
         self.schema_cache_path = schema_cache_path or f"{databases_root.rstrip('/')}.schema_cache.json"
 
@@ -191,7 +199,7 @@ class SynSQLTableDataset:
         # comparisons on one core). This set is the actual fix.
         self._db_id_set = set(self._db_ids)
 
-        self._conn_cache: dict[str, sqlite3.Connection] = {}
+        self._conn_cache: OrderedDict[str, sqlite3.Connection] = OrderedDict()
         self._table_names_cache: dict[str, list[str]] = {}
         if os.path.exists(self.schema_cache_path):
             print(
@@ -236,10 +244,33 @@ class SynSQLTableDataset:
         return db_id in self._db_id_set and table_name in self._table_names(db_id)
 
     def _connection(self, db_id: str) -> sqlite3.Connection:
-        if db_id not in self._conn_cache:
-            path = get_sqlite_path(self.databases_root, db_id)
-            self._conn_cache[db_id] = sqlite3.connect(path)
-        return self._conn_cache[db_id]
+        connection = self._conn_cache.pop(db_id, None)
+        if connection is not None:
+            self._conn_cache[db_id] = connection
+            return connection
+
+        while len(self._conn_cache) >= self.max_open_connections:
+            _evicted_db_id, evicted = self._conn_cache.popitem(last=False)
+            evicted.close()
+
+        path = get_sqlite_path(self.databases_root, db_id)
+        connection = sqlite3.connect(path)
+        self._conn_cache[db_id] = connection
+        return connection
+
+    def close_connections(self) -> None:
+        """Close every live SQLite handle held by the bounded LRU cache."""
+        while self._conn_cache:
+            _db_id, connection = self._conn_cache.popitem(last=False)
+            connection.close()
+
+    def __del__(self):
+        # Best-effort cleanup at interpreter shutdown.  Explicit callers may
+        # use close_connections(); exceptions in __del__ must never escape.
+        try:
+            self.close_connections()
+        except Exception:
+            pass
 
     def _table_names(self, db_id: str) -> list[str]:
         """Real table names, read from this database's own sqlite_master

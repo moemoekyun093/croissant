@@ -32,6 +32,23 @@ def file_sha256(path: str) -> str:
     return digest.hexdigest()
 
 
+def load_frozen_cache(path: str | None, label: str) -> dict:
+    """Load an existing CPU frozen-feature cache without expanding FP16."""
+    if path is None:
+        return {}
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"{label} cache does not exist: {path}")
+    print(f"[prepare] loading {label} cache from {path} ...", flush=True)
+    try:
+        loaded = torch.load(path, map_location="cpu", weights_only=True)
+    except TypeError:  # PyTorch versions before weights_only was added.
+        loaded = torch.load(path, map_location="cpu")
+    if not isinstance(loaded, dict):
+        raise TypeError(f"{label} cache must be a dict, got {type(loaded).__name__}")
+    print(f"[prepare] loaded {len(loaded)} {label} cache entries", flush=True)
+    return loaded
+
+
 class RandomProjectionPreparer:
     def __init__(
         self,
@@ -42,6 +59,8 @@ class RandomProjectionPreparer:
         max_text_batch_size: int,
         device: str,
         exclude_special_tokens: bool,
+        text_cache_path: str | None,
+        query_cache_path: str | None,
     ):
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.backbone = AutoModel.from_pretrained(model_name).to(device).eval()
@@ -59,16 +78,50 @@ class RandomProjectionPreparer:
             hidden_size, projection_dim, generator=generator, dtype=torch.float32
         ) / math.sqrt(projection_dim)
         self.projection = self.projection_cpu.to(device)
+        self.hidden_size = hidden_size
+
+        # These are the existing on-disk caches used by train_model.py.
+        # The text cache maps exact cell/header strings to raw BERT [CLS]
+        # vectors [768].  The query cache maps exact questions to raw token
+        # features [L, 768] plus token IDs.  We deliberately retain their
+        # on-disk FP16 dtype in CPU memory and project hits to 128-D in bulk.
+        self._raw_cls_cache = load_frozen_cache(text_cache_path, "cell/header")
+        self._raw_query_cache = load_frozen_cache(query_cache_path, "query")
+
         # Preparation-only cache.  Training never sees or consults this
         # dictionary; every requested vector is embedded directly in its
         # final PreparedBatch record.
         self._cls_cache: dict[str, torch.Tensor] = {}
+        self.cls_cache_hits = 0
+        self.cls_bert_misses = 0
+        self.query_cache_hits = 0
+        self.query_bert_misses = 0
+
+    def _project_cached_cls(self, texts: list[str]) -> None:
+        for start in range(0, len(texts), self.max_text_batch_size):
+            chunk = texts[start : start + self.max_text_batch_size]
+            raw = torch.stack([self._raw_cls_cache[text] for text in chunk])
+            if raw.ndim != 2 or raw.shape[1] != self.hidden_size:
+                raise ValueError(
+                    f"cell/header cache has incompatible shape {tuple(raw.shape)}; "
+                    f"expected [N, {self.hidden_size}]"
+                )
+            projected = (
+                raw.to(self.device, dtype=self.projection.dtype) @ self.projection
+            ).to(torch.float16).cpu()
+            for i, text in enumerate(chunk):
+                self._cls_cache[text] = projected[i].clone()
+        self.cls_cache_hits += len(texts)
 
     @torch.inference_mode()
     def _encode_missing_cls(self, strings: list[str]) -> None:
         missing = sorted({text for text in strings if text not in self._cls_cache})
-        for start in range(0, len(missing), self.max_text_batch_size):
-            texts = missing[start : start + self.max_text_batch_size]
+        cached = [text for text in missing if text in self._raw_cls_cache]
+        uncached = [text for text in missing if text not in self._raw_cls_cache]
+        self._project_cached_cls(cached)
+
+        for start in range(0, len(uncached), self.max_text_batch_size):
+            texts = uncached[start : start + self.max_text_batch_size]
             encoded = self.tokenizer(
                 texts,
                 padding=True,
@@ -80,6 +133,7 @@ class RandomProjectionPreparer:
             projected = (hidden @ self.projection).to(torch.float16).cpu()
             for i, text in enumerate(texts):
                 self._cls_cache[text] = projected[i].clone()
+        self.cls_bert_misses += len(uncached)
 
     def cls_features(self, strings: list[str]) -> torch.Tensor:
         if not strings:
@@ -89,29 +143,68 @@ class RandomProjectionPreparer:
 
     @torch.inference_mode()
     def query_features(self, questions: list[str]) -> tuple[torch.Tensor, torch.Tensor]:
-        encoded = self.tokenizer(
-            questions,
-            padding=True,
-            truncation=True,
-            max_length=self.max_length,
-            return_tensors="pt",
-        ).to(self.device)
-        hidden = self.backbone(**encoded).last_hidden_state
-        features = (hidden @ self.projection).to(torch.float16).cpu()
-        mask = encoded["attention_mask"].bool()
+        unique_missing = sorted(
+            {question for question in questions if question not in self._raw_query_cache}
+        )
+        for start in range(0, len(unique_missing), self.max_text_batch_size):
+            texts = unique_missing[start : start + self.max_text_batch_size]
+            encoded = self.tokenizer(
+                texts,
+                padding=True,
+                truncation=True,
+                max_length=self.max_length,
+                return_tensors="pt",
+            ).to(self.device)
+            hidden = self.backbone(**encoded).last_hidden_state
+            hidden_cpu = hidden.to(torch.float16).cpu()
+            ids_cpu = encoded["input_ids"].cpu()
+            lengths = encoded["attention_mask"].sum(dim=1).cpu().tolist()
+            for i, (question, length) in enumerate(zip(texts, lengths)):
+                true_length = int(length)
+                self._raw_query_cache[question] = (
+                    hidden_cpu[i, :true_length].clone(),
+                    ids_cpu[i, :true_length].clone(),
+                )
+        self.query_bert_misses += len(unique_missing)
+        self.query_cache_hits += len(questions) - len(unique_missing)
+
+        per_query = [self._raw_query_cache[question] for question in questions]
+        max_query_length = max(hidden.shape[0] for hidden, _ids in per_query)
+        hidden_cpu = torch.zeros(
+            len(questions), max_query_length, self.hidden_size, dtype=torch.float16
+        )
+        ids_cpu = torch.full(
+            (len(questions), max_query_length),
+            self.tokenizer.pad_token_id or 0,
+            dtype=torch.long,
+        )
+        mask = torch.zeros(len(questions), max_query_length, dtype=torch.bool)
+        for i, (hidden, ids) in enumerate(per_query):
+            if hidden.ndim != 2 or hidden.shape[1] != self.hidden_size:
+                raise ValueError(
+                    f"query cache has incompatible shape {tuple(hidden.shape)}; "
+                    f"expected [L, {self.hidden_size}]"
+                )
+            length = hidden.shape[0]
+            hidden_cpu[i, :length] = hidden.to(torch.float16)
+            ids_cpu[i, :length] = ids
+            mask[i, :length] = True
+
+        features = (
+            hidden_cpu.to(self.device, dtype=self.projection.dtype) @ self.projection
+        ).to(torch.float16).cpu()
         if self.exclude_special_tokens:
             special = torch.tensor(
                 [
                     self.tokenizer.get_special_tokens_mask(
                         ids, already_has_special_tokens=True
                     )
-                    for ids in encoded["input_ids"].tolist()
+                    for ids in ids_cpu.tolist()
                 ],
-                device=self.device,
                 dtype=torch.bool,
             )
             mask = mask & ~special
-        return features, mask.cpu()
+        return features, mask
 
     def table_features(self, tables) -> tuple[torch.Tensor, ...]:
         bt = len(tables)
@@ -188,6 +281,8 @@ class RandomProjectionPreparer:
             cell_mask,
         ) = self.table_features(tables)
         return PreparedBatch(
+            query_texts=tuple(questions),
+            candidate_table_ids=tuple(candidate_ids),
             query_features=query_features,
             query_mask=query_mask,
             cell_features=cells,
@@ -207,6 +302,16 @@ def main() -> None:
     parser.add_argument("--questions_json", required=True)
     parser.add_argument("--tables_json", default=None)
     parser.add_argument("--split_json", default="configs/splits/query_split.json")
+    parser.add_argument(
+        "--corpus_json",
+        default=None,
+        help="corpus manifest paired with --materialized_corpus_cache_path",
+    )
+    parser.add_argument(
+        "--materialized_corpus_cache_path",
+        default=None,
+        help="existing sequential table-data JSON used to avoid random SQLite/NFS reads",
+    )
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--model_name", default="bert-base-uncased")
@@ -227,12 +332,34 @@ def main() -> None:
     parser.add_argument("--max_columns", type=int, default=20)
     parser.add_argument("--max_length", type=int, default=32)
     parser.add_argument("--max_text_batch_size", type=int, default=2048)
+    parser.add_argument(
+        "--text_cache_path",
+        default=None,
+        help="existing cell/header cache: exact string -> raw BERT [CLS, 768]",
+    )
+    parser.add_argument(
+        "--query_cache_path",
+        default=None,
+        help="existing frozen query cache: question -> (raw BERT [L, 768], token IDs)",
+    )
+    parser.add_argument(
+        "--max_open_connections",
+        type=int,
+        default=64,
+        help="bounded LRU size for SQLite handles (prevents thousands of NFS opens)",
+    )
     parser.add_argument("--exclude_special_tokens", action="store_true")
     args = parser.parse_args()
 
-    if args.projection_dim <= 0 or args.batch_size <= 1 or args.batches_per_shard <= 0:
+    if (
+        args.projection_dim <= 0
+        or args.batch_size <= 1
+        or args.batches_per_shard <= 0
+        or args.max_open_connections <= 0
+    ):
         parser.error(
-            "projection_dim/batches_per_shard must be positive and batch_size must exceed one"
+            "projection_dim/batches_per_shard/max_open_connections must be positive "
+            "and batch_size must exceed one"
         )
     projection_seed = args.seed if args.projection_seed is None else args.projection_seed
 
@@ -241,7 +368,22 @@ def main() -> None:
         tables_json=args.tables_json,
         max_rows=args.max_rows,
         seed=args.seed,
+        max_open_connections=args.max_open_connections,
     )
+    if args.materialized_corpus_cache_path is not None:
+        if args.corpus_json is None:
+            parser.error(
+                "--corpus_json is required with --materialized_corpus_cache_path"
+            )
+        if not os.path.exists(args.materialized_corpus_cache_path):
+            parser.error(
+                "--materialized_corpus_cache_path must already exist; refusing to "
+                "silently rebuild it from thousands of SQLite files"
+            )
+        table_dataset.load_corpus(
+            args.corpus_json,
+            materialized_cache_path=args.materialized_corpus_cache_path,
+        )
     query_dataset = SynSQLQueryDataset(args.questions_json, table_dataset)
     train_indices = query_dataset.resolve_split(args.split_json)["train"]
     shuffled = list(train_indices)
@@ -257,6 +399,8 @@ def main() -> None:
         max_text_batch_size=args.max_text_batch_size,
         device=args.device,
         exclude_special_tokens=args.exclude_special_tokens,
+        text_cache_path=args.text_cache_path,
+        query_cache_path=args.query_cache_path,
     )
     rng = random.Random(args.seed)
     common_metadata = {
@@ -271,6 +415,10 @@ def main() -> None:
         "max_columns": args.max_columns,
         "max_length": args.max_length,
         "model_name": args.model_name,
+        "text_cache_path": args.text_cache_path,
+        "query_cache_path": args.query_cache_path,
+        "max_open_connections": args.max_open_connections,
+        "materialized_corpus_cache_path": args.materialized_corpus_cache_path,
         "split_sha256": file_sha256(args.split_json),
         "questions_sha256": file_sha256(args.questions_json),
     }
@@ -341,7 +489,12 @@ def main() -> None:
                 if (batch_index + 1) % 20 == 0:
                     print(
                         f"[prepare] epoch {epoch}: {batch_index + 1}/{expected} batches, "
-                        f"{len(preparer._cls_cache)} unique cell/header strings",
+                        f"{len(preparer._cls_cache)} unique cell/header strings; "
+                        f"cell/header cache hits={preparer.cls_cache_hits}, "
+                        f"BERT misses={preparer.cls_bert_misses}; "
+                        f"query cache hits={preparer.query_cache_hits}, "
+                        f"BERT misses={preparer.query_bert_misses}; "
+                        f"open SQLite connections={len(table_dataset._conn_cache)}",
                         flush=True,
                     )
         except BaseException:
@@ -374,6 +527,7 @@ def main() -> None:
         json.dump(manifest, f, indent=2)
     with open(os.path.join(args.output_dir, "PREPARATION_COMPLETE"), "w", encoding="utf-8") as f:
         f.write("complete\n")
+    table_dataset.close_connections()
 
 
 if __name__ == "__main__":

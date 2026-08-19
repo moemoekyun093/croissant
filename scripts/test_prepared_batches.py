@@ -21,6 +21,8 @@ from src.training.losses import cross_score_queries_tables, query_table_info_nce
 def main() -> None:
     torch.manual_seed(7)
     batch = PreparedBatch(
+        query_texts=("q0", "q1", "q2"),
+        candidate_table_ids=("t0", "t1", "t2", "t3", "t4"),
         query_features=torch.randn(3, 5, 8).half(),
         query_mask=torch.ones(3, 5, dtype=torch.bool),
         cell_features=torch.randn(5 * 4 * 6, 8).half(),

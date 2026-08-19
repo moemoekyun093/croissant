@@ -22,7 +22,7 @@ import torch
 
 
 FORMAT_NAME = "croissant_prepared_batches"
-FORMAT_VERSION = 2
+FORMAT_VERSION = 3
 
 
 @dataclass
@@ -41,6 +41,8 @@ class MaterializedBatch:
 
 @dataclass
 class PreparedBatch:
+    query_texts: tuple[str, ...]         # audit only; never used by training
+    candidate_table_ids: tuple[str, ...]  # audit only; never used by training
     query_features: torch.Tensor       # [Bq, L, r], stored float16 on CPU
     query_mask: torch.Tensor           # [Bq, L], bool
     cell_features: torch.Tensor        # [sum_t Nt*Mt, r], packed float16 CPU
@@ -58,6 +60,8 @@ class PreparedBatch:
         rm, cm, xm, pm = self.row_mask, self.col_mask, self.cell_mask, self.positive_mask
         if q.ndim != 3 or qm.shape != q.shape[:2]:
             raise ValueError(f"bad prepared query shapes: Q={tuple(q.shape)}, mask={tuple(qm.shape)}")
+        if len(self.query_texts) != q.shape[0]:
+            raise ValueError("audit query-text count does not match query tensor")
         if x.ndim != 2 or h.ndim != 2 or x.shape[1] != h.shape[1]:
             raise ValueError(f"bad packed table/header shapes: X={tuple(x.shape)}, H={tuple(h.shape)}")
         if self.cell_scatter.shape != (x.shape[0],) or self.header_scatter.shape != (h.shape[0],):
@@ -66,6 +70,8 @@ class PreparedBatch:
             raise TypeError("packed scatter indices must be int32 on disk")
         if rm.ndim != 2 or cm.ndim != 2 or rm.shape[0] != cm.shape[0]:
             raise ValueError("prepared row/column masks do not describe one table batch")
+        if len(self.candidate_table_ids) != cm.shape[0]:
+            raise ValueError("audit table-ID count does not match candidate tensor")
         if xm.shape != (cm.shape[0], cm.shape[1], rm.shape[1]) or pm.shape != (q.shape[0], cm.shape[0]):
             raise ValueError("prepared cell/positive masks do not match their tensors")
         if self.cell_scatter.numel() and (
