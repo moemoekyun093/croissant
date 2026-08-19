@@ -40,8 +40,17 @@ def main() -> None:
     parser.add_argument("--log_every", type=int, default=10)
     parser.add_argument("--table_microbatch_cell_budget", type=int, default=None)
     parser.add_argument("--table_microbatch_max_tables", type=int, default=None)
+    parser.add_argument(
+        "--score_table_chunk_size",
+        type=int,
+        default=None,
+        help="score this many candidate tables at once, then concatenate the "
+        "complete [Bq,Bt] matrix before the unchanged InfoNCE loss",
+    )
     parser.add_argument("--poll_seconds", type=float, default=5.0)
     args = parser.parse_args()
+    if args.score_table_chunk_size is not None and args.score_table_chunk_size <= 0:
+        parser.error("--score_table_chunk_size must be positive or omitted")
 
     # A producer publishes only closed, atomically-renamed *.pkl shards.
     # Wait for the first one so preparation and training can be launched
@@ -149,10 +158,27 @@ def main() -> None:
                         bt, n_cols = cpu_batch.col_mask.shape
                         n_rows = cpu_batch.row_mask.shape[1]
                         score_gib = 2 * bq * bt * length * n_cols * n_rows * 4 / 1024**3
+                        active_tables = (
+                            bt
+                            if args.score_table_chunk_size is None
+                            else min(bt, args.score_table_chunk_size)
+                        )
+                        active_score_gib = (
+                            2
+                            * bq
+                            * active_tables
+                            * length
+                            * n_cols
+                            * n_rows
+                            * 4
+                            / 1024**3
+                        )
                         message = (
                             f"[prepared] epoch {epoch} first batch: Bq={bq}, Bt={bt}, "
                             f"L={length}, N={n_cols}, M={n_rows}; row-match forward "
-                            f"temporaries >= {score_gib:.2f} GiB"
+                            f"temporaries >= {score_gib:.2f} GiB unchunked, "
+                            f">= {active_score_gib:.2f} GiB active with "
+                            f"table chunk={active_tables}"
                         )
                         print(message, flush=True)
                         log.write(message + "\n")
@@ -166,10 +192,31 @@ def main() -> None:
                         batch.row_mask,
                         batch.col_mask,
                     )
-                    scores = cross_score_queries_tables(
-                        scorer, "row_match", q, x,
-                        batch.row_mask.float(), batch.col_mask.float(),
-                    )
+                    if args.score_table_chunk_size is None:
+                        scores = cross_score_queries_tables(
+                            scorer, "row_match", q, x,
+                            batch.row_mask.float(), batch.col_mask.float(),
+                        )
+                    else:
+                        score_chunks = []
+                        for table_start in range(
+                            0, x.shape[0], args.score_table_chunk_size
+                        ):
+                            table_end = min(
+                                x.shape[0],
+                                table_start + args.score_table_chunk_size,
+                            )
+                            score_chunks.append(
+                                cross_score_queries_tables(
+                                    scorer,
+                                    "row_match",
+                                    q,
+                                    x[table_start:table_end],
+                                    batch.row_mask[table_start:table_end].float(),
+                                    batch.col_mask[table_start:table_end].float(),
+                                )
+                            )
+                        scores = torch.cat(score_chunks, dim=1)
                     loss = query_table_info_nce_loss(
                         scores,
                         positive_mask=batch.positive_mask,
