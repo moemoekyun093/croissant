@@ -6,7 +6,12 @@ import sqlite3
 from pathlib import Path
 import tempfile
 
-from scripts.materialize_fk_consistent_corpus import _stage_sqlite, sample_database
+from scripts.materialize_fk_consistent_corpus import (
+    _atomic_json,
+    _stage_sqlite,
+    materialize,
+    sample_database,
+)
 
 
 def _snapshot(sampled):
@@ -165,6 +170,53 @@ def main() -> None:
         staged = _stage_sqlite(source, root / "stage", "toy")
         assert staged.read_bytes() == source.read_bytes()
         staged.unlink()
+
+    # A failed database is recorded without publishing an incomplete corpus;
+    # after fixing it, the next invocation resumes the successful checkpoint.
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        (root / "configs/splits").mkdir(parents=True)
+        requested = {
+            "tables": [
+                {"db_id": "good", "table_name": "items"},
+                {"db_id": "missing", "table_name": "items"},
+            ]
+        }
+        schemas = [
+            {"db_id": name, "table_names_original": ["items"], "foreign_keys": []}
+            for name in ("good", "missing")
+        ]
+        _atomic_json(root / "configs/splits/corpus.json", requested)
+        _atomic_json(root / "tables.json", schemas)
+
+        def create_database(name: str) -> None:
+            path = root / "databases" / name / f"{name}.sqlite"
+            path.parent.mkdir(parents=True)
+            database = sqlite3.connect(path)
+            database.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT)")
+            database.executemany(
+                "INSERT INTO items(value) VALUES (?)", [("a",), ("b",), ("c",)]
+            )
+            database.commit()
+            database.close()
+
+        create_database("good")
+        output = root / "corpus.materialized.json"
+        checkpoints = root / "checkpoints"
+        incomplete = materialize(
+            root, output, max_rows=2, seed=42,
+            database_checkpoint_dir=checkpoints, max_database_attempts=1,
+        )
+        assert incomplete["failed_databases"] == 1
+        assert not output.exists()
+
+        create_database("missing")
+        complete = materialize(
+            root, output, max_rows=2, seed=42,
+            database_checkpoint_dir=checkpoints, max_database_attempts=1,
+        )
+        assert complete["n_databases"] == 2
+        assert output.exists()
     print("FK-consistent sampling test passed")
 
 

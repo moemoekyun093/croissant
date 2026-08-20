@@ -33,6 +33,7 @@ import shutil
 import sqlite3
 import tempfile
 import time
+import traceback
 from typing import Iterable
 
 from src.data.synsql_dataset import clean_text
@@ -596,6 +597,84 @@ def _load_database_checkpoint(
     return payload
 
 
+def _materialize_one_database(
+    dataset_root: Path,
+    db_id: str,
+    requested_tables: list[str],
+    schema: dict | None,
+    max_rows: int,
+    seed: int,
+    sqlite_staging_dir: Path | None,
+    position: int,
+    total_databases: int,
+) -> dict:
+    source_path = _sqlite_path(dataset_root, db_id)
+    staged_path = None
+    print(
+        f"[fk-sample] database {position}/{total_databases}: {db_id} "
+        f"({source_path.stat().st_size / 2**20:.1f} MiB)"
+        + ("; staging locally" if sqlite_staging_dir is not None else ""),
+        flush=True,
+    )
+    try:
+        database_path = source_path
+        if sqlite_staging_dir is not None:
+            staged_path = _stage_sqlite(source_path, sqlite_staging_dir, db_id)
+            database_path = staged_path
+        connection = sqlite3.connect(str(database_path))
+        connection.execute("PRAGMA query_only=ON")
+        try:
+            sampled, columns, foreign_keys, removed = sample_database(
+                connection, db_id, schema, max_rows, seed
+            )
+        finally:
+            connection.close()
+    finally:
+        if staged_path is not None:
+            staged_path.unlink(missing_ok=True)
+
+    fk_child_columns = {
+        (fk.child, column)
+        for fk in foreign_keys
+        for column in fk.child_columns
+    }
+    database_tables = []
+    database_rows = 0
+    database_empty_tables = 0
+    for table in requested_tables:
+        rows = sampled.get(table, [])
+        table_columns = columns.get(table, [])
+        if not rows:
+            database_empty_tables += 1
+        database_rows += len(rows)
+        database_tables.append(
+            {
+                "table_id": f"{db_id}#sep#{table}",
+                "table_name": f"{db_id}#sep#{table}",
+                "columns": [
+                    {
+                        "header": column,
+                        "cells": [clean_text(row.values[index]) for row in rows],
+                        "is_foreign_key": (table, column) in fk_child_columns,
+                    }
+                    for index, column in enumerate(table_columns)
+                ],
+            }
+        )
+    return {
+        "format": CHECKPOINT_FORMAT,
+        "db_id": db_id,
+        "max_rows": max_rows,
+        "seed": seed,
+        "requested_tables": requested_tables,
+        "n_rows": database_rows,
+        "n_foreign_keys": len(foreign_keys),
+        "n_rows_pruned_for_fk_closure": removed,
+        "n_empty_tables": database_empty_tables,
+        "tables": database_tables,
+    }
+
+
 def materialize(
     dataset_root: Path,
     output_path: Path,
@@ -603,6 +682,7 @@ def materialize(
     seed: int,
     sqlite_staging_dir: Path | None = None,
     database_checkpoint_dir: Path | None = None,
+    max_database_attempts: int = 2,
 ) -> dict:
     with (dataset_root / "configs/splits/corpus.json").open(encoding="utf-8") as source:
         corpus = json.load(source)
@@ -623,12 +703,33 @@ def materialize(
 
     emitted_by_id = {}
     total_fks = total_rows = pruned_rows = empty_tables = 0
+    failures = []
     for position, db_id in enumerate(sorted(requested_by_db), start=1):
         requested_tables = requested_by_db[db_id]
         checkpoint_path = _database_checkpoint_path(database_checkpoint_dir, db_id)
-        checkpoint = _load_database_checkpoint(
-            checkpoint_path, db_id, requested_tables, max_rows, seed
-        )
+        failure_path = checkpoint_path.with_suffix(".failed.json")
+        checkpoint = None
+        try:
+            checkpoint = _load_database_checkpoint(
+                checkpoint_path, db_id, requested_tables, max_rows, seed
+            )
+        except Exception as error:
+            failure = {
+                "db_id": db_id,
+                "stage": "load_checkpoint",
+                "error_type": type(error).__name__,
+                "error": str(error),
+                "traceback": traceback.format_exc(),
+            }
+            _atomic_json(failure_path, failure)
+            failures.append(failure)
+            print(
+                f"[fk-sample] ERROR database {position}/{len(requested_by_db)} "
+                f"{db_id}: could not load checkpoint: {error}; continuing",
+                flush=True,
+            )
+            continue
+
         if checkpoint is not None:
             for table_record in checkpoint["tables"]:
                 _record_db, _, table = table_record["table_id"].partition("#sep#")
@@ -642,77 +743,59 @@ def materialize(
                 f"{db_id} from {checkpoint_path}",
                 flush=True,
             )
+            failure_path.unlink(missing_ok=True)
             continue
 
-        source_path = _sqlite_path(dataset_root, db_id)
-        staged_path = None
-        print(
-            f"[fk-sample] database {position}/{len(requested_by_db)}: {db_id} "
-            f"({source_path.stat().st_size / 2**20:.1f} MiB)"
-            + ("; staging locally" if sqlite_staging_dir is not None else ""),
-            flush=True,
-        )
-        try:
-            database_path = source_path
-            if sqlite_staging_dir is not None:
-                staged_path = _stage_sqlite(source_path, sqlite_staging_dir, db_id)
-                database_path = staged_path
-            connection = sqlite3.connect(str(database_path))
-            connection.execute("PRAGMA query_only=ON")
+        last_failure = None
+        for attempt in range(1, max_database_attempts + 1):
             try:
-                sampled, columns, foreign_keys, removed = sample_database(
-                    connection, db_id, schemas.get(db_id), max_rows, seed
+                checkpoint = _materialize_one_database(
+                    dataset_root=dataset_root,
+                    db_id=db_id,
+                    requested_tables=requested_tables,
+                    schema=schemas.get(db_id),
+                    max_rows=max_rows,
+                    seed=seed,
+                    sqlite_staging_dir=sqlite_staging_dir,
+                    position=position,
+                    total_databases=len(requested_by_db),
                 )
-            finally:
-                connection.close()
-        finally:
-            if staged_path is not None:
-                staged_path.unlink(missing_ok=True)
-        fk_child_columns = {
-            (fk.child, column)
-            for fk in foreign_keys
-            for column in fk.child_columns
-        }
-        database_tables = []
-        database_rows = 0
-        database_empty_tables = 0
-        for table in requested_tables:
-            rows = sampled.get(table, [])
-            table_columns = columns.get(table, [])
-            if not rows:
-                database_empty_tables += 1
-            database_rows += len(rows)
-            table_record = {
-                "table_id": f"{db_id}#sep#{table}",
-                "table_name": f"{db_id}#sep#{table}",
-                "columns": [
-                    {
-                        "header": column,
-                        "cells": [clean_text(row.values[index]) for row in rows],
-                        "is_foreign_key": (table, column) in fk_child_columns,
-                    }
-                    for index, column in enumerate(table_columns)
-                ],
-            }
-            database_tables.append(table_record)
-            emitted_by_id[(db_id, table)] = table_record
-        checkpoint = {
-            "format": CHECKPOINT_FORMAT,
-            "db_id": db_id,
-            "max_rows": max_rows,
-            "seed": seed,
-            "requested_tables": requested_tables,
-            "n_rows": database_rows,
-            "n_foreign_keys": len(foreign_keys),
-            "n_rows_pruned_for_fk_closure": removed,
-            "n_empty_tables": database_empty_tables,
-            "tables": database_tables,
-        }
+                break
+            except Exception as error:
+                last_failure = {
+                    "db_id": db_id,
+                    "stage": "materialize_database",
+                    "attempt": attempt,
+                    "max_attempts": max_database_attempts,
+                    "error_type": type(error).__name__,
+                    "error": str(error),
+                    "traceback": traceback.format_exc(),
+                }
+                _atomic_json(failure_path, last_failure)
+                print(
+                    f"[fk-sample] ERROR database {position}/{len(requested_by_db)} "
+                    f"{db_id}, attempt {attempt}/{max_database_attempts}: "
+                    f"{type(error).__name__}: {error}",
+                    flush=True,
+                )
+        if checkpoint is None:
+            failures.append(last_failure)
+            print(
+                f"[fk-sample] SKIPPING {db_id} after {max_database_attempts} "
+                f"failed attempt(s); details={failure_path}",
+                flush=True,
+            )
+            continue
+
         _atomic_json(checkpoint_path, checkpoint)
-        total_rows += database_rows
-        total_fks += len(foreign_keys)
-        pruned_rows += removed
-        empty_tables += database_empty_tables
+        failure_path.unlink(missing_ok=True)
+        for table_record in checkpoint["tables"]:
+            _record_db, _, table = table_record["table_id"].partition("#sep#")
+            emitted_by_id[(db_id, table)] = table_record
+        total_rows += int(checkpoint["n_rows"])
+        total_fks += int(checkpoint["n_foreign_keys"])
+        pruned_rows += int(checkpoint["n_rows_pruned_for_fk_closure"])
+        empty_tables += int(checkpoint["n_empty_tables"])
         print(
             f"[fk-sample] completed {position}/{len(requested_by_db)} databases; "
             f"rows={total_rows}, FKs={total_fks}, pruned={pruned_rows}; "
@@ -720,12 +803,37 @@ def materialize(
             flush=True,
         )
 
+    if failures:
+        incomplete = {
+            "format": "croissant_fk_materialization_incomplete_v1",
+            "dataset_root": str(dataset_root.resolve()),
+            "output_path_not_published": str(output_path.resolve()),
+            "seed": seed,
+            "max_rows": max_rows,
+            "completed_databases": len(requested_by_db) - len(failures),
+            "failed_databases": len(failures),
+            "failures": failures,
+            "database_checkpoint_dir": str(database_checkpoint_dir.resolve()),
+        }
+        incomplete_path = output_path.with_suffix(output_path.suffix + ".incomplete.json")
+        _atomic_json(incomplete_path, incomplete)
+        print(
+            f"[fk-sample] INCOMPLETE: {len(failures)} database(s) failed; "
+            f"final corpus was NOT published. Rerun the same command to resume "
+            f"successful checkpoints and retry failures. Details: {incomplete_path}",
+            flush=True,
+        )
+        return incomplete
+
     emitted = [
         emitted_by_id[(str(record["db_id"]), str(record["table_name"]))]
         for record in corpus["tables"]
         if (str(record["db_id"]), str(record["table_name"])) in emitted_by_id
     ]
     _atomic_json(output_path, emitted)
+    output_path.with_suffix(output_path.suffix + ".incomplete.json").unlink(
+        missing_ok=True
+    )
     manifest = {
         "format": "croissant_fk_consistent_materialized_corpus",
         "dataset_root": str(dataset_root.resolve()),
@@ -766,9 +874,15 @@ def main() -> None:
         default=None,
         help="per-database resumable JSON checkpoints; defaults next to output_path",
     )
+    parser.add_argument(
+        "--max_database_attempts",
+        type=int,
+        default=2,
+        help="retry a failing database this many times before recording it and continuing",
+    )
     args = parser.parse_args()
-    if args.max_rows <= 0:
-        parser.error("--max_rows must be positive")
+    if args.max_rows <= 0 or args.max_database_attempts <= 0:
+        parser.error("--max_rows and --max_database_attempts must be positive")
     output_path = Path(args.output_path)
     if output_path.exists():
         parser.error(f"refusing to overwrite existing output: {output_path}")
@@ -779,6 +893,7 @@ def main() -> None:
         args.seed,
         Path(args.sqlite_staging_dir) if args.sqlite_staging_dir else None,
         Path(args.database_checkpoint_dir) if args.database_checkpoint_dir else None,
+        args.max_database_attempts,
     )
 
 
