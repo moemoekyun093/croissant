@@ -2,3 +2,7 @@
 __pycache__/
 *.py[cod]
 *$py.class
+
+# Local GPU monitor configuration may identify hosts and should never contain
+# credentials, even though SMTP passwords are environment variables.
+configs/gpu-monitor.json

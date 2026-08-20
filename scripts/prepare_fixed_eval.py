@@ -29,8 +29,16 @@ def main() -> None:
     parser.add_argument("--split_json", default="configs/splits/query_split.json")
     parser.add_argument("--corpus_json", default="configs/splits/corpus.json")
     parser.add_argument("--materialized_corpus_cache_path", required=True)
-    parser.add_argument("--text_cache_path", required=True)
-    parser.add_argument("--query_cache_path", required=True)
+    parser.add_argument(
+        "--text_cache_path",
+        default=None,
+        help="optional existing cell/header cache; cache misses are encoded directly",
+    )
+    parser.add_argument(
+        "--query_cache_path",
+        default=None,
+        help="optional existing query cache; cache misses are encoded directly",
+    )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--model_name", default="bert-base-uncased")
     parser.add_argument("--seed", type=int, default=42)

@@ -1,0 +1,36 @@
+{
+  "servers": [
+    {
+      "name": "training-01",
+      "host": "gpu-monitor@gpu-01.example.com",
+      "port": 22
+    },
+    {
+      "name": "training-02",
+      "host": "gpu-monitor@gpu-02.example.com",
+      "port": 22,
+      "minimum_free_memory_mb": 20000
+    }
+  ],
+  "availability": {
+    "minimum_free_memory_mb": 12000,
+    "maximum_utilization_percent": 10,
+    "ssh_timeout_seconds": 10
+  },
+  "check_interval_seconds": 300,
+  "reminder_hours": 24,
+  "notify_on_first_run": true,
+  "state_file": "~/.local/state/gpu-monitor/state.json",
+  "smtp": {
+    "host": "smtp.example.com",
+    "port": 587,
+    "starttls": true,
+    "username": "alerts@example.com",
+    "password_env": "GPU_MONITOR_SMTP_PASSWORD"
+  },
+  "email": {
+    "from": "alerts@example.com",
+    "to": ["you@example.com"],
+    "subject_prefix": "[GPU monitor]"
+  }
+}

@@ -1,0 +1,11 @@
+[Unit]
+Description=Check remote GPU availability every five minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+Persistent=true
+RandomizedDelaySec=15
+
+[Install]
+WantedBy=timers.target
