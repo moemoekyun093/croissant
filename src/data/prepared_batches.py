@@ -16,13 +16,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 import pickle
-from typing import Iterator
+import queue
+import threading
+from typing import Iterable, Iterator, TypeVar
 
 import torch
 
 
 FORMAT_NAME = "croissant_prepared_batches"
 FORMAT_VERSION = 3
+T = TypeVar("T")
 
 
 @dataclass
@@ -181,6 +184,42 @@ def iter_prepared_batches(path: str, validate: bool = True) -> Iterator[Prepared
             if validate:
                 batch.validate(projection_dim)
             yield batch
+
+
+def prefetch_iterable(iterable: Iterable[T], depth: int = 2) -> Iterator[T]:
+    """Read/unpickle future CPU batches while the GPU trains on this one.
+
+    Prepared shards normally live on NAS.  Without prefetching, each step
+    waits synchronously for ``pickle.load`` before launching any GPU work.
+    A bounded daemon thread overlaps that I/O/deserialization with the
+    current forward/backward pass while retaining only ``depth`` additional
+    batches in memory.  Record order and tensor contents are unchanged.
+    """
+    if depth <= 0:
+        yield from iterable
+        return
+
+    records: queue.Queue[tuple[str, object]] = queue.Queue(maxsize=depth)
+
+    def produce() -> None:
+        try:
+            for value in iterable:
+                records.put(("value", value))
+        except BaseException as error:
+            records.put(("error", error))
+        finally:
+            records.put(("done", None))
+
+    worker = threading.Thread(target=produce, name="prepared-batch-prefetch", daemon=True)
+    worker.start()
+    while True:
+        kind, payload = records.get()
+        if kind == "value":
+            yield payload  # type: ignore[misc]
+        elif kind == "error":
+            raise payload  # type: ignore[misc]
+        else:
+            return
 
 
 def _validate_metadata(metadata: object, path: str) -> None:

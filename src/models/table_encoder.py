@@ -398,7 +398,7 @@ class TableEncoder(nn.Module):
         import time
         device = next(self.parameters()).device
         is_cuda = device.type == "cuda"
-        if is_cuda:
+        if is_cuda and profile:
             torch.cuda.synchronize()
         t0 = time.perf_counter()
 
@@ -429,14 +429,14 @@ class TableEncoder(nn.Module):
         elif ablation is not None:
             raise ValueError(f"Unknown ablation mode: {ablation}")
 
-        if is_cuda:
+        if is_cuda and profile:
             torch.cuda.synchronize()
         t1 = time.perf_counter()
 
         for layer in self.layers:
             X = layer(X, row_mask, col_mask)
 
-        if is_cuda:
+        if is_cuda and profile:
             torch.cuda.synchronize()
         t2 = time.perf_counter()
 

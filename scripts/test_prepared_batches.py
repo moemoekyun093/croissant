@@ -11,6 +11,7 @@ from src.data.prepared_batches import (
     PreparedBatch,
     PreparedBatchWriter,
     iter_prepared_batches,
+    prefetch_iterable,
     read_prepared_metadata,
 )
 from src.data.prepared_eval import (
@@ -19,7 +20,12 @@ from src.data.prepared_eval import (
     read_eval_shard,
     write_eval_shard,
 )
-from src.models.prepared_table_encoder import PreparedQueryEncoder, PreparedTableEncoder
+from src.models.prepared_table_encoder import (
+    PreparedQueryEncoder,
+    PreparedTabbieEncoder,
+    PreparedTableEncoder,
+    PreparedTurlEncoder,
+)
 from src.scoring.multi_score import MultiScorer
 from src.training.losses import cross_score_queries_tables, query_table_info_nce_loss
 from src.training.prepared_evaluator import _ranking_metrics
@@ -27,6 +33,21 @@ from src.training.prepared_evaluator import _ranking_metrics
 
 def main() -> None:
     torch.manual_seed(7)
+    assert list(prefetch_iterable(range(20), depth=2)) == list(range(20))
+
+    def failing_stream():
+        yield 1
+        raise RuntimeError("prefetch propagation check")
+
+    prefetched = iter(prefetch_iterable(failing_stream(), depth=2))
+    assert next(prefetched) == 1
+    try:
+        next(prefetched)
+    except RuntimeError as error:
+        assert str(error) == "prefetch propagation check"
+    else:
+        raise AssertionError("prefetch worker exception was not propagated")
+
     batch = PreparedBatch(
         query_texts=("q0", "q1", "q2"),
         candidate_table_ids=("t0", "t1", "t2", "t3", "t4"),
@@ -127,6 +148,69 @@ def main() -> None:
     loss.backward()
     assert table_model.film_content.weight.grad is not None
     assert query_model.proj.weight.grad is not None
+
+    turl = PreparedTurlEncoder(
+        embed_dim=8,
+        num_layers=1,
+        num_heads=2,
+        ffn_hidden_dim=16,
+        attention_budget=2_000,
+    )
+    turl_output = turl(
+        prepared.cell_features,
+        prepared.header_features,
+        prepared.row_mask,
+        prepared.col_mask,
+    )
+    assert turl_output.shape == prepared.cell_features.shape
+    turl_output.sum().backward()
+    assert turl.layers[0].linear1.weight.grad is not None
+
+    tabbie = PreparedTabbieEncoder(
+        embed_dim=8,
+        num_layers=1,
+        num_heads=2,
+        ffn_hidden_dim=16,
+        max_rows=7,
+        max_columns=4,
+        table_microbatch_cell_budget=48,
+        table_microbatch_max_tables=2,
+    )
+    tabbie_output = tabbie(
+        prepared.cell_features,
+        prepared.header_features,
+        prepared.row_mask,
+        prepared.col_mask,
+    )
+    assert tabbie_output.shape == prepared.cell_features.shape
+    tabbie_output.sum().backward()
+    assert tabbie.row_layers[0].linear1.weight.grad is not None
+
+    # Size-sorted TABBIE microbatching must be an execution-only change:
+    # mixed table shapes are restored in candidate order with the same
+    # values as a single padded contextualization call.
+    mixed_rows = prepared.row_mask.clone()
+    mixed_columns = prepared.col_mask.clone()
+    mixed_rows[1, 4:] = False
+    mixed_rows[3, 2:] = False
+    mixed_columns[2, 3:] = False
+    mixed_columns[3, 2:] = False
+    tabbie.eval()
+    grouped_output = tabbie(
+        prepared.cell_features,
+        prepared.header_features,
+        mixed_rows,
+        mixed_columns,
+    )
+    tabbie.table_microbatch_cell_budget = None
+    tabbie.table_microbatch_max_tables = None
+    full_output = tabbie(
+        prepared.cell_features,
+        prepared.header_features,
+        mixed_rows,
+        mixed_columns,
+    )
+    assert torch.allclose(grouped_output, full_output, atol=1e-5, rtol=1e-4)
     print("prepared-batch serialization/gradient check passed")
 
 

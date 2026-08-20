@@ -248,6 +248,7 @@ class BaselineCellwiseAdapter(nn.Module):
 
         device = next(self.parameters()).device
         is_cuda = device.type == "cuda"
+        self.baseline_encoder._profile_timings = profile
         self._last_table_microbatches = 1
 
         per_table_cell: list = [None] * len(tables)  # each [n_cols_i, n_rows_i, embed_dim]
@@ -268,13 +269,13 @@ class BaselineCellwiseAdapter(nn.Module):
         # re-applied fresh every call. Counted as "frozen" time (it's a
         # cache load + a cheap Linear/Identity, not the backbone) -- ~0 on
         # a fully-warm cache.
-        if is_cuda:
+        if is_cuda and profile:
             torch.cuda.synchronize()
         t_hits_0 = time.perf_counter()
         for i in cache_hit_indices:
             raw_cell = self._table_cache[self._cache_key(tables[i])].to(device)
             per_table_cell[i] = self.projection(raw_cell)
-        if is_cuda:
+        if is_cuda and profile:
             torch.cuda.synchronize()
         frozen_s = time.perf_counter() - t_hits_0
         network_s = 0.0
@@ -303,11 +304,11 @@ class BaselineCellwiseAdapter(nn.Module):
                         (*self._table_to_headers_rows(tables[i]), None) for i in group
                     ]
 
-                    if is_cuda:
+                    if is_cuda and profile:
                         torch.cuda.synchronize()
                     t_fb_0 = time.perf_counter()
                     encodings = self.baseline_encoder.forward_batch(batch_inputs)
-                    if is_cuda:
+                    if is_cuda and profile:
                         torch.cuda.synchronize()
                     t_fb_1 = time.perf_counter()
 
@@ -329,7 +330,7 @@ class BaselineCellwiseAdapter(nn.Module):
                 self._last_table_microbatches = len(groups)
             else:
                 self._last_table_microbatches = max(1, len(cache_miss_indices))
-                if is_cuda:
+                if is_cuda and profile:
                     torch.cuda.synchronize()
                 t_loop_0 = time.perf_counter()
                 for i in cache_miss_indices:
@@ -342,7 +343,7 @@ class BaselineCellwiseAdapter(nn.Module):
                     if self.cacheable:
                         self._table_cache[self._cache_key(tables[i])] = raw_cell.detach().cpu()
                     per_table_cell[i] = self.projection(raw_cell)
-                if is_cuda:
+                if is_cuda and profile:
                     torch.cuda.synchronize()
                 frozen_s += time.perf_counter() - t_loop_0
 

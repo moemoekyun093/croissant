@@ -9,6 +9,7 @@ import torch
 
 from src.models.prepared_table_encoder import (
     PreparedQueryEncoder,
+    PreparedTabbieEncoder,
     PreparedTableEncoder,
     PreparedTurlEncoder,
 )
@@ -23,10 +24,11 @@ def main() -> None:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--query_batch_size", type=int, default=32)
     parser.add_argument("--output_json", default=None)
-    parser.add_argument("--encoder", choices=("ours", "turl"), default=None)
+    parser.add_argument("--encoder", choices=("ours", "tabbie", "turl"), default=None)
     parser.add_argument("--num_layers", type=int, default=None)
     parser.add_argument("--num_heads", type=int, default=None)
     parser.add_argument("--channel_mix_hidden_dim", type=int, default=None)
+    parser.add_argument("--tabbie_ffn_hidden_dim", type=int, default=None)
     parser.add_argument("--turl_ffn_hidden_dim", type=int, default=None)
     parser.add_argument("--turl_attention_budget", type=int, default=None)
     args = parser.parse_args()
@@ -41,7 +43,7 @@ def main() -> None:
     metadata = checkpoint["metadata"]
     config = checkpoint.get("model_config", {})
     encoder = args.encoder or checkpoint.get("encoder") or config.get("encoder")
-    if encoder not in ("ours", "turl"):
+    if encoder not in ("ours", "tabbie", "turl"):
         parser.error("checkpoint has no encoder metadata; pass --encoder")
     dim = int(metadata["projection_dim"])
     num_layers = args.num_layers or config.get("num_layers", 3)
@@ -57,6 +59,18 @@ def main() -> None:
                 or config.get("channel_mix_hidden_dim", 512)
             ),
             nonlinearity=config.get("nonlinearity", "sigmoid"),
+        ).to(device)
+    elif encoder == "tabbie":
+        table_model = PreparedTabbieEncoder(
+            embed_dim=dim,
+            num_layers=num_layers,
+            num_heads=num_heads,
+            ffn_hidden_dim=(
+                args.tabbie_ffn_hidden_dim
+                or config.get("tabbie_ffn_hidden_dim", 512)
+            ),
+            max_rows=int(metadata["max_rows"]) + 1,
+            max_columns=int(metadata["max_columns"]),
         ).to(device)
     else:
         table_model = PreparedTurlEncoder(

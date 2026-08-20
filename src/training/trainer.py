@@ -303,6 +303,7 @@ class FinetuneTrainer:
         profile: bool = False,
         profile_every: int = 20,
         score_table_chunk_size: int | None = None,
+        sync_cuda_errors: bool = False,
     ):
         self.model = model.to(device)
         self.query_encoder = query_encoder.to(device)
@@ -334,6 +335,7 @@ class FinetuneTrainer:
         # adds a few torch.cuda-syncing time.perf_counter() calls per step.
         self.profile = profile
         self.profile_every = profile_every
+        self.sync_cuda_errors = sync_cuda_errors
         if score_table_chunk_size is not None and score_table_chunk_size <= 0:
             raise ValueError("score_table_chunk_size must be positive or None")
         self.score_table_chunk_size = score_table_chunk_size
@@ -498,7 +500,9 @@ class FinetuneTrainer:
         t_query = time.perf_counter()
 
         try:
-            X, col_mask, row_mask, cell_mask = self.model.forward_batch_cellwise(tables)
+            X, col_mask, row_mask, cell_mask = self.model.forward_batch_cellwise(
+                tables, profile=self.profile
+            )
             X = self.table_projection(X)
             self._maybe_sync()
         except Exception:
@@ -612,6 +616,13 @@ class FinetuneTrainer:
         impossible to attribute. Called at the end of every try block in
         _score_batch/train_step that just did GPU work. No-op on CPU
         (torch.cuda.synchronize would raise if no CUDA device exists)."""
+        # Synchronizing after every query/table/scoring/backward stage is
+        # invaluable while isolating a device-side assertion, but it also
+        # serializes the entire pipeline and prevents CPU preparation from
+        # overlapping queued GPU work. Production runs synchronize only
+        # when profiling or when explicitly requested for diagnostics.
+        if not (self.profile or self.sync_cuda_errors):
+            return
         dev = self.device
         is_cuda = (isinstance(dev, str) and dev.startswith("cuda")) or (
             isinstance(dev, torch.device) and dev.type == "cuda"

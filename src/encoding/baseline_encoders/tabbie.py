@@ -259,13 +259,14 @@ class TabbieTableEncoder(BaseTableEncoder):
         # network measurement.
         import time
         is_cuda = self.device.type == "cuda" if hasattr(self.device, "type") else False
-        if is_cuda:
+        profile_timings = getattr(self, "_profile_timings", False)
+        if is_cuda and profile_timings:
             torch.cuda.synchronize()
         t0 = time.perf_counter()
 
         all_cls = self._encode_cells_isolated(all_texts)  # [total_cells_across_all_tables, D]
 
-        if is_cuda:
+        if is_cuda and profile_timings:
             torch.cuda.synchronize()
         t1 = time.perf_counter()
 
@@ -286,7 +287,7 @@ class TabbieTableEncoder(BaseTableEncoder):
         cls_list = [all_cls[start:end] for (start, end) in per_table_offsets]
         results: List[TableEncoding] = self._forward_from_cls_batch(cls_list, per_table_shape)
 
-        if is_cuda:
+        if is_cuda and profile_timings:
             torch.cuda.synchronize()
         t2 = time.perf_counter()
 

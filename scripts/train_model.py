@@ -360,6 +360,12 @@ if __name__ == "__main__":
     )
     parser.add_argument("--profile_every", type=int, default=20)
     parser.add_argument(
+        "--sync_cuda_errors",
+        action="store_true",
+        help="synchronize after every CUDA stage for crash attribution; "
+        "slower and unnecessary for normal training",
+    )
+    parser.add_argument(
         "--score_table_chunk_size",
         type=_int_or_none,
         default=None,
@@ -874,6 +880,7 @@ if __name__ == "__main__":
         profile=args.profile,
         profile_every=args.profile_every,
         score_table_chunk_size=args.score_table_chunk_size,
+        sync_cuda_errors=args.sync_cuda_errors,
     )
 
     # Same "auto-resume if a checkpoint already exists" pattern as stage

@@ -404,14 +404,15 @@ class StruBertTableEncoder(BaseTableEncoder):
         # cacheable -- trainable).
         import time
         is_cuda = self.device.type == "cuda" if hasattr(self.device, "type") else False
-        if is_cuda:
+        profile_timings = getattr(self, "_profile_timings", False)
+        if is_cuda and profile_timings:
             torch.cuda.synchronize()
         t0 = time.perf_counter()
 
         all_col_fine, all_col_coarse = self._cellwise_pool_sequence(all_col_seqs)
         all_row_fine, all_row_coarse = self._cellwise_pool_sequence(all_row_seqs)
 
-        if is_cuda:
+        if is_cuda and profile_timings:
             torch.cuda.synchronize()
         t1 = time.perf_counter()
 
@@ -425,7 +426,7 @@ class StruBertTableEncoder(BaseTableEncoder):
             [all_row_coarse[r0:r1] for (r0, r1) in row_offsets],
         )
 
-        if is_cuda:
+        if is_cuda and profile_timings:
             torch.cuda.synchronize()
         t2 = time.perf_counter()
 

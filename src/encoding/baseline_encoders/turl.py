@@ -369,7 +369,8 @@ class TurlTableEncoder(BaseTableEncoder):
         import time
 
         is_cuda = self.token_embed.weight.device.type == "cuda"
-        if is_cuda:
+        profile_timings = getattr(self, "_profile_timings", False)
+        if is_cuda and profile_timings:
             torch.cuda.synchronize()
         started = time.perf_counter()
 
@@ -379,7 +380,7 @@ class TurlTableEncoder(BaseTableEncoder):
             for original_idx, encoding in zip(group, group_results):
                 results[original_idx] = encoding
 
-        if is_cuda:
+        if is_cuda and profile_timings:
             torch.cuda.synchronize()
         # TURL's frozen lookup/tokenization is tiny compared with its
         # trainable masked stack. Attribute the combined batched call to the

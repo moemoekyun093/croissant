@@ -11,9 +11,14 @@ import time
 import torch
 from torch.optim import AdamW
 
-from src.data.prepared_batches import iter_prepared_batches, read_prepared_metadata
+from src.data.prepared_batches import (
+    iter_prepared_batches,
+    prefetch_iterable,
+    read_prepared_metadata,
+)
 from src.models.prepared_table_encoder import (
     PreparedQueryEncoder,
+    PreparedTabbieEncoder,
     PreparedTableEncoder,
     PreparedTurlEncoder,
 )
@@ -38,10 +43,11 @@ def main() -> None:
         help="start fresh even if checkpoint_latest.pt exists",
     )
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--encoder", choices=("ours", "turl"), default="ours")
+    parser.add_argument("--encoder", choices=("ours", "tabbie", "turl"), default="ours")
     parser.add_argument("--num_layers", type=int, default=3)
     parser.add_argument("--num_heads", type=int, default=8)
     parser.add_argument("--channel_mix_hidden_dim", type=int, default=512)
+    parser.add_argument("--tabbie_ffn_hidden_dim", type=int, default=512)
     parser.add_argument("--turl_ffn_hidden_dim", type=int, default=512)
     parser.add_argument("--turl_attention_budget", type=int, default=2_000_000)
     parser.add_argument("--nonlinearity", default="sigmoid")
@@ -71,6 +77,18 @@ def main() -> None:
         "complete [Bq,Bt] matrix before the unchanged InfoNCE loss",
     )
     parser.add_argument("--poll_seconds", type=float, default=5.0)
+    parser.add_argument(
+        "--prefetch_batches",
+        type=int,
+        default=2,
+        help="background NAS read/unpickle queue depth (default: 2; 0 disables)",
+    )
+    parser.add_argument(
+        "--amp_dtype",
+        choices=("none", "bfloat16"),
+        default="none",
+        help="optional CUDA mixed precision; none preserves FP32 training",
+    )
     args = parser.parse_args()
     if args.score_table_chunk_size is not None and args.score_table_chunk_size <= 0:
         parser.error("--score_table_chunk_size must be positive or omitted")
@@ -78,6 +96,12 @@ def main() -> None:
         parser.error("--profile_every must be positive")
     if args.eval_query_batch_size <= 0 or args.patience <= 0:
         parser.error("--eval_query_batch_size and --patience must be positive")
+    if args.prefetch_batches < 0:
+        parser.error("--prefetch_batches must be non-negative")
+    if args.poll_seconds <= 0:
+        parser.error("--poll_seconds must be positive")
+    if args.amp_dtype != "none" and not args.device.startswith("cuda"):
+        parser.error("--amp_dtype currently requires a CUDA device")
     if args.skip_resume and args.resume_checkpoint is not None:
         parser.error("--skip_resume and --resume_checkpoint are mutually exclusive")
 
@@ -97,6 +121,7 @@ def main() -> None:
     metadata = read_prepared_metadata(first_paths[0])
     dim = int(metadata["projection_dim"])
     device = torch.device(args.device)
+    amp_dtype = torch.bfloat16 if args.amp_dtype == "bfloat16" else None
 
     if args.encoder == "ours":
         table_model = PreparedTableEncoder(
@@ -105,6 +130,17 @@ def main() -> None:
             num_heads=args.num_heads,
             channel_mix_hidden_dim=args.channel_mix_hidden_dim,
             nonlinearity=args.nonlinearity,
+            table_microbatch_cell_budget=args.table_microbatch_cell_budget,
+            table_microbatch_max_tables=args.table_microbatch_max_tables,
+        ).to(device)
+    elif args.encoder == "tabbie":
+        table_model = PreparedTabbieEncoder(
+            embed_dim=dim,
+            num_layers=args.num_layers,
+            num_heads=args.num_heads,
+            ffn_hidden_dim=args.tabbie_ffn_hidden_dim,
+            max_rows=int(metadata["max_rows"]) + 1,
+            max_columns=int(metadata["max_columns"]),
             table_microbatch_cell_budget=args.table_microbatch_cell_budget,
             table_microbatch_max_tables=args.table_microbatch_max_tables,
         ).to(device)
@@ -175,10 +211,30 @@ def main() -> None:
         trainable_parameters = sum(parameter.numel() for parameter in parameters)
         startup = (
             f"[prepared] encoder={args.encoder} projection_dim={dim} "
-            f"trainable_parameters={trainable_parameters:,}"
+            f"trainable_parameters={trainable_parameters:,} "
+            f"prefetch_batches={args.prefetch_batches} amp_dtype={args.amp_dtype}"
         )
         print(startup, flush=True)
         log.write(startup + "\n")
+        if args.val_prepared_dir is None:
+            validation_startup = (
+                "[prepared-val] DISABLED: no --val_prepared_dir was supplied; "
+                "this run cannot report validation MAP/MRR or select best_model.pt"
+            )
+        else:
+            validation_marker = os.path.join(
+                args.val_prepared_dir, "PREPARATION_COMPLETE"
+            )
+            validation_state = (
+                "ready" if os.path.exists(validation_marker) else "still preparing"
+            )
+            validation_startup = (
+                f"[prepared-val] ENABLED: {args.val_prepared_dir}; "
+                f"MAP/MRR every completed epoch, patience={args.patience}; "
+                f"validation artifacts are {validation_state}"
+            )
+        print(validation_startup, flush=True)
+        log.write(validation_startup + "\n")
         global_step = int(resume_state.get("global_step", 0)) if resume_state else 0
         start_time = time.time()
         processed: set[str] = set(
@@ -276,11 +332,16 @@ def main() -> None:
                 "best_val_map": best_val_map,
                 "best_epoch": best_epoch,
                 "epochs_without_improvement": epochs_without_improvement,
+                "training_config": {
+                    "amp_dtype": args.amp_dtype,
+                    "prefetch_batches": args.prefetch_batches,
+                },
                 "model_config": {
                     "encoder": args.encoder,
                     "num_layers": args.num_layers,
                     "num_heads": args.num_heads,
                     "channel_mix_hidden_dim": args.channel_mix_hidden_dim,
+                    "tabbie_ffn_hidden_dim": args.tabbie_ffn_hidden_dim,
                     "nonlinearity": args.nonlinearity,
                     "turl_ffn_hidden_dim": args.turl_ffn_hidden_dim,
                     "turl_attention_budget": args.turl_attention_budget,
@@ -330,7 +391,10 @@ def main() -> None:
                 table_model.train()
                 query_model.train()
                 scorer.train()
-                batch_iterator = iter_prepared_batches(path, validate=True)
+                batch_iterator = prefetch_iterable(
+                    iter_prepared_batches(path, validate=True),
+                    depth=args.prefetch_batches,
+                )
                 previous_step_end = time.perf_counter()
                 for shard_step, cpu_batch in enumerate(batch_iterator):
                     pickle_load_s = time.perf_counter() - previous_step_end
@@ -365,54 +429,72 @@ def main() -> None:
                         log.write(message + "\n")
 
                     stage_started = time.perf_counter()
-                    batch = cpu_batch.materialize(device)
+                    batch = cpu_batch.materialize(
+                        device,
+                        dtype=torch.float32 if amp_dtype is None else amp_dtype,
+                    )
                     profile_sync()
                     materialize_s = time.perf_counter() - stage_started
                     optimizer.zero_grad(set_to_none=True)
 
                     stage_started = time.perf_counter()
-                    q = query_model(batch.query_features, batch.query_mask)
+                    with torch.autocast(
+                        device_type=device.type,
+                        dtype=amp_dtype,
+                        enabled=amp_dtype is not None,
+                    ):
+                        q = query_model(batch.query_features, batch.query_mask)
                     profile_sync()
                     query_s = time.perf_counter() - stage_started
 
                     stage_started = time.perf_counter()
-                    x = table_model(
-                        batch.cell_features,
-                        batch.header_features,
-                        batch.row_mask,
-                        batch.col_mask,
-                    )
+                    with torch.autocast(
+                        device_type=device.type,
+                        dtype=amp_dtype,
+                        enabled=amp_dtype is not None,
+                    ):
+                        x = table_model(
+                            batch.cell_features,
+                            batch.header_features,
+                            batch.row_mask,
+                            batch.col_mask,
+                        )
                     profile_sync()
                     table_s = time.perf_counter() - stage_started
 
                     stage_started = time.perf_counter()
-                    if args.score_table_chunk_size is None:
-                        scores = cross_score_queries_tables(
-                            scorer, "row_match", q, x,
-                            batch.row_mask.float(), batch.col_mask.float(),
-                        )
-                    else:
-                        score_chunks = []
-                        for table_start in range(
-                            0, x.shape[0], args.score_table_chunk_size
-                        ):
-                            table_end = min(
-                                x.shape[0],
-                                table_start + args.score_table_chunk_size,
+                    with torch.autocast(
+                        device_type=device.type,
+                        dtype=amp_dtype,
+                        enabled=amp_dtype is not None,
+                    ):
+                        if args.score_table_chunk_size is None:
+                            scores = cross_score_queries_tables(
+                                scorer, "row_match", q, x,
+                                batch.row_mask.float(), batch.col_mask.float(),
                             )
-                            score_chunks.append(
-                                cross_score_queries_tables(
-                                    scorer,
-                                    "row_match",
-                                    q,
-                                    x[table_start:table_end],
-                                    batch.row_mask[table_start:table_end].float(),
-                                    batch.col_mask[table_start:table_end].float(),
+                        else:
+                            score_chunks = []
+                            for table_start in range(
+                                0, x.shape[0], args.score_table_chunk_size
+                            ):
+                                table_end = min(
+                                    x.shape[0],
+                                    table_start + args.score_table_chunk_size,
                                 )
-                            )
-                        scores = torch.cat(score_chunks, dim=1)
+                                score_chunks.append(
+                                    cross_score_queries_tables(
+                                        scorer,
+                                        "row_match",
+                                        q,
+                                        x[table_start:table_end],
+                                        batch.row_mask[table_start:table_end].float(),
+                                        batch.col_mask[table_start:table_end].float(),
+                                    )
+                                )
+                            scores = torch.cat(score_chunks, dim=1)
                     loss = query_table_info_nce_loss(
-                        scores,
+                        scores.float(),
                         positive_mask=batch.positive_mask,
                         temperature=args.temperature,
                     )
@@ -501,6 +583,23 @@ def main() -> None:
                     log.write(message + "\n")
 
                     if args.val_prepared_dir is not None:
+                        validation_marker = os.path.join(
+                            args.val_prepared_dir, "PREPARATION_COMPLETE"
+                        )
+                        waiting_logged_at = 0.0
+                        while not os.path.exists(validation_marker):
+                            now = time.monotonic()
+                            if now - waiting_logged_at >= 60.0:
+                                report(
+                                    f"[prepared-val] epoch {epoch}: waiting for "
+                                    f"validation preparation to complete at "
+                                    f"{args.val_prepared_dir}"
+                                )
+                                waiting_logged_at = now
+                            time.sleep(min(args.poll_seconds, 60.0))
+                        report(
+                            f"[prepared-val] epoch {epoch}: starting MAP/MRR evaluation"
+                        )
                         metrics = evaluate_prepared(
                             args.val_prepared_dir,
                             table_model,
