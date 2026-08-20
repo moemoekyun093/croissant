@@ -32,6 +32,42 @@ def file_sha256(path: str) -> str:
     return digest.hexdigest()
 
 
+def build_train_epochs(
+    train_indices: list[int],
+    train_sample_size: int | None,
+    num_epochs: int | None,
+    seed: int,
+) -> list[list[int]]:
+    """Build deterministic training epochs while preserving legacy behavior.
+
+    Without ``num_epochs``, the historical BIG behavior is unchanged: one
+    seeded shuffle is partitioned into disjoint chunks of train_sample_size.
+    With ``num_epochs``, each epoch independently reshuffles the train split
+    and takes up to train_sample_size examples. This lets smaller datasets
+    such as BIRD/Spider train for multiple epochs instead of stopping after
+    one pass.
+    """
+    if not train_indices:
+        return []
+    chunk_size = train_sample_size or len(train_indices)
+    if num_epochs is None:
+        shuffled = list(train_indices)
+        random.Random(seed).shuffle(shuffled)
+        return [
+            shuffled[start : start + chunk_size]
+            for start in range(0, len(shuffled), chunk_size)
+        ]
+
+    epoch_size = min(chunk_size, len(train_indices))
+    rng = random.Random(seed)
+    epochs = []
+    for _epoch in range(num_epochs):
+        shuffled = list(train_indices)
+        rng.shuffle(shuffled)
+        epochs.append(shuffled[:epoch_size])
+    return epochs
+
+
 def load_frozen_cache(path: str | None, label: str) -> dict:
     """Load an existing CPU frozen-feature cache without expanding FP16."""
     if path is None:
@@ -328,6 +364,14 @@ def main() -> None:
     )
     parser.add_argument("--n_hard_negatives", type=int, default=2)
     parser.add_argument("--train_sample_size", type=int, default=40000)
+    parser.add_argument(
+        "--num_epochs",
+        type=int,
+        default=None,
+        help="repeat the (optionally sampled) train split for this many "
+        "deterministically reshuffled epochs; omitted preserves the legacy "
+        "single-shuffle/disjoint-chunk behavior used for BIG",
+    )
     parser.add_argument("--max_rows", type=int, default=50)
     parser.add_argument("--max_columns", type=int, default=20)
     parser.add_argument("--max_length", type=int, default=32)
@@ -356,10 +400,13 @@ def main() -> None:
         or args.batch_size <= 1
         or args.batches_per_shard <= 0
         or args.max_open_connections <= 0
+        or args.train_sample_size < 0
+        or (args.num_epochs is not None and args.num_epochs <= 0)
     ):
         parser.error(
-            "projection_dim/batches_per_shard/max_open_connections must be positive "
-            "and batch_size must exceed one"
+            "projection_dim/batches_per_shard/max_open_connections/num_epochs "
+            "must be positive, train_sample_size must be non-negative, and "
+            "batch_size must exceed one"
         )
     projection_seed = args.seed if args.projection_seed is None else args.projection_seed
 
@@ -386,10 +433,12 @@ def main() -> None:
         )
     query_dataset = SynSQLQueryDataset(args.questions_json, table_dataset)
     train_indices = query_dataset.resolve_split(args.split_json)["train"]
-    shuffled = list(train_indices)
-    random.Random(args.seed).shuffle(shuffled)
-    chunk_size = args.train_sample_size or len(shuffled)
-    train_chunks = [shuffled[i : i + chunk_size] for i in range(0, len(shuffled), chunk_size)]
+    train_chunks = build_train_epochs(
+        train_indices,
+        args.train_sample_size,
+        args.num_epochs,
+        args.seed,
+    )
 
     preparer = RandomProjectionPreparer(
         model_name=args.model_name,
@@ -419,6 +468,7 @@ def main() -> None:
         "query_cache_path": args.query_cache_path,
         "max_open_connections": args.max_open_connections,
         "materialized_corpus_cache_path": args.materialized_corpus_cache_path,
+        "requested_num_epochs": args.num_epochs,
         "split_sha256": file_sha256(args.split_json),
         "questions_sha256": file_sha256(args.questions_json),
     }

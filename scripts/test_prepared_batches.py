@@ -7,6 +7,7 @@ import tempfile
 
 import torch
 
+from scripts.prepare_fixed_batches import build_train_epochs
 from src.data.prepared_batches import (
     PreparedBatch,
     PreparedBatchWriter,
@@ -33,6 +34,14 @@ from src.training.prepared_evaluator import _ranking_metrics, evaluate_prepared
 
 def main() -> None:
     torch.manual_seed(7)
+    legacy_epochs = build_train_epochs(list(range(10)), 4, None, seed=7)
+    assert [len(epoch) for epoch in legacy_epochs] == [4, 4, 2]
+    assert sorted(index for epoch in legacy_epochs for index in epoch) == list(range(10))
+    repeated_epochs = build_train_epochs(list(range(10)), 20, 3, seed=7)
+    assert len(repeated_epochs) == 3
+    assert all(sorted(epoch) == list(range(10)) for epoch in repeated_epochs)
+    assert repeated_epochs == build_train_epochs(list(range(10)), 20, 3, seed=7)
+    assert len({tuple(epoch) for epoch in repeated_epochs}) > 1
     assert list(prefetch_iterable(range(20), depth=2)) == list(range(20))
 
     def failing_stream():
