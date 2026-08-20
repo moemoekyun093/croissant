@@ -60,7 +60,7 @@ def _sqlite_files(root: Path) -> dict[str, Path]:
     for path in sorted(root.rglob("*.sqlite")):
         db_id = path.stem
         previous = result.get(db_id)
-        if previous is not None and previous.resolve() != path.resolve():
+        if previous is not None and os.path.abspath(previous) != os.path.abspath(path):
             raise ValueError(
                 f"database id {db_id!r} resolves to two SQLite files: "
                 f"{previous} and {path}"
@@ -76,13 +76,56 @@ def _merge_sqlite_roots(roots: Iterable[Path]) -> dict[str, Path]:
     for root in roots:
         for db_id, path in _sqlite_files(root).items():
             previous = merged.get(db_id)
-            if previous is not None and previous.resolve() != path.resolve():
+            if previous is not None and os.path.abspath(previous) != os.path.abspath(path):
                 raise ValueError(
                     f"database id {db_id!r} occurs in multiple source roots: "
                     f"{previous} and {path}"
                 )
             merged[db_id] = path
     return merged
+
+
+def _sqlite_files_from_schema(
+    roots: Iterable[Path], schema_records: dict[str, dict]
+) -> dict[str, Path]:
+    """Resolve standard dataset paths directly; recursively scan only misses."""
+    roots = tuple(roots)
+    for root in roots:
+        if not root.is_dir():
+            raise FileNotFoundError(f"database directory does not exist: {root}")
+    result: dict[str, Path] = {}
+    missing = []
+    for db_id in sorted(schema_records):
+        candidates = [
+            candidate
+            for root in roots
+            for candidate in (root / db_id / f"{db_id}.sqlite", root / f"{db_id}.sqlite")
+            if candidate.is_file()
+        ]
+        if len(candidates) == 1:
+            result[db_id] = candidates[0]
+        elif len(candidates) > 1:
+            raise ValueError(
+                f"database id {db_id!r} resolves to multiple SQLite files: {candidates}"
+            )
+        else:
+            missing.append(db_id)
+
+    if missing:
+        # Compatibility fallback for nonstandard extracted layouts.  Official
+        # BIRD/Spider layouts never enter this NFS-expensive recursive scan.
+        discovered = _merge_sqlite_roots(roots)
+        for db_id in missing:
+            path = discovered.get(db_id)
+            if path is not None:
+                result[db_id] = path
+    unresolved = sorted(set(schema_records) - set(result))
+    if unresolved:
+        raise FileNotFoundError(
+            f"could not find SQLite files for {len(unresolved)} schema database(s): "
+            f"{unresolved[:10]}"
+        )
+    return result
 
 
 def _schema_from_sqlite(path: Path) -> tuple[list[str], dict[str, list[str]], dict]:
@@ -151,6 +194,139 @@ def _tables_from_spider_ast(sql_tree, schema_record: dict) -> list[str]:
     return [table_names[index] for index in sorted(indices) if index < len(table_names)]
 
 
+def _schema_table_names(schema_record: dict | None) -> list[str]:
+    """Return official canonical table names without touching SQLite."""
+    if not schema_record:
+        return []
+    names = schema_record.get("table_names_original") or schema_record.get("table_names")
+    if not isinstance(names, list):
+        return []
+    return [str(name) for name in names if str(name).strip()]
+
+
+def _unquote_identifier(token: str) -> str:
+    if token.startswith('"') and token.endswith('"'):
+        return token[1:-1].replace('""', '"')
+    if token.startswith("`") and token.endswith("`"):
+        return token[1:-1].replace("``", "`")
+    if token.startswith("[") and token.endswith("]"):
+        return token[1:-1]
+    return token
+
+
+def _sql_identifier_tokens(sql: str) -> list[str]:
+    """Small SQL lexer sufficient for locating FROM/JOIN table sources."""
+    pattern = re.compile(
+        r"--[^\n]*|/\*.*?\*/|'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|"
+        r"`(?:``|[^`])*`|\[[^\]]*\]|[A-Za-z_][A-Za-z0-9_$]*|[(),.;]",
+        flags=re.DOTALL,
+    )
+    tokens = []
+    for match in pattern.finditer(sql):
+        token = match.group(0)
+        if token.startswith("--") or token.startswith("/*") or token.startswith("'"):
+            continue
+        tokens.append(token)
+    return tokens
+
+
+def _tables_from_sql_syntax(sql: str, actual_names: list[str]) -> list[str]:
+    """Resolve ordinary and nested FROM/JOIN sources without opening SQLite."""
+    tokens = _sql_identifier_tokens(sql)
+    canonical = {name.lower(): name for name in actual_names}
+    stop_words = {
+        "where", "group", "order", "having", "limit", "union", "intersect",
+        "except", "window", "returning", "qualify", "on",
+    }
+    source_modifiers = {"only", "lateral"}
+    # Each parenthesis depth has its own FROM-list state, so commas in SELECT
+    # expressions or JOIN predicates are never mistaken for table separators.
+    state: dict[int, dict[str, bool]] = {
+        0: {"in_from": False, "expect_source": False}
+    }
+    depth = 0
+    result = []
+    seen = set()
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        lower = _unquote_identifier(token).lower()
+        bare_word = token[:1] not in {'"', "`", "["}
+        current = state.setdefault(
+            depth, {"in_from": False, "expect_source": False}
+        )
+        if token == "(":
+            if current["expect_source"]:
+                current["expect_source"] = False
+            depth += 1
+            state[depth] = {"in_from": False, "expect_source": False}
+            index += 1
+            continue
+        if token == ")":
+            state.pop(depth, None)
+            depth = max(0, depth - 1)
+            index += 1
+            continue
+        if bare_word and lower == "from":
+            current["in_from"] = True
+            current["expect_source"] = True
+            index += 1
+            continue
+        if bare_word and lower == "join":
+            current["in_from"] = True
+            current["expect_source"] = True
+            index += 1
+            continue
+        if bare_word and lower in stop_words:
+            current["in_from"] = False
+            current["expect_source"] = False
+            index += 1
+            continue
+        if token == "," and current["in_from"]:
+            current["expect_source"] = True
+            index += 1
+            continue
+        if current["expect_source"]:
+            if bare_word and lower in source_modifiers:
+                index += 1
+                continue
+            parts = [_unquote_identifier(token)]
+            cursor = index
+            while (
+                cursor + 2 < len(tokens)
+                and tokens[cursor + 1] == "."
+                and tokens[cursor + 2] not in {"(", ")", ",", ";"}
+            ):
+                parts.append(_unquote_identifier(tokens[cursor + 2]))
+                cursor += 2
+            name = canonical.get(parts[-1].lower())
+            if name is not None and name not in seen:
+                seen.add(name)
+                result.append(name)
+            current["expect_source"] = False
+            index = cursor + 1
+            continue
+        index += 1
+    return result
+
+
+def _tables_from_name_mentions(sql: str, actual_names: list[str]) -> list[str]:
+    """Conservative all-name scan used to validate the syntax fast path."""
+    scrubbed = re.sub(r"--[^\n]*|/\*.*?\*/|'(?:''|[^'])*'", " ", sql, flags=re.DOTALL)
+    matched = []
+    for name in sorted(actual_names, key=len, reverse=True):
+        quoted = re.escape(name)
+        patterns = (
+            rf'"{quoted}"',
+            rf'`{quoted}`',
+            rf'\[{quoted}\]',
+            rf'(?<![A-Za-z0-9_]){quoted}(?![A-Za-z0-9_])',
+        )
+        if any(re.search(pattern, scrubbed, flags=re.IGNORECASE) for pattern in patterns):
+            matched.append(name)
+    return matched
+
+
 def _tables_from_connection(
     sql: str, connection: sqlite3.Connection, actual_names: list[str]
 ) -> list[str]:
@@ -176,21 +352,7 @@ def _tables_from_connection(
     if canonical:
         return canonical
 
-    # Remove string literals before matching schema table names so a value
-    # such as 'concerts' is not mistaken for the concerts table.
-    scrubbed = re.sub(r"'(?:''|[^'])*'", " ", sql)
-    matched = []
-    for name in sorted(actual_names, key=len, reverse=True):
-        quoted = re.escape(name)
-        patterns = (
-            rf'"{quoted}"',
-            rf'`{quoted}`',
-            rf'\[{quoted}\]',
-            rf'(?<![A-Za-z0-9_]){quoted}(?![A-Za-z0-9_])',
-        )
-        if any(re.search(pattern, scrubbed, flags=re.IGNORECASE) for pattern in patterns):
-            matched.append(name)
-    return matched
+    return _tables_from_name_mentions(sql, actual_names)
 
 
 class SQLiteTableResolver:
@@ -206,6 +368,8 @@ class SQLiteTableResolver:
         self.table_names = table_names
         self.max_open_connections = max_open_connections
         self.connections: OrderedDict[str, sqlite3.Connection] = OrderedDict()
+        self.fast_path_queries = 0
+        self.sqlite_fallback_queries = 0
 
     def _connection(self, db_id: str) -> sqlite3.Connection:
         connection = self.connections.pop(db_id, None)
@@ -221,6 +385,12 @@ class SQLiteTableResolver:
         return connection
 
     def tables(self, db_id: str, sql: str) -> list[str]:
+        syntax_tables = _tables_from_sql_syntax(sql, self.table_names[db_id])
+        mentioned_tables = _tables_from_name_mentions(sql, self.table_names[db_id])
+        if syntax_tables and set(syntax_tables) == set(mentioned_tables):
+            self.fast_path_queries += 1
+            return syntax_tables
+        self.sqlite_fallback_queries += 1
         return _tables_from_connection(
             sql, self._connection(db_id), self.table_names[db_id]
         )
@@ -305,14 +475,21 @@ def _split_queries(
 
 def _install_database(source: Path, destination: Path, mode: str) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
-    if destination.exists() or destination.is_symlink():
-        if destination.is_symlink() and destination.resolve() == source.resolve():
+    if destination.is_symlink():
+        target = Path(os.readlink(destination))
+        if not target.is_absolute():
+            target = destination.parent / target
+        if os.path.abspath(target) == os.path.abspath(source):
             return
         raise FileExistsError(
             f"refusing to replace existing normalized database: {destination}"
         )
+    if destination.exists():
+        raise FileExistsError(
+            f"refusing to replace existing normalized database: {destination}"
+        )
     if mode == "symlink":
-        destination.symlink_to(source.resolve())
+        destination.symlink_to(source.absolute())
     elif mode == "hardlink":
         os.link(source, destination)
     else:
@@ -334,11 +511,18 @@ def normalize_dataset(
 
     schemas: dict[str, dict] = {}
     table_names_by_db: dict[str, list[str]] = {}
+    official_schema_fast_path = 0
+    sqlite_schema_fallback = 0
     for position, (db_id, sqlite_path) in enumerate(sorted(sqlite_sources.items()), start=1):
-        actual_names, _columns, generated_schema = _schema_from_sqlite(sqlite_path)
-        generated_schema["db_id"] = db_id
-        schemas[db_id] = source_schema_records.get(db_id, generated_schema)
-        # Always use SQLite's canonical names for supervision and corpus.
+        source_schema = source_schema_records.get(db_id)
+        actual_names = _schema_table_names(source_schema)
+        if actual_names:
+            schemas[db_id] = dict(source_schema)
+            official_schema_fast_path += 1
+        else:
+            actual_names, _columns, generated_schema = _schema_from_sqlite(sqlite_path)
+            schemas[db_id] = generated_schema
+            sqlite_schema_fallback += 1
         schemas[db_id]["db_id"] = db_id
         table_names_by_db[db_id] = actual_names
         _install_database(
@@ -353,11 +537,21 @@ def normalize_dataset(
     questions: list[dict] = []
     skipped = Counter()
     seen = set()
+    processed_questions = 0
     resolver = SQLiteTableResolver(sqlite_sources, table_names_by_db)
     try:
         for source_split, question_path in question_sources:
             records = _load_json(question_path)
             for record in records:
+                processed_questions += 1
+                if processed_questions % 1000 == 0:
+                    print(
+                        f"[normalize-{dataset}] processed {processed_questions} "
+                        f"questions; retained={len(questions)}, SQL syntax fast path="
+                        f"{resolver.fast_path_queries}, SQLite fallbacks="
+                        f"{resolver.sqlite_fallback_queries}",
+                        flush=True,
+                    )
                 db_id = str(record.get("db_id", "")).strip()
                 if db_id not in sqlite_sources:
                     skipped["missing_database"] += 1
@@ -385,6 +579,14 @@ def normalize_dataset(
                 questions.append(normalized)
     finally:
         resolver.close()
+
+    print(
+        f"[normalize-{dataset}] metadata fast paths: official schemas="
+        f"{official_schema_fast_path}, SQLite schema fallbacks={sqlite_schema_fallback}; "
+        f"SQL syntax resolutions={resolver.fast_path_queries}, "
+        f"SQLite EXPLAIN fallbacks={resolver.sqlite_fallback_queries}",
+        flush=True,
+    )
 
     if not questions:
         raise ValueError(f"normalization produced no valid {dataset} questions")
@@ -429,6 +631,10 @@ def normalize_dataset(
         "n_train": split["n_train"],
         "n_val": split["n_val"],
         "n_test": split["n_test"],
+        "official_schema_fast_path": official_schema_fast_path,
+        "sqlite_schema_fallback": sqlite_schema_fallback,
+        "sql_syntax_fast_path": resolver.fast_path_queries,
+        "sqlite_explain_fallback": resolver.sqlite_fallback_queries,
         "skipped": dict(skipped),
         "question_sources": [str(path.resolve()) for _name, path in question_sources],
     }
@@ -475,10 +681,11 @@ def _bird_inputs(root: Path):
         (dev_dir / "dev_databases", root / "dev_databases"),
         "BIRD dev_databases",
     )
+    schemas = _schema_records((train_tables, dev_tables))
     return (
         [("official_train", train_json), ("official_dev", dev_json)],
-        _merge_sqlite_roots((train_databases, dev_databases)),
-        _schema_records((train_tables, dev_tables)),
+        _sqlite_files_from_schema((train_databases, dev_databases), schemas),
+        schemas,
     )
 
 
@@ -490,10 +697,11 @@ def _spider_inputs(root: Path):
     databases = _first_existing(
         (data / "database", data / "databases"), "Spider database directory"
     )
+    schemas = _schema_records((tables_json,))
     return (
         [("official_train", train_json), ("official_dev", dev_json)],
-        _sqlite_files(databases),
-        _schema_records((tables_json,)),
+        _sqlite_files_from_schema((databases,), schemas),
+        schemas,
     )
 
 
