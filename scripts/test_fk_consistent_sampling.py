@@ -40,6 +40,19 @@ def main() -> None:
         );
         CREATE TABLE schema_parent(id INTEGER PRIMARY KEY);
         CREATE TABLE schema_child(id INTEGER PRIMARY KEY, parent_id INTEGER);
+        CREATE TABLE wr_parent(
+            left_id INTEGER,
+            right_id INTEGER,
+            label TEXT,
+            PRIMARY KEY(left_id, right_id)
+        ) WITHOUT ROWID;
+        CREATE TABLE wr_child(
+            id INTEGER PRIMARY KEY,
+            left_id INTEGER,
+            right_id INTEGER,
+            FOREIGN KEY(left_id, right_id)
+              REFERENCES wr_parent(left_id, right_id)
+        );
         """
     )
     connection.executemany(
@@ -70,6 +83,15 @@ def main() -> None:
     connection.executemany(
         "INSERT INTO schema_child(id, parent_id) VALUES (?, ?)",
         [(index, (index - 1) % 100 + 1) for index in range(1, 1001)],
+    )
+    connection.executemany(
+        "INSERT INTO wr_parent(left_id, right_id, label) VALUES (?, ?, ?)",
+        [(index, index + 1000, f"wr{index}") for index in range(1, 101)],
+    )
+    connection.executemany(
+        "INSERT INTO wr_child(id, left_id, right_id) VALUES (?, ?, ?)",
+        [(index, (index - 1) % 100 + 1, (index - 1) % 100 + 1001)
+         for index in range(1, 1001)],
     )
 
     # Spider-style schema fallback: this FK is absent from the SQLite DDL.
@@ -113,6 +135,11 @@ def main() -> None:
     assert all(
         row.values[1] is None or row.values[1] in schema_parent_ids
         for row in first["schema_child"]
+    )
+    wr_parent_keys = {(row.values[0], row.values[1]) for row in first["wr_parent"]}
+    assert all(
+        (row.values[1], row.values[2]) in wr_parent_keys
+        for row in first["wr_child"]
     )
 
     with tempfile.TemporaryDirectory() as directory:

@@ -48,7 +48,9 @@ class ForeignKey:
 
 @dataclass(frozen=True)
 class SampledRow:
-    rowid: int
+    # Integer SQLite rowid for ordinary tables; primary-key tuple (or a
+    # deterministic scan ordinal) for WITHOUT ROWID/virtual tables.
+    rowid: object
     values: tuple[object, ...]
 
 
@@ -332,11 +334,16 @@ def _sample_rows(
         minimum, maximum = connection.execute(
             f"SELECT MIN(rowid), MAX(rowid) FROM {quoted_table}"
         ).fetchone()
-    except sqlite3.OperationalError as error:
-        raise ValueError(
-            f"table {table!r} has no usable rowid; FK-consistent sampling "
-            "currently requires ordinary SQLite rowid tables"
-        ) from error
+    except sqlite3.OperationalError:
+        return _sample_rows_without_rowid(
+            connection,
+            table,
+            columns,
+            where_sql,
+            parameters,
+            max_rows,
+            rng,
+        )
     if minimum is None or maximum is None:
         return []
 
@@ -376,6 +383,63 @@ def _sample_rows(
     if len(candidates) > max_rows:
         candidates = rng.sample(candidates, max_rows)
     return sorted(candidates, key=lambda row: row.rowid)
+
+
+def _sample_rows_without_rowid(
+    connection: sqlite3.Connection,
+    table: str,
+    columns: list[str],
+    where_sql: str,
+    parameters: list[object],
+    max_rows: int,
+    rng: random.Random,
+) -> list[SampledRow]:
+    """Uniform deterministic reservoir sample for WITHOUT ROWID tables.
+
+    WITHOUT ROWID tables are physically ordered by their declared primary
+    key, so this is a sequential local scan when ``--sqlite_staging_dir`` is
+    used.  It is intentionally limited to the uncommon tables for which the
+    much faster random-rowid path is unavailable.
+    """
+    quoted_table = _quote(table)
+    quoted_columns = ", ".join(_quote(name) for name in columns)
+    primary_key = _primary_key_columns(connection, table)
+    if primary_key:
+        order_sql = ", ".join(_quote(name) for name in primary_key)
+        key_indices = _column_indices(columns, primary_key)
+    else:
+        # SQLite requires a primary key for true WITHOUT ROWID tables, but a
+        # virtual table can also reject ``rowid``. Preserve deterministic scan
+        # order as far as that module permits and use the scan ordinal.
+        order_sql = ", ".join(_quote(name) for name in columns)
+        key_indices = ()
+    query = (
+        f"SELECT {quoted_columns} FROM {quoted_table} "
+        f"WHERE ({where_sql}) ORDER BY {order_sql}"
+    )
+    print(
+        f"[fk-sample] table {table}: no implicit rowid; deterministic "
+        f"reservoir sampling by {primary_key or 'full-row order'}",
+        flush=True,
+    )
+    reservoir: list[SampledRow] = []
+    seen = 0
+    for result in connection.execute(query, parameters):
+        values = tuple(result)
+        locator: object
+        if key_indices:
+            locator = tuple(values[index] for index in key_indices)
+        else:
+            locator = seen
+        row = SampledRow(locator, values)
+        seen += 1
+        if len(reservoir) < max_rows:
+            reservoir.append(row)
+            continue
+        replacement = rng.randrange(seen)
+        if replacement < max_rows:
+            reservoir[replacement] = row
+    return sorted(reservoir, key=lambda row: repr(row.rowid))
 
 
 def _prune_to_fk_closure(
