@@ -28,7 +28,7 @@ from src.models.prepared_table_encoder import (
 )
 from src.scoring.multi_score import MultiScorer
 from src.training.losses import cross_score_queries_tables, query_table_info_nce_loss
-from src.training.prepared_evaluator import _ranking_metrics
+from src.training.prepared_evaluator import _ranking_metrics, evaluate_prepared
 
 
 def main() -> None:
@@ -211,6 +211,38 @@ def main() -> None:
         mixed_columns,
     )
     assert torch.allclose(grouped_output, full_output, atol=1e-5, rtol=1e-4)
+
+    # End-to-end check for the table-major evaluator: query and table
+    # shards are each loaded once, yet the complete [Nq,Nt] ranking and
+    # multi-positive metrics are produced.
+    with tempfile.TemporaryDirectory() as directory:
+        metadata = {"projection_dim": 8}
+        write_eval_shard(
+            os.path.join(directory, "queries_00000.pkl"), metadata, eval_queries
+        )
+        write_eval_shard(
+            os.path.join(directory, "tables_00000.pkl"), metadata, eval_tables
+        )
+        with open(
+            os.path.join(directory, "PREPARATION_COMPLETE"),
+            "w",
+            encoding="utf-8",
+        ) as marker:
+            marker.write("complete\n")
+        metrics = evaluate_prepared(
+            directory,
+            table_model,
+            query_model,
+            scorer,
+            "cpu",
+            metadata,
+            query_batch_size=1,
+            progress=None,
+        )
+        assert metrics["n_queries"] == 2
+        assert metrics["n_tables"] == 3
+        assert 0.0 <= metrics["map"] <= 1.0
+        assert 0.0 <= metrics["mrr"] <= 1.0
     print("prepared-batch serialization/gradient check passed")
 
 
