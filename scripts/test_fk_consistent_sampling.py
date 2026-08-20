@@ -53,6 +53,12 @@ def main() -> None:
             FOREIGN KEY(left_id, right_id)
               REFERENCES wr_parent(left_id, right_id)
         );
+        CREATE TABLE malformed_parent(id INTEGER PRIMARY KEY);
+        CREATE TABLE malformed_child(
+            id INTEGER PRIMARY KEY,
+            team_id INTEGER,
+            FOREIGN KEY(team_id) REFERENCES malformed_parent(team_id)
+        );
         """
     )
     connection.executemany(
@@ -93,6 +99,12 @@ def main() -> None:
         [(index, (index - 1) % 100 + 1, (index - 1) % 100 + 1001)
          for index in range(1, 1001)],
     )
+    connection.executemany(
+        "INSERT INTO malformed_parent(id) VALUES (?)", [(1,), (2,)]
+    )
+    connection.executemany(
+        "INSERT INTO malformed_child(id, team_id) VALUES (?, ?)", [(1, 1), (2, 2)]
+    )
 
     # Spider-style schema fallback: this FK is absent from the SQLite DDL.
     schema = {
@@ -114,6 +126,10 @@ def main() -> None:
     )
     assert _snapshot(first) == _snapshot(second)
     assert foreign_keys
+    assert not any(
+        fk.child == "malformed_child" and fk.parent == "malformed_parent"
+        for fk in foreign_keys
+    )
     assert all(len(rows) <= 7 for rows in first.values())
 
     parent_ids = {row.values[0] for row in first["parent"]}

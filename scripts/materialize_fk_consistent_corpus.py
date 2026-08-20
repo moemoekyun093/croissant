@@ -247,8 +247,37 @@ def _discover_foreign_keys(
                 tuple(value.lower() for value in fk.parent_columns),
             )
         ] = fk
+    validated = []
+    for fk in by_signature.values():
+        child_live = {name.lower(): name for name in columns.get(fk.child, [])}
+        parent_live = {name.lower(): name for name in columns.get(fk.parent, [])}
+        missing_child = [
+            name for name in fk.child_columns if name.lower() not in child_live
+        ]
+        missing_parent = [
+            name for name in fk.parent_columns if name.lower() not in parent_live
+        ]
+        if missing_child or missing_parent:
+            print(
+                f"[fk-sample] WARNING: ignoring malformed FK "
+                f"{fk.child}{fk.child_columns} -> {fk.parent}{fk.parent_columns}; "
+                f"missing child columns={missing_child}, "
+                f"missing parent columns={missing_parent}",
+                flush=True,
+            )
+            continue
+        validated.append(
+            ForeignKey(
+                child=fk.child,
+                parent=fk.parent,
+                child_columns=tuple(child_live[name.lower()] for name in fk.child_columns),
+                parent_columns=tuple(
+                    parent_live[name.lower()] for name in fk.parent_columns
+                ),
+            )
+        )
     return sorted(
-        by_signature.values(),
+        validated,
         key=lambda fk: (fk.child.lower(), fk.parent.lower(), fk.child_columns),
     )
 
@@ -524,12 +553,56 @@ def sample_database(
     return sampled, columns, foreign_keys, removed
 
 
+CHECKPOINT_FORMAT = "croissant_fk_database_checkpoint_v1"
+
+
+def _database_checkpoint_path(directory: Path, db_id: str) -> Path:
+    safe = "".join(
+        character if character.isalnum() or character in {"-", "_"} else "_"
+        for character in db_id
+    )
+    digest = hashlib.sha256(db_id.encode()).hexdigest()[:12]
+    return directory / f"{safe}.{digest}.json"
+
+
+def _load_database_checkpoint(
+    path: Path,
+    db_id: str,
+    requested_tables: list[str],
+    max_rows: int,
+    seed: int,
+) -> dict | None:
+    if not path.exists():
+        return None
+    with path.open(encoding="utf-8") as source:
+        payload = json.load(source)
+    expected = {
+        "format": CHECKPOINT_FORMAT,
+        "db_id": db_id,
+        "max_rows": max_rows,
+        "seed": seed,
+        "requested_tables": requested_tables,
+    }
+    mismatches = {
+        key: (payload.get(key), value)
+        for key, value in expected.items()
+        if payload.get(key) != value
+    }
+    if mismatches:
+        raise ValueError(
+            f"stale/incompatible database checkpoint {path}: {mismatches}; "
+            "use a new --database_checkpoint_dir or remove this checkpoint"
+        )
+    return payload
+
+
 def materialize(
     dataset_root: Path,
     output_path: Path,
     max_rows: int,
     seed: int,
     sqlite_staging_dir: Path | None = None,
+    database_checkpoint_dir: Path | None = None,
 ) -> dict:
     with (dataset_root / "configs/splits/corpus.json").open(encoding="utf-8") as source:
         corpus = json.load(source)
@@ -542,9 +615,35 @@ def materialize(
     for record in corpus["tables"]:
         requested_by_db[str(record["db_id"])].append(str(record["table_name"]))
 
+    if database_checkpoint_dir is None:
+        database_checkpoint_dir = output_path.with_name(
+            output_path.name + ".db_checkpoints"
+        )
+    database_checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
     emitted_by_id = {}
     total_fks = total_rows = pruned_rows = empty_tables = 0
     for position, db_id in enumerate(sorted(requested_by_db), start=1):
+        requested_tables = requested_by_db[db_id]
+        checkpoint_path = _database_checkpoint_path(database_checkpoint_dir, db_id)
+        checkpoint = _load_database_checkpoint(
+            checkpoint_path, db_id, requested_tables, max_rows, seed
+        )
+        if checkpoint is not None:
+            for table_record in checkpoint["tables"]:
+                _record_db, _, table = table_record["table_id"].partition("#sep#")
+                emitted_by_id[(db_id, table)] = table_record
+            total_rows += int(checkpoint["n_rows"])
+            total_fks += int(checkpoint["n_foreign_keys"])
+            pruned_rows += int(checkpoint["n_rows_pruned_for_fk_closure"])
+            empty_tables += int(checkpoint["n_empty_tables"])
+            print(
+                f"[fk-sample] resumed database {position}/{len(requested_by_db)}: "
+                f"{db_id} from {checkpoint_path}",
+                flush=True,
+            )
+            continue
+
         source_path = _sqlite_path(dataset_root, db_id)
         staged_path = None
         print(
@@ -569,20 +668,21 @@ def materialize(
         finally:
             if staged_path is not None:
                 staged_path.unlink(missing_ok=True)
-        total_fks += len(foreign_keys)
-        pruned_rows += removed
         fk_child_columns = {
             (fk.child, column)
             for fk in foreign_keys
             for column in fk.child_columns
         }
-        for table in requested_by_db[db_id]:
+        database_tables = []
+        database_rows = 0
+        database_empty_tables = 0
+        for table in requested_tables:
             rows = sampled.get(table, [])
             table_columns = columns.get(table, [])
             if not rows:
-                empty_tables += 1
-            total_rows += len(rows)
-            emitted_by_id[(db_id, table)] = {
+                database_empty_tables += 1
+            database_rows += len(rows)
+            table_record = {
                 "table_id": f"{db_id}#sep#{table}",
                 "table_name": f"{db_id}#sep#{table}",
                 "columns": [
@@ -594,9 +694,29 @@ def materialize(
                     for index, column in enumerate(table_columns)
                 ],
             }
+            database_tables.append(table_record)
+            emitted_by_id[(db_id, table)] = table_record
+        checkpoint = {
+            "format": CHECKPOINT_FORMAT,
+            "db_id": db_id,
+            "max_rows": max_rows,
+            "seed": seed,
+            "requested_tables": requested_tables,
+            "n_rows": database_rows,
+            "n_foreign_keys": len(foreign_keys),
+            "n_rows_pruned_for_fk_closure": removed,
+            "n_empty_tables": database_empty_tables,
+            "tables": database_tables,
+        }
+        _atomic_json(checkpoint_path, checkpoint)
+        total_rows += database_rows
+        total_fks += len(foreign_keys)
+        pruned_rows += removed
+        empty_tables += database_empty_tables
         print(
             f"[fk-sample] completed {position}/{len(requested_by_db)} databases; "
-            f"rows={total_rows}, FKs={total_fks}, pruned={pruned_rows}",
+            f"rows={total_rows}, FKs={total_fks}, pruned={pruned_rows}; "
+            f"checkpoint={checkpoint_path}",
             flush=True,
         )
 
@@ -622,6 +742,7 @@ def materialize(
         "sqlite_staging_dir": (
             str(sqlite_staging_dir.resolve()) if sqlite_staging_dir is not None else None
         ),
+        "database_checkpoint_dir": str(database_checkpoint_dir.resolve()),
     }
     _atomic_json(output_path.with_suffix(output_path.suffix + ".manifest.json"), manifest)
     print(json.dumps(manifest, indent=2), flush=True)
@@ -640,6 +761,11 @@ def main() -> None:
         help="copy one database at a time here before sampling; use local /tmp "
         "to replace random NAS reads with one sequential NAS read",
     )
+    parser.add_argument(
+        "--database_checkpoint_dir",
+        default=None,
+        help="per-database resumable JSON checkpoints; defaults next to output_path",
+    )
     args = parser.parse_args()
     if args.max_rows <= 0:
         parser.error("--max_rows must be positive")
@@ -652,6 +778,7 @@ def main() -> None:
         args.max_rows,
         args.seed,
         Path(args.sqlite_staging_dir) if args.sqlite_staging_dir else None,
+        Path(args.database_checkpoint_dir) if args.database_checkpoint_dir else None,
     )
 
 
