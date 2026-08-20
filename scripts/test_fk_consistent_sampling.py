@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import sqlite3
+from pathlib import Path
+import tempfile
 
-from scripts.materialize_fk_consistent_corpus import sample_database
+from scripts.materialize_fk_consistent_corpus import _stage_sqlite, sample_database
 
 
 def _snapshot(sampled):
@@ -112,6 +114,14 @@ def main() -> None:
         row.values[1] is None or row.values[1] in schema_parent_ids
         for row in first["schema_child"]
     )
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        source = root / "source.sqlite"
+        source.write_bytes(b"sqlite-staging-test" * 1024)
+        staged = _stage_sqlite(source, root / "stage", "toy")
+        assert staged.read_bytes() == source.read_bytes()
+        staged.unlink()
     print("FK-consistent sampling test passed")
 
 

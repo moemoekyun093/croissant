@@ -29,7 +29,10 @@ import json
 import os
 from pathlib import Path
 import random
+import shutil
 import sqlite3
+import tempfile
+import time
 from typing import Iterable
 
 from src.data.synsql_dataset import clean_text
@@ -74,6 +77,45 @@ def _sqlite_path(dataset_root: Path, db_id: str) -> Path:
     if len(matches) != 1:
         raise FileNotFoundError(f"could not resolve SQLite file for {db_id!r}")
     return matches[0]
+
+
+def _stage_sqlite(source: Path, staging_dir: Path, db_id: str) -> Path:
+    """Copy one NAS database sequentially so sampling uses local random I/O."""
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    size = source.stat().st_size
+    free = shutil.disk_usage(staging_dir).free
+    if size > free:
+        raise OSError(
+            f"not enough free space in {staging_dir}: database {db_id!r} needs "
+            f"{size / 2**30:.2f} GiB, only {free / 2**30:.2f} GiB is free"
+        )
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f"{db_id}.", suffix=".sqlite", dir=staging_dir
+    )
+    os.close(descriptor)
+    staged = Path(temporary_name)
+    copied = 0
+    last_report = time.monotonic()
+    try:
+        with source.open("rb") as source_file, staged.open("wb") as destination:
+            while True:
+                chunk = source_file.read(16 * 1024 * 1024)
+                if not chunk:
+                    break
+                destination.write(chunk)
+                copied += len(chunk)
+                now = time.monotonic()
+                if now - last_report >= 10:
+                    print(
+                        f"[fk-sample] staging {db_id}: {copied / 2**30:.2f}/"
+                        f"{size / 2**30:.2f} GiB",
+                        flush=True,
+                    )
+                    last_report = now
+        return staged
+    except BaseException:
+        staged.unlink(missing_ok=True)
+        raise
 
 
 def _table_names(connection: sqlite3.Connection) -> list[str]:
@@ -423,6 +465,7 @@ def materialize(
     output_path: Path,
     max_rows: int,
     seed: int,
+    sqlite_staging_dir: Path | None = None,
 ) -> dict:
     with (dataset_root / "configs/splits/corpus.json").open(encoding="utf-8") as source:
         corpus = json.load(source)
@@ -438,14 +481,30 @@ def materialize(
     emitted_by_id = {}
     total_fks = total_rows = pruned_rows = empty_tables = 0
     for position, db_id in enumerate(sorted(requested_by_db), start=1):
-        connection = sqlite3.connect(str(_sqlite_path(dataset_root, db_id)))
-        connection.execute("PRAGMA query_only=ON")
+        source_path = _sqlite_path(dataset_root, db_id)
+        staged_path = None
+        print(
+            f"[fk-sample] database {position}/{len(requested_by_db)}: {db_id} "
+            f"({source_path.stat().st_size / 2**20:.1f} MiB)"
+            + ("; staging locally" if sqlite_staging_dir is not None else ""),
+            flush=True,
+        )
         try:
-            sampled, columns, foreign_keys, removed = sample_database(
-                connection, db_id, schemas.get(db_id), max_rows, seed
-            )
+            database_path = source_path
+            if sqlite_staging_dir is not None:
+                staged_path = _stage_sqlite(source_path, sqlite_staging_dir, db_id)
+                database_path = staged_path
+            connection = sqlite3.connect(str(database_path))
+            connection.execute("PRAGMA query_only=ON")
+            try:
+                sampled, columns, foreign_keys, removed = sample_database(
+                    connection, db_id, schemas.get(db_id), max_rows, seed
+                )
+            finally:
+                connection.close()
         finally:
-            connection.close()
+            if staged_path is not None:
+                staged_path.unlink(missing_ok=True)
         total_fks += len(foreign_keys)
         pruned_rows += removed
         fk_child_columns = {
@@ -471,12 +530,11 @@ def materialize(
                     for index, column in enumerate(table_columns)
                 ],
             }
-        if position % 25 == 0 or position == len(requested_by_db):
-            print(
-                f"[fk-sample] {position}/{len(requested_by_db)} databases; "
-                f"rows={total_rows}, FKs={total_fks}, pruned={pruned_rows}",
-                flush=True,
-            )
+        print(
+            f"[fk-sample] completed {position}/{len(requested_by_db)} databases; "
+            f"rows={total_rows}, FKs={total_fks}, pruned={pruned_rows}",
+            flush=True,
+        )
 
     emitted = [
         emitted_by_id[(str(record["db_id"]), str(record["table_name"]))]
@@ -497,6 +555,9 @@ def materialize(
         "n_rows_pruned_for_fk_closure": pruned_rows,
         "n_empty_tables": empty_tables,
         "strict_fk_closure": True,
+        "sqlite_staging_dir": (
+            str(sqlite_staging_dir.resolve()) if sqlite_staging_dir is not None else None
+        ),
     }
     _atomic_json(output_path.with_suffix(output_path.suffix + ".manifest.json"), manifest)
     print(json.dumps(manifest, indent=2), flush=True)
@@ -509,13 +570,25 @@ def main() -> None:
     parser.add_argument("--output_path", required=True)
     parser.add_argument("--max_rows", type=int, default=50)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--sqlite_staging_dir",
+        default=None,
+        help="copy one database at a time here before sampling; use local /tmp "
+        "to replace random NAS reads with one sequential NAS read",
+    )
     args = parser.parse_args()
     if args.max_rows <= 0:
         parser.error("--max_rows must be positive")
     output_path = Path(args.output_path)
     if output_path.exists():
         parser.error(f"refusing to overwrite existing output: {output_path}")
-    materialize(Path(args.dataset_root), output_path, args.max_rows, args.seed)
+    materialize(
+        Path(args.dataset_root),
+        output_path,
+        args.max_rows,
+        args.seed,
+        Path(args.sqlite_staging_dir) if args.sqlite_staging_dir else None,
+    )
 
 
 if __name__ == "__main__":
