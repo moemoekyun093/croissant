@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import glob
 import json
 import os
@@ -286,6 +287,17 @@ def main() -> None:
                     epoch_steps[boundary[0]]
                 )
 
+        # Every entry in ``processed`` has already been opened, validated,
+        # and consumed.  Keep the per-epoch count in memory instead of
+        # reopening every processed pickle on NAS for every completion
+        # marker after every shard (which previously caused tens of
+        # thousands of remote metadata reads at each shard boundary).
+        processed_shards_by_epoch = Counter()
+        for basename in processed:
+            parts = basename.split("_")
+            if len(parts) >= 4 and parts[0] == "epoch" and parts[2] == "shard":
+                processed_shards_by_epoch[int(parts[1])] += 1
+
         if resume_state is not None:
             resume_message = (
                 f"[prepared] resumed {args.encoder} from {resume_path}: "
@@ -553,7 +565,9 @@ def main() -> None:
                         log.write(message + "\n")
                     previous_step_end = time.perf_counter()
                 epoch_steps[epoch] = step_in_epoch
-                processed.add(os.path.basename(path))
+                processed_basename = os.path.basename(path)
+                processed.add(processed_basename)
+                processed_shards_by_epoch[epoch] += 1
                 save_checkpoint(
                     os.path.join(args.checkpoint_dir, "checkpoint_latest.pt"), epoch, shard
                 )
@@ -563,15 +577,19 @@ def main() -> None:
 
             # An epoch marker is published only after all of its shards.
             for marker in sorted(glob.glob(os.path.join(args.prepared_dir, "epoch_*.complete"))):
+                marker_basename = os.path.basename(marker)
+                marker_epoch = int(marker_basename.removeprefix("epoch_").removesuffix(".complete"))
+                if marker_epoch in finalized_epochs:
+                    continue
                 with open(marker, "r", encoding="utf-8") as f:
                     completed = json.load(f)
                 epoch = int(completed["epoch"])
+                if epoch != marker_epoch:
+                    raise ValueError(
+                        f"epoch marker filename/content mismatch: {marker}"
+                    )
                 expected_shards = int(completed["shards"])
-                consumed_shards = sum(
-                    read_prepared_metadata(path).get("epoch") == epoch
-                    for path in paths
-                    if os.path.basename(path) in processed
-                )
+                consumed_shards = processed_shards_by_epoch[epoch]
                 if epoch not in finalized_epochs and consumed_shards >= expected_shards:
                     finalized_epochs.add(epoch)
                     losses = epoch_losses.get(epoch, [])
