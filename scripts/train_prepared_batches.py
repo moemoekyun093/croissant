@@ -63,6 +63,13 @@ def main() -> None:
     parser.add_argument("--eval_query_batch_size", type=int, default=32)
     parser.add_argument("--patience", type=int, default=15)
     parser.add_argument(
+        "--max_epochs",
+        type=int,
+        default=None,
+        help="consume at most this many complete prepared epochs; validation "
+        "and best-checkpoint selection still run after every consumed epoch",
+    )
+    parser.add_argument(
         "--keep_epoch_checkpoints",
         action="store_true",
         help="retain checkpoint_epochN.pt snapshots; default keeps only "
@@ -95,8 +102,12 @@ def main() -> None:
         parser.error("--score_table_chunk_size must be positive or omitted")
     if args.profile_every <= 0:
         parser.error("--profile_every must be positive")
-    if args.eval_query_batch_size <= 0 or args.patience <= 0:
-        parser.error("--eval_query_batch_size and --patience must be positive")
+    if (
+        args.eval_query_batch_size <= 0
+        or args.patience <= 0
+        or (args.max_epochs is not None and args.max_epochs <= 0)
+    ):
+        parser.error("--eval_query_batch_size, --patience, and --max_epochs must be positive")
     if args.prefetch_batches < 0:
         parser.error("--prefetch_batches must be non-negative")
     if args.poll_seconds <= 0:
@@ -347,6 +358,7 @@ def main() -> None:
                 "training_config": {
                     "amp_dtype": args.amp_dtype,
                     "prefetch_batches": args.prefetch_batches,
+                    "max_epochs": args.max_epochs,
                 },
                 "model_config": {
                     "encoder": args.encoder,
@@ -371,6 +383,12 @@ def main() -> None:
             paths = sorted(
                 glob.glob(os.path.join(args.prepared_dir, "epoch_*_shard_*.pkl"))
             )
+            if args.max_epochs is not None:
+                paths = [
+                    path
+                    for path in paths
+                    if int(os.path.basename(path).split("_")[1]) < args.max_epochs
+                ]
             new_paths = [
                 path for path in paths if os.path.basename(path) not in processed
             ]
@@ -579,6 +597,8 @@ def main() -> None:
             for marker in sorted(glob.glob(os.path.join(args.prepared_dir, "epoch_*.complete"))):
                 marker_basename = os.path.basename(marker)
                 marker_epoch = int(marker_basename.removeprefix("epoch_").removesuffix(".complete"))
+                if args.max_epochs is not None and marker_epoch >= args.max_epochs:
+                    continue
                 if marker_epoch in finalized_epochs:
                     continue
                 with open(marker, "r", encoding="utf-8") as f:
@@ -678,6 +698,12 @@ def main() -> None:
                         epoch,
                         expected_shards - 1,
                     )
+                    if args.max_epochs is not None and epoch + 1 >= args.max_epochs:
+                        stop_training = True
+                        report(
+                            f"[prepared] reached --max_epochs={args.max_epochs}; "
+                            "stopping after the completed validation/checkpoint"
+                        )
 
             if stop_training:
                 break
@@ -695,6 +721,12 @@ def main() -> None:
                 final_paths = sorted(
                     glob.glob(os.path.join(args.prepared_dir, "epoch_*_shard_*.pkl"))
                 )
+                if args.max_epochs is not None:
+                    final_paths = [
+                        path
+                        for path in final_paths
+                        if int(os.path.basename(path).split("_")[1]) < args.max_epochs
+                    ]
                 remaining = [
                     path
                     for path in final_paths
