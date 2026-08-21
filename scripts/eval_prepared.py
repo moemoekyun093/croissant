@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 
 import torch
 
@@ -14,7 +15,10 @@ from src.models.prepared_table_encoder import (
     PreparedTurlEncoder,
 )
 from src.scoring.multi_score import MultiScorer
-from src.training.prepared_evaluator import evaluate_prepared
+from src.training.prepared_evaluator import (
+    evaluate_prepared,
+    evaluate_prepared_streaming,
+)
 
 
 def main() -> None:
@@ -23,6 +27,12 @@ def main() -> None:
     parser.add_argument("--prepared_dir", required=True)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--query_batch_size", type=int, default=32)
+    parser.add_argument(
+        "--table_batch_size",
+        type=int,
+        default=32,
+        help="candidate-table contextualization batch size for streaming evaluation",
+    )
     parser.add_argument("--output_json", default=None)
     parser.add_argument("--encoder", choices=("ours", "tabbie", "turl"), default=None)
     parser.add_argument("--num_layers", type=int, default=None)
@@ -32,6 +42,8 @@ def main() -> None:
     parser.add_argument("--turl_ffn_hidden_dim", type=int, default=None)
     parser.add_argument("--turl_attention_budget", type=int, default=None)
     args = parser.parse_args()
+    if args.query_batch_size <= 0 or args.table_batch_size <= 0:
+        parser.error("query/table batch sizes must be positive")
 
     device = torch.device(args.device)
     try:
@@ -92,16 +104,34 @@ def main() -> None:
     query_model.load_state_dict(checkpoint["query_model_state_dict"])
     scorer.load_state_dict(checkpoint["scorer_state_dict"])
 
-    metrics = evaluate_prepared(
-        args.prepared_dir,
-        table_model,
-        query_model,
-        scorer,
-        device,
-        metadata,
-        query_batch_size=args.query_batch_size,
-        progress=lambda message: print(message, flush=True),
-    )
+    manifest_path = os.path.join(args.prepared_dir, "manifest.json")
+    evaluation_mode = None
+    if os.path.exists(manifest_path):
+        with open(manifest_path, encoding="utf-8") as source:
+            evaluation_mode = json.load(source).get("evaluation_mode")
+    if evaluation_mode == "streaming_per_query_candidates":
+        metrics = evaluate_prepared_streaming(
+            args.prepared_dir,
+            table_model,
+            query_model,
+            scorer,
+            device,
+            metadata,
+            query_batch_size=args.query_batch_size,
+            table_batch_size=args.table_batch_size,
+            progress=lambda message: print(message, flush=True),
+        )
+    else:
+        metrics = evaluate_prepared(
+            args.prepared_dir,
+            table_model,
+            query_model,
+            scorer,
+            device,
+            metadata,
+            query_batch_size=args.query_batch_size,
+            progress=lambda message: print(message, flush=True),
+        )
     result = {
         "checkpoint": args.checkpoint,
         "prepared_dir": args.prepared_dir,

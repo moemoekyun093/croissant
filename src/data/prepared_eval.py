@@ -35,6 +35,56 @@ class PreparedEvalQueries:
 
 
 @dataclass
+class PreparedStreamingEvalQueries:
+    """One fixed full-test query chunk and its candidate decisions.
+
+    ``candidate_table_indices`` points into the single globally prepared
+    table corpus (the concatenation of ``tables_*.pkl`` in filename order).
+    The two masks therefore freeze the old streaming evaluator's per-query
+    candidate visibility and relevance decisions without duplicating table
+    features in every query chunk.
+    """
+
+    query_texts: tuple[str, ...]          # audit only
+    gold_table_ids: tuple[tuple[str, ...], ...]  # audit only
+    features: torch.Tensor               # [B,L,R] float16 CPU
+    mask: torch.Tensor                   # [B,L] bool
+    candidate_table_indices: torch.Tensor  # [P] int32, global corpus positions
+    visible_mask: torch.Tensor           # [B,P] bool
+    positive_mask: torch.Tensor          # [B,P] bool
+
+    def validate(self, projection_dim: int) -> None:
+        if self.features.ndim != 3 or self.features.shape[-1] != projection_dim:
+            raise ValueError("bad prepared streaming query features")
+        if self.mask.shape != self.features.shape[:2] or self.mask.dtype != torch.bool:
+            raise ValueError("bad prepared streaming query mask")
+        batch_size = self.features.shape[0]
+        pool_size = self.candidate_table_indices.numel()
+        if len(self.query_texts) != batch_size:
+            raise ValueError("streaming query text count does not match features")
+        if len(self.gold_table_ids) != batch_size:
+            raise ValueError("streaming query gold-label count does not match features")
+        if self.candidate_table_indices.ndim != 1:
+            raise ValueError("streaming candidate indices must be one-dimensional")
+        if self.candidate_table_indices.dtype != torch.int32:
+            raise TypeError("streaming candidate indices must be int32")
+        if self.visible_mask.shape != (batch_size, pool_size):
+            raise ValueError("bad streaming candidate visibility shape")
+        if self.positive_mask.shape != (batch_size, pool_size):
+            raise ValueError("bad streaming positive-mask shape")
+        if self.visible_mask.dtype != torch.bool or self.positive_mask.dtype != torch.bool:
+            raise TypeError("streaming visibility/positive masks must be bool")
+        if pool_size == 0:
+            raise ValueError("streaming query chunk has an empty candidate pool")
+        if int(self.candidate_table_indices.min()) < 0:
+            raise ValueError("streaming candidate index is negative")
+        if not torch.all(self.positive_mask.any(dim=1)):
+            raise ValueError("streaming evaluation query has no positive candidate")
+        if torch.any(self.positive_mask & ~self.visible_mask):
+            raise ValueError("streaming positive candidate is hidden")
+
+
+@dataclass
 class PreparedEvalTables:
     table_ids: tuple[str, ...]
     cell_features: torch.Tensor
