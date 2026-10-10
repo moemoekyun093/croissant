@@ -46,7 +46,7 @@ from src.training.trainer import PretrainTrainer
 
 def make_batches(tables, batch_size, rng, max_columns=20):
     """Same bucket-by-size + truncate-wide-tables strategy as
-    scripts/real_data_check.py::bucket_tables -- keeps padding cost down.
+    scripts/diagnostics/real_data_check.py::bucket_tables -- keeps padding cost down.
 
     Also drops any table with zero rows or zero columns before batching
     -- a handful of real SynSQL tables are genuinely empty in their

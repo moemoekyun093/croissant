@@ -12,7 +12,7 @@ which gives every baseline the same forward_batch_cellwise(tables) ->
 
 Runs pretraining then finetuning in one invocation for whichever
 --encoder you pick. Every encoder loads the SAME persisted query split
-+ fixed corpus (scripts/build_query_splits.py -- run that once first),
++ fixed corpus (scripts/data_prep/build_query_splits.py -- run that once first),
 so results are directly comparable across models. --embed_dim,
 --pretrain_epochs, --finetune_epochs, etc. are shared flags applied
 identically regardless of --encoder, for the "consistency in model
@@ -29,7 +29,7 @@ is used to decide which checkpoint is "best".
 
 Usage:
     # once, shared across every encoder:
-    python -m scripts.build_query_splits \\
+    python -m scripts.data_prep.build_query_splits \\
         --tables_json /path/to/synsql/tables.json \\
         --databases_root /path/to/synsql/databases \\
         --questions_json /path/to/synsql/questions_with_tables.json
@@ -51,18 +51,17 @@ Usage:
 
 import argparse
 import datetime
-import glob
 import json
 import os
 import random
 
 from src.data.synsql_dataset import SynSQLQueryDataset, SynSQLTableDataset
 from src.encoding.baseline_encoders import ENCODER_REGISTRY
-from src.encoding.baseline_encoders.adapter import build_baseline_model
-from src.encoding.cell_encoder import CellEncoder
-from src.models.table_encoder import DiscriminatorHead, TableEncoder, load_pretrained_encoder
+from src.models.table_encoder import DiscriminatorHead, load_pretrained_encoder
 from src.training.config import apply_yaml_defaults
 from src.training.query_encoder import QueryEncoder
+from src.models.factory import build_table_model  # noqa: F401  (re-exported for eval_test)
+from src.training.checkpoints import latest_checkpoint, safe_load_cache
 from src.training.trainer import FinetuneTrainer, PretrainTrainer
 
 
@@ -77,90 +76,6 @@ from scripts.pretrain_electra import make_batches
 from scripts.finetune_query_table import cap_columns, count_batches, resolve_train_batches, to_eval_examples
 
 ENCODER_CHOICES = ["ours"] + sorted(ENCODER_REGISTRY)
-
-
-def latest_checkpoint(checkpoint_dir: str) -> str | None:
-    """Same natural/version-sort convention as scripts/run_pilot.sh's
-    shell logic, reimplemented in Python -- picks the highest-epoch
-    checkpoint_epoch*.pt in a PretrainTrainer checkpoint_dir."""
-    paths = glob.glob(os.path.join(checkpoint_dir, "checkpoint_epoch*.pt"))
-    if not paths:
-        return None
-
-    def epoch_num(path: str) -> int:
-        name = os.path.basename(path)
-        digits = "".join(ch for ch in name if ch.isdigit())
-        return int(digits) if digits else -1
-
-    return max(paths, key=epoch_num)
-
-
-def _safe_load_cache(load_fn, path: str, label: str) -> bool:
-    """Wraps a *.load_*cache(path) call so a corrupted cache file can't
-    crash the whole training launch. Root cause seen in practice: a
-    training process killed mid torch.save() (e.g. SIGKILL from a
-    relaunch/restart) leaves a truncated .pt file -- torch.load then
-    raises a RuntimeError ("PytorchStreamReader failed locating file ...
-    internal miniz error") deep inside torch's own unpickler, which
-    previously propagated straight out of this script before training
-    even started (a corrupted CACHE file was blocking an otherwise-fine
-    run). On a load failure: renames the bad file aside to
-    '<path>.corrupted' (so it's not silently lost/inspectable later, and
-    so it stops being picked up as "exists" on the NEXT launch too) and
-    continues with an empty cache -- exactly as if the file had never
-    existed, just slower on the first pass while it rebuilds. Returns
-    True if the load actually succeeded.
-    """
-    try:
-        load_fn(path)
-        return True
-    except Exception as e:
-        corrupted_path = path + ".corrupted"
-        print(
-            f"WARNING: failed to load {label} cache from {path!r} "
-            f"({type(e).__name__}: {e}) -- treating as if it doesn't "
-            f"exist and continuing with an empty cache. Moving the bad "
-            f"file to {corrupted_path!r} so it isn't picked up again."
-        )
-        try:
-            os.replace(path, corrupted_path)
-        except OSError as move_err:
-            print(f"  (also failed to move the corrupted file aside: {move_err})")
-        return False
-
-
-def build_table_model(args):
-    if args.encoder == "ours":
-        cell_encoder = CellEncoder(
-            text_model_name=args.text_model_name,
-            output_dim=args.embed_dim,
-            text_max_length=args.text_max_length,
-            text_trainable=args.text_trainable,
-            text_max_batch_size=args.text_max_batch_size,
-            header_mode=args.header_mode,
-        )
-        return TableEncoder(
-            cell_encoder,
-            embed_dim=args.embed_dim,
-            num_layers=args.num_layers,
-            nonlinearity=args.nonlinearity,
-            channel_mix_hidden_dim=args.channel_mix_hidden_dim,
-            num_heads=args.num_heads,
-            table_microbatch_cell_budget=getattr(args, "table_microbatch_cell_budget", None),
-            table_microbatch_max_tables=getattr(args, "table_microbatch_max_tables", None),
-        )
-    return build_baseline_model(
-        args.encoder,
-        embed_dim=args.embed_dim,
-        model_name=args.model_name,
-        num_layers=args.num_layers,
-        tabbie_ffn_hidden_dim=args.tabbie_ffn_hidden_dim,
-        strubert_ffn_hidden_dim=getattr(args, "strubert_ffn_hidden_dim", None),
-        turl_attention_budget=getattr(args, "turl_attention_budget", None),
-        table_microbatch_cell_budget=getattr(args, "table_microbatch_cell_budget", None),
-        table_microbatch_max_tables=getattr(args, "table_microbatch_max_tables", None),
-        device=args.device,
-    )
 
 
 if __name__ == "__main__":
@@ -545,7 +460,7 @@ if __name__ == "__main__":
     # for them -- guard on --encoder ours accordingly.
     if args.encoder == "ours" and os.path.exists(args.text_cache_path):
         print(f"loading cell/header text cache from {args.text_cache_path} ...")
-        if _safe_load_cache(model.load_text_cache, args.text_cache_path, "text"):
+        if safe_load_cache(model.load_text_cache, args.text_cache_path, "text"):
             print(f"text cache warm-started with {model.cell_encoder.text_embedder.cache_size()} entries")
 
     # Table-embedding cache: only meaningful for the two fully-frozen
@@ -559,7 +474,7 @@ if __name__ == "__main__":
     # on scoring_mode at all -- can be reused here directly.
     if args.encoder in ("bert", "tapas") and os.path.exists(args.table_cache_path):
         print(f"loading table-embedding cache from {args.table_cache_path} ...")
-        if _safe_load_cache(model.load_table_cache, args.table_cache_path, "table"):
+        if safe_load_cache(model.load_table_cache, args.table_cache_path, "table"):
             print(f"table cache warm-started with {len(model._table_cache)} entries")
 
     # Frozen-substep cache: tabbie/strubert can't cache their FINAL table
@@ -570,7 +485,7 @@ if __name__ == "__main__":
     # StruBertTableEncoder instance inside the adapter.
     if args.encoder in ("tabbie", "strubert") and os.path.exists(args.frozen_cache_path):
         print(f"loading frozen-substep cache from {args.frozen_cache_path} ...")
-        if _safe_load_cache(model.baseline_encoder.load_frozen_cache, args.frozen_cache_path, "frozen-substep"):
+        if safe_load_cache(model.baseline_encoder.load_frozen_cache, args.frozen_cache_path, "frozen-substep"):
             cache_attr = "_cell_cache" if args.encoder == "tabbie" else "_seq_cache"
             print(f"frozen cache warm-started with {len(getattr(model.baseline_encoder, cache_attr))} entries")
 
@@ -842,7 +757,7 @@ if __name__ == "__main__":
     # while running a totally different encoder.
     if not args.query_trainable and os.path.exists(args.query_cache_path):
         print(f"loading query cache from {args.query_cache_path} ...")
-        if _safe_load_cache(query_encoder.load_frozen_cache, args.query_cache_path, "query"):
+        if safe_load_cache(query_encoder.load_frozen_cache, args.query_cache_path, "query"):
             print(f"query cache warm-started with {len(query_encoder._encoder_cache)} entries")
 
     def save_all_caches() -> None:
@@ -904,7 +819,7 @@ if __name__ == "__main__":
     else:
         # Validate the file loads BEFORE handing it to finetuner.fit()
         # (which calls load_checkpoint deep inside its own resume logic)
-        # -- same corrupted-checkpoint concern as _safe_load_cache above
+        # -- same corrupted-checkpoint concern as safe_load_cache above
         # (e.g. a process killed mid torch.save() leaves a truncated
         # file). A failure here just means "start finetuning fresh",
         # same as if the file never existed, instead of crashing the

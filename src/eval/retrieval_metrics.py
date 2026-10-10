@@ -3,10 +3,10 @@ Retrieval evaluation metrics -- Mean Average Precision (MAP) over a
 FIXED table corpus.
 
 Per-instruction: only the QUERIES are split into train/val/test
-(scripts/build_query_splits.py); the table corpus itself is never
+(scripts/data_prep/build_query_splits.py); the table corpus itself is never
 partitioned, so every split ranks against the exact same, full set of
 candidate tables. MAP is the metric used for early stopping
-(src/training/trainer.py::FinetuneTrainer) -- val loss is no longer the
+(src/training/finetune_trainer.py::FinetuneTrainer) -- val loss is no longer the
 early-stopping signal, only best validation MAP is.
 """
 

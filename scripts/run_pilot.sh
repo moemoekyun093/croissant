@@ -38,11 +38,11 @@ SPLIT_JSON="configs/splits/query_split.json"
 CORPUS_JSON="configs/splits/corpus.json"
 
 echo "=== [1/4] sanity checks (fast, synthetic data, no GPU-heavy work) ==="
-python -m scripts.sanity_checks
+python -m scripts.diagnostics.sanity_checks
 
 echo
 echo "=== [2/4] build query train/val/test split + fixed corpus ==="
-python -m scripts.build_query_splits \
+python -m scripts.data_prep.build_query_splits \
     --tables_json "$TABLES_JSON" \
     --databases_root "$DATABASES_ROOT" \
     --questions_json "$QUESTIONS_JSON" \

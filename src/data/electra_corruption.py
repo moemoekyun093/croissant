@@ -187,7 +187,7 @@ def build_non_fk_mask(tables: list[Table], device="cpu"):
     padding). Meant to be multiplied into the model's own cell_mask
     before electra_discriminator_loss, so FK columns are excluded from
     the ELECTRA discriminator's loss entirely -- confirmed against real
-    SynSQL-2.5M tables (scripts/inspect_synsql_tables.py) that ~30% of
+    SynSQL-2.5M tables (scripts/diagnostics/inspect_synsql_tables.py) that ~30% of
     columns are key-like, and FK columns specifically have a structural
     problem for this task: FK VALUES REPEAT ACROSS ROWS NORMALLY (e.g.
     environment_id=1 shared by many rows is completely legitimate), so a

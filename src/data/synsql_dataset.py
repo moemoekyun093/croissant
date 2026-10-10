@@ -6,7 +6,7 @@ finetuning.
 
 Table/column NAMES are read directly from each SQLite database's own
 schema (`sqlite_master` + `PRAGMA table_info`) -- the same approach
-scripts/build_bird_jsonl.py already uses elsewhere in this repo -- rather
+scripts/data_prep/build_bird_jsonl.py already uses elsewhere in this repo -- rather
 than from `tables.json`. Confirmed against the real SynSQL-2.5M dump:
 `tables.json` is Spider-style, a LIST of per-DATABASE records (not
 per-table), each with a `ddls` field (raw CREATE TABLE strings) and a
@@ -59,23 +59,8 @@ from dataclasses import dataclass
 from typing import Iterator
 
 from src.data.table import Column, Table
-
-
-def clean_text(x) -> str:
-    """Same normalization used throughout the corpus-building scripts
-    (build_bird_jsonl.py, build_bird_augmented_corpus.py) -- collapse
-    whitespace, stringify, strip. Kept identical here so SynSQL tables
-    look like every other source in the corpus."""
-    if x is None:
-        return ""
-    return " ".join(str(x).split()).strip()
-
-
-def get_sqlite_path(db_root: str, db_id: str) -> str:
-    """Same convention as scripts/build_bird_jsonl.py::get_sqlite_path --
-    confirmed to match SynSQL-2.5M's actual on-disk layout
-    (databases/<db_id>/<db_id>.sqlite)."""
-    return f"{db_root}/{db_id}/{db_id}.sqlite"
+from src.utils.paths import get_sqlite_path
+from src.utils.text import clean_text  # noqa: F401  (re-exported for existing importers)
 
 
 def _drop_empty_tables(tables: list[Table]) -> tuple[list[Table], int]:
@@ -307,7 +292,7 @@ class SynSQLTableDataset:
 
     def _column_names(self, db_id: str, table_name: str) -> list[str]:
         """Real column names, in the table's own declared order, read via
-        PRAGMA table_info -- same convention scripts/build_bird_jsonl.py
+        PRAGMA table_info -- same convention scripts/data_prep/build_bird_jsonl.py
         already uses for BIRD."""
         key = (db_id, table_name)
         if key not in self._column_names_cache:
@@ -462,7 +447,7 @@ class SynSQLTableDataset:
     ) -> list[Table]:
         """
         Materializes the FIXED retrieval corpus persisted by
-        scripts/build_query_splits.py -- the same corpus every
+        scripts/data_prep/build_query_splits.py -- the same corpus every
         train/val/test split (and every model, including baselines)
         should rank against, per-instruction that only queries are
         split, never the corpus.
@@ -605,7 +590,7 @@ class QueryTableExample:
 
     def key(self) -> tuple:
         """Identity used by the persisted train/val/test query split
-        (scripts/build_query_splits.py) to match a split record back to
+        (scripts/data_prep/build_query_splits.py) to match a split record back to
         this dataset's own (possibly re-filtered) examples list --
         content-based rather than a raw index, so the split stays valid
         even if SynSQLQueryDataset's filtering logic changes later and
@@ -759,7 +744,7 @@ class SynSQLQueryDataset:
     def resolve_split(self, split_json_path: str) -> dict[str, list[int]]:
         """
         Loads a persisted train/val/test QUERY split (built once via
-        scripts/build_query_splits.py) and resolves it against THIS
+        scripts/data_prep/build_query_splits.py) and resolves it against THIS
         dataset's own self.examples, returning
         {"train": [idx, ...], "val": [...], "test": [...]} -- indices
         into self.examples / self[idx].

@@ -9,7 +9,7 @@ files. Pass a --flag explicitly to override just that one value for a
 single run.
 
 Split/corpus: loads the persisted query split and fixed table corpus
-built by scripts/build_query_splits.py (--split_json/--corpus_json) --
+built by scripts/data_prep/build_query_splits.py (--split_json/--corpus_json) --
 run that script once first. Training uses the TRAIN query examples
 only; validation each epoch computes Mean Average Precision (MAP) of
 the VAL query examples ranked against the FULL corpus (never a subset),
@@ -20,7 +20,7 @@ is "best". Test-set MAP is reported once at the end, using the
 best-validation-MAP checkpoint, not the last epoch trained.
 
 Usage:
-    python -m scripts.build_query_splits \\
+    python -m scripts.data_prep.build_query_splits \\
         --databases_root /path/to/synsql/databases \\
         --questions_json /path/to/synsql/questions_with_tables.json \\
         --tables_json /path/to/synsql/tables.json

@@ -269,7 +269,7 @@ class CellEncoder(nn.Module):
     def encode_column(self, column: Column) -> torch.Tensor:
         """
         Single-column entry point -- kept for debugging/inspection (e.g.
-        scripts/debug_nan.py isolates one column at a time), not used on
+        scripts/debug/debug_nan.py isolates one column at a time), not used on
         the main training path anymore. That path goes through
         encode_tables_batched instead, which batches across whole
         tables at once.

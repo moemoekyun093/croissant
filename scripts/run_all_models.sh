@@ -27,7 +27,7 @@
 #
 # Every flag below is overridable via env var, same convention as
 # scripts/run_pilot.sh. Split/corpus files must already exist -- run
-# scripts/build_query_splits.py once first if configs/splits/*.json
+# scripts/data_prep/build_query_splits.py once first if configs/splits/*.json
 # aren't there yet.
 set -euo pipefail
 

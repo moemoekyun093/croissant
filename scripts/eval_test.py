@@ -23,13 +23,16 @@ from __future__ import annotations
 import argparse
 import os
 import random
+import time
 import types
+from pathlib import Path
 
 import torch
 
 from src.data.synsql_dataset import SynSQLTableDataset, SynSQLQueryDataset
 from src.training.query_encoder import QueryEncoder
 from src.training.trainer import FinetuneTrainer
+from src.utils.io import atomic_json
 from scripts.train_model import build_table_model
 
 
@@ -128,6 +131,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--databases_root", required=True)
     ap.add_argument("--questions_json", required=True)
+    ap.add_argument("--results_json", default=None,
+                    help="write per-model test MAP/MRR here (default: results/eval_test_<timestamp>.json)")
     ap.add_argument("--tables_json", default=None)
     ap.add_argument("--split_json", default="configs/splits/query_split.json")
     ap.add_argument("--corpus_json", default="configs/splits/corpus.json")
@@ -261,6 +266,19 @@ def main():
         vm_s = f"{vm:9.4f}" if isinstance(vm, (int, float)) else "     n/a "
         print(f"{r['enc']:12} {mp:9.4f} {mr:9.4f} {vm_s}")
     print("===================================================")
+
+    out = Path(args.results_json or f"results/eval_test_{time.strftime('%Y%m%d_%H%M%S')}.json")
+    atomic_json(out, {
+        "args": {k: v for k, v in vars(args).items() if isinstance(v, (str, int, float, bool, type(None)))},
+        "num_queries": len(ex),
+        "models": {
+            r["enc"]: {
+                "test_map": sum(r["ap"]) / max(1, len(r["ap"])),
+                "test_mrr": sum(r["rr"]) / max(1, len(r["rr"])),
+                "val_map": r["val_map"], "epoch": r["epoch"],
+            } for r in runners},
+    }, indent=2)
+    print(f"[eval] results written to {out}")
 
 
 if __name__ == "__main__":
